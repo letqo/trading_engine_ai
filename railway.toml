@@ -1,0 +1,17 @@
+# Railway service config. SPEC.md Deployment: background worker, no public
+# port, schema changes only via Alembic migrations run as a release step
+# before the worker starts.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+releaseCommand = "alembic upgrade head"
+startCommand = "python -m engine.cli.main papertrade"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+# Exactly one replica, always. Two live instances would both reconcile
+# against the same broker account and could race on order submission --
+# the startup reconciliation (engine.execution.reconcile) assumes a single
+# writer. Do not raise this without redesigning for concurrent instances.
+numReplicas = 1

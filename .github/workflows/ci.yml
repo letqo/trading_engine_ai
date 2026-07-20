@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check src tests
+
+      - name: Apply Alembic migrations (SQLite, for CI schema smoke-test)
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: sqlite:///./ci_test.db
+
+      - name: Run tests (network-dependent tests skipped -- no egress guarantee on CI runners)
+        run: pytest -m "not network" -v
+        env:
+          DATABASE_URL: sqlite:///./ci_test.db

@@ -1,0 +1,189 @@
+# Fixed, config-driven trading universe. The engine never scans or trades
+# outside this list (SPEC.md "Trading universe").
+#
+# tier: 1 = core (signals developed/validated here first)
+#       2 = macro/regional basket exposure
+#       3 = futures twin, real-money era only -- not tradable in v1
+# asset_class: equity_etf | equity | commodity_etf | bond_etf | future
+# news_topics: keyword/topic tags used by the news router to associate
+#   incoming news items with this instrument.
+# futures_twin: symbol of the Tier 3 contract this ETF rehearses for, if any.
+
+instruments:
+  # --- Tier 1: Core -------------------------------------------------------
+  - symbol: SPY
+    tier: 1
+    asset_class: equity_etf
+    news_topics: [sp500, fed, fomc, cpi, macro_us, broad_market]
+    futures_twin: ES
+
+  - symbol: QQQ
+    tier: 1
+    asset_class: equity_etf
+    news_topics: [nasdaq100, tech_sector, fed, fomc, cpi, macro_us]
+    futures_twin: NQ
+
+  - symbol: IWM
+    tier: 1
+    asset_class: equity_etf
+    news_topics: [russell2000, small_cap, fed, fomc, macro_us]
+    futures_twin: RTY
+
+  - symbol: AAPL
+    tier: 1
+    asset_class: equity
+    news_topics: [aapl, iphone, apple_earnings, tech_sector]
+
+  - symbol: MSFT
+    tier: 1
+    asset_class: equity
+    news_topics: [msft, azure, microsoft_earnings, tech_sector, ai]
+
+  - symbol: NVDA
+    tier: 1
+    asset_class: equity
+    news_topics: [nvda, semiconductors, ai, gpu, nvidia_earnings]
+
+  - symbol: TSLA
+    tier: 1
+    asset_class: equity
+    news_topics: [tsla, ev, tesla_earnings, elon_musk]
+
+  - symbol: META
+    tier: 1
+    asset_class: equity
+    news_topics: [meta, facebook, instagram, ai, meta_earnings]
+
+  - symbol: AMZN
+    tier: 1
+    asset_class: equity
+    news_topics: [amzn, ecommerce, aws, amazon_earnings]
+
+  - symbol: GOOGL
+    tier: 1
+    asset_class: equity
+    news_topics: [googl, google, alphabet, search, ai, google_earnings]
+
+  - symbol: AMD
+    tier: 1
+    asset_class: equity
+    news_topics: [amd, semiconductors, ai, gpu, amd_earnings]
+
+  - symbol: JPM
+    tier: 1
+    asset_class: equity
+    news_topics: [jpm, banking, financials, rates, jpmorgan_earnings]
+
+  - symbol: COIN
+    tier: 1
+    asset_class: equity
+    news_topics: [coin, crypto, bitcoin, coinbase_earnings, sec_crypto]
+
+  # --- Tier 2: Macro & regional diversification ----------------------------
+  - symbol: EWJ
+    tier: 2
+    asset_class: equity_etf
+    news_topics: [boj, japan, yen, nikkei]
+    futures_twin: NKD
+
+  - symbol: FXI
+    tier: 2
+    asset_class: equity_etf
+    news_topics: [pboc, china, china_stimulus, yuan]
+
+  - symbol: VGK
+    tier: 2
+    asset_class: equity_etf
+    news_topics: [ecb, europe, eurozone, euro]
+
+  - symbol: EEM
+    tier: 2
+    asset_class: equity_etf
+    news_topics: [emerging_markets, em_currency, em_central_banks]
+
+  - symbol: SMH
+    tier: 2
+    asset_class: equity_etf
+    news_topics: [semiconductors, chips_act, taiwan, tsmc]
+
+  - symbol: XLE
+    tier: 2
+    asset_class: equity_etf
+    news_topics: [energy_sector, eia, opec, oil]
+
+  - symbol: XLF
+    tier: 2
+    asset_class: equity_etf
+    news_topics: [banks, financials, rates, fed]
+
+  - symbol: GLD
+    tier: 2
+    asset_class: commodity_etf
+    news_topics: [gold, safe_haven, real_rates, fed]
+    futures_twin: GC
+
+  - symbol: USO
+    tier: 2
+    asset_class: commodity_etf
+    news_topics: [oil, eia, opec, crude]
+    futures_twin: CL
+
+  - symbol: TLT
+    tier: 2
+    asset_class: bond_etf
+    news_topics: [long_bonds, treasuries, fed, fomc, cpi, rates]
+    futures_twin: ZB
+
+  # --- Tier 3: Futures twins (real-money era only, not traded in v1) -------
+  - symbol: ES
+    tier: 3
+    asset_class: future
+    news_topics: [sp500, fed, fomc, cpi, macro_us]
+    underlying: "S&P 500"
+    rehearsal_etf: SPY
+
+  - symbol: NQ
+    tier: 3
+    asset_class: future
+    news_topics: [nasdaq100, tech_sector, fed, fomc]
+    underlying: "Nasdaq 100"
+    rehearsal_etf: QQQ
+
+  - symbol: RTY
+    tier: 3
+    asset_class: future
+    news_topics: [russell2000, small_cap, fed, fomc]
+    underlying: "Russell 2000"
+    rehearsal_etf: IWM
+
+  - symbol: GC
+    tier: 3
+    asset_class: future
+    news_topics: [gold, safe_haven, real_rates, fed]
+    underlying: Gold
+    rehearsal_etf: GLD
+
+  - symbol: CL
+    tier: 3
+    asset_class: future
+    news_topics: [oil, eia, opec, crude]
+    underlying: "Crude oil"
+    rehearsal_etf: USO
+
+  - symbol: ZB
+    tier: 3
+    asset_class: future
+    news_topics: [long_bonds, treasuries, fed, fomc, rates]
+    underlying: "30Y bonds"
+    rehearsal_etf: TLT
+
+  - symbol: NKD
+    tier: 3
+    asset_class: future
+    news_topics: [boj, japan, yen, nikkei]
+    underlying: "Nikkei 225"
+    rehearsal_etf: EWJ
+
+# News-to-instrument routing is driven entirely by the news_topics tags
+# above: a scored news item carries topic tags, and the router fans it out
+# to every instrument whose news_topics intersect the item's tags.

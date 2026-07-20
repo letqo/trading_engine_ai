@@ -1,0 +1,165 @@
+"""SQLModel tables: the durable state the whole system is built to protect.
+
+SPEC.md Storage section is authoritative: Postgres from day one via
+DATABASE_URL, SQLModel + Alembic migrations. (The one line under "Backtester
+requirements" that says "SQLite table" for the experiment journal is a slip
+against that -- everything durable lives behind DATABASE_URL, which is
+Postgres in Docker/Railway and may be SQLite only for a zero-setup local
+dev/test run.)
+
+Nothing here is a container-filesystem artifact. Losing this on redeploy is
+a critical bug per the Deployment section.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from enum import Enum
+
+from sqlalchemy import JSON, Column
+from sqlmodel import Field, SQLModel
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
+class RunMode(str, Enum):
+    BACKTEST = "backtest"
+    PAPER_LIVE = "paper_live"
+
+
+class TradeSide(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class ExperimentRun(SQLModel, table=True):
+    """One row per backtest (or live paper-trading session). This is the
+    'experiment registry': config + git hash + data snapshot + seed +
+    metrics, so every result is reproducible and traceable."""
+
+    __tablename__ = "experiment_run"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    created_at: datetime = Field(default_factory=_now, index=True)
+    mode: RunMode = Field(index=True)
+    strategy_name: str = Field(index=True)
+
+    config_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    git_hash: str
+    data_snapshot_id: str | None = Field(default=None, index=True)
+    random_seed: int
+
+    period_start: datetime | None = None
+    period_end: datetime | None = None
+    is_validation_run: bool = Field(default=False, index=True)
+    validation_access_reason: str | None = None
+
+    total_return_pct: float | None = None
+    max_drawdown_pct: float | None = None
+    sharpe: float | None = None
+    win_rate: float | None = None
+    profit_factor: float | None = None
+    num_trades: int | None = None
+    avg_holding_hours: float | None = None
+    exposure_pct: float | None = None
+
+    notes: str | None = None
+
+
+class TradeRecord(SQLModel, table=True):
+    """Every fill, backtest or live. This table is the trade journal --
+    losing it on redeploy is the specific critical-bug scenario called out
+    in SPEC.md's Deployment section, which is why it lives in Postgres and
+    nowhere else."""
+
+    __tablename__ = "trade_record"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    run_id: str = Field(foreign_key="experiment_run.id", index=True)
+    timestamp: datetime = Field(index=True)
+    symbol: str = Field(index=True)
+    side: TradeSide
+    quantity: float
+    price: float
+    fees: float = 0.0
+    slippage: float = 0.0
+    strategy_id: str
+    broker_order_id: str | None = Field(default=None, index=True)
+    realized_pnl: float | None = None
+    exit_reason: str | None = None
+
+
+class NewsItemRecord(SQLModel, table=True):
+    """Raw + scored news. 'Never discard source data' -- raw_payload always
+    holds the untouched source response."""
+
+    __tablename__ = "news_item_record"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    source: str = Field(index=True)
+    published_at: datetime = Field(index=True)
+    ingested_at: datetime = Field(default_factory=_now, index=True)
+    headline: str
+    url: str | None = None
+    raw_payload: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    routed_symbols: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    sentiment_score: float | None = None
+    sentiment_model: str | None = None
+
+
+class DataSnapshot(SQLModel, table=True):
+    """A named, immutable pointer to 'the data as of ingestion time X', so a
+    backtest run's data_snapshot_id can be traced back to exactly what it
+    saw -- required for the determinism/audit constraint."""
+
+    __tablename__ = "data_snapshot"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    created_at: datetime = Field(default_factory=_now)
+    description: str
+    universe_hash: str
+    bar_start: datetime | None = None
+    bar_end: datetime | None = None
+    news_count: int = 0
+    bar_row_count: int = 0
+
+
+class RiskHaltEvent(SQLModel, table=True):
+    """Every time RiskGate halts trading or the kill switch fires. This is
+    the audit trail for the risk system, independent of trade outcomes."""
+
+    __tablename__ = "risk_halt_event"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    timestamp: datetime = Field(default_factory=_now, index=True)
+    run_id: str | None = Field(default=None, foreign_key="experiment_run.id", index=True)
+    reason: str
+    account_equity: float
+    triggered_by: str
+
+
+class ReconciliationReport(SQLModel, table=True):
+    """Weekly paper-vs-backtest reconciliation, per the anti-self-deception
+    protocol: divergence beyond tolerance must be investigated before any
+    further iteration."""
+
+    __tablename__ = "reconciliation_report"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    created_at: datetime = Field(default_factory=_now)
+    week_start: datetime
+    week_end: datetime
+    backtest_run_id: str = Field(foreign_key="experiment_run.id")
+    backtest_expected_return_pct: float
+    realized_return_pct: float
+    divergence_pct: float
+    tolerance_pct: float
+    within_tolerance: bool
+    notes: str | None = None
