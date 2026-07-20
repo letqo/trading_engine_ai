@@ -7,7 +7,7 @@ UNIVERSE_PATH = Path(__file__).resolve().parent.parent / "universe.yaml"
 
 def test_loads_all_tiers():
     universe = load_universe(UNIVERSE_PATH)
-    assert len(universe.tier(1)) == 13  # SPY, QQQ, IWM + 10 mega-caps
+    assert len(universe.tier(1)) == 17  # SPY, QQQ, IWM + 10 mega-caps + 4 non-tech diversifiers
     assert len(universe.tier(2)) == 10
     assert len(universe.tier(3)) == 7
 

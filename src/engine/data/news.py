@@ -1,6 +1,9 @@
-"""News ingestion: free RSS sources, no API key required. One optional API
-free-tier source (NewsAPI) is wired in as a stub that only activates if
-NEWS_API_KEY is set.
+"""News ingestion: free RSS sources, no API key required.
+
+`Settings.news_api_key` / `Settings.finnhub_api_key` exist as config fields
+for a future NewsAPI/Finnhub source (SPEC.md: "one API free tier") but are
+not wired to a fetcher yet -- RSS is the only live source today. Don't
+assume setting those env vars does anything until this docstring changes.
 
 Raw payloads are always kept (SPEC.md: "never discard source data") -- the
 full feedparser entry dict rides along in NewsItem.raw_payload.

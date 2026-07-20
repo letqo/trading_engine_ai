@@ -163,3 +163,65 @@ class ReconciliationReport(SQLModel, table=True):
     tolerance_pct: float
     within_tolerance: bool
     notes: str | None = None
+
+
+class PredictionDirection(str, Enum):
+    UP = "up"
+    DOWN = "down"
+
+
+class PredictionStatus(str, Enum):
+    PENDING = "pending"
+    RESOLVED = "resolved"
+    INVALID = "invalid"  # e.g. no price data available to resolve against
+
+
+class Prediction(SQLModel, table=True):
+    """One row per (news item, predicted symbol): the consequence-prediction
+    pipeline's forward-testing log (engine.prediction).
+
+    This is deliberately NOT a backtest artifact. It exists because an LLM
+    cannot be backtested honestly against historical events it may already
+    know the outcome of -- see docs/prediction_pipeline.md. Instead, every
+    prediction is written here *before* its outcome is known, and scored
+    later in a separate step (resolve_pending_predictions). The row is never
+    edited after outcome resolution fills in the resolution fields, so the
+    log can never be quietly adjusted once the answer is known.
+
+    `forward_safe` is the load-bearing field: True only if the news item's
+    decision_timestamp is after the reasoning model's stated knowledge
+    cutoff, i.e. the event could not possibly be in that model's training
+    data. Only forward_safe=True rows may ever be counted as evidence the
+    prediction pipeline has real skill; forward_safe=False rows are kept for
+    inspection but must never be scored as if they were a genuine test.
+    """
+
+    __tablename__ = "prediction"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    created_at: datetime = Field(default_factory=_now, index=True)
+
+    news_headline: str
+    news_source: str
+    news_published_at: datetime
+    news_decision_timestamp: datetime = Field(index=True)  # see engine.domain.NewsItem.decision_timestamp
+    topics: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+
+    symbol: str = Field(index=True)
+    direction: PredictionDirection
+    confidence: float
+    rationale: str
+
+    model_name: str
+    model_knowledge_cutoff: datetime
+    forward_safe: bool = Field(index=True)
+
+    retrieved_context_ids: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+
+    status: PredictionStatus = Field(default=PredictionStatus.PENDING, index=True)
+    resolution_window_hours: float
+    resolved_at: datetime | None = None
+    entry_price: float | None = None
+    exit_price: float | None = None
+    actual_return_pct: float | None = None
+    outcome_correct: bool | None = None

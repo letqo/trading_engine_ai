@@ -79,6 +79,30 @@ instruments:
     asset_class: equity
     news_topics: [coin, crypto, bitcoin, coinbase_earnings, sec_crypto]
 
+  # Non-tech news magnets -- Tier 1 was originally 10/13 tech/tech-adjacent
+  # names plus JPM; these add healthcare, industrials, retail, and energy
+  # sector coverage using the same "generates lots of headlines" selection
+  # logic, not basket exposure (that's what Tier 2 is for).
+  - symbol: UNH
+    tier: 1
+    asset_class: equity
+    news_topics: [healthcare, health_insurance, medicare, unitedhealth_earnings]
+
+  - symbol: CAT
+    tier: 1
+    asset_class: equity
+    news_topics: [industrials, construction_equipment, caterpillar_earnings, china_demand]
+
+  - symbol: WMT
+    tier: 1
+    asset_class: equity
+    news_topics: [retail, consumer_spending, walmart_earnings, cpi]
+
+  - symbol: XOM
+    tier: 1
+    asset_class: equity
+    news_topics: [energy_sector, oil, exxon_earnings]
+
   # --- Tier 2: Macro & regional diversification ----------------------------
   - symbol: EWJ
     tier: 2

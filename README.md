@@ -41,10 +41,22 @@ engine reconcile --run-id <id> --week-start ... --week-end ... \
     --backtest-expected-pct 1.2 --realized-pct 0.8               # weekly Phase 6 check
 engine kill                                                       # kill switch
 engine papertrade                                                 # live worker loop
+
+engine predict-news --limit 10                                    # LLM consequence-prediction forward-test
+engine resolve-predictions                                        # score predictions past their resolution window
+engine predictions-report                                         # accuracy of resolved, forward-safe predictions
 ```
 
 Strategies: `buy_and_hold`, `random_entry` (Phase 3 baselines),
 `dumb_news` (Phase 4 control group), `overnight_gap` (Phase 5 candidate).
+
+The consequence-prediction pipeline (`engine.prediction`) is a separate,
+parallel research track -- not a strategy, doesn't touch RiskGate or the
+backtester. It asks an LLM to reason about indirect/second-order
+consequences of news (mechanisms keyword routing and VADER sentiment can't
+see), and forward-tests itself since it can't be backtested honestly. See
+[`docs/prediction_pipeline.md`](docs/prediction_pipeline.md) for why, and
+what config it needs (`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF`).
 
 ## Architecture
 
@@ -57,6 +69,7 @@ backtest/       event-driven simulator, cost model, metrics, perturbation
 risk/           RiskGate -- single non-bypassable choke point for every order
 execution/      Broker interface + Alpaca paper client + startup reconciliation
 journal/        SQLModel tables + registry (experiment/trade/journal, Postgres)
+prediction/     LLM consequence-prediction forward-test loop (separate from strategy/)
 cli/            ingest, replay, backtest, report, reconcile, kill, papertrade
 ```
 

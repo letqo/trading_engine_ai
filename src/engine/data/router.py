@@ -43,6 +43,10 @@ KEYWORD_TOPICS: dict[str, str] = {
     r"\byen\b|\bnikkei\b": "nikkei",
     r"\bemerging market(s)?\b": "emerging_markets",
     r"\beurope\b|eurozone|\beuro\b": "europe",
+    r"\bunitedhealth\b|\bunh\b": "healthcare",
+    r"\bcaterpillar\b": "industrials",
+    r"\bwalmart\b|\bwmt\b": "retail",
+    r"\bexxon\b|\bxom\b": "energy_sector",
 }
 
 _COMPILED = [(re.compile(pattern, re.IGNORECASE), topic) for pattern, topic in KEYWORD_TOPICS.items()]

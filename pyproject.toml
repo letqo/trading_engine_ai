@@ -21,6 +21,7 @@ dependencies = [
     "requests>=2.32",
     "python-dotenv>=1.0",
     "tenacity>=8.2",
+    "anthropic>=0.75",
 ]
 
 [project.optional-dependencies]

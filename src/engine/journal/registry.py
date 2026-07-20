@@ -5,7 +5,7 @@ format is defined in one place."""
 from __future__ import annotations
 
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlmodel import Session, select
 
@@ -14,6 +14,9 @@ from engine.journal.models import (
     DataSnapshot,
     ExperimentRun,
     NewsItemRecord,
+    Prediction,
+    PredictionDirection,
+    PredictionStatus,
     ReconciliationReport,
     RiskHaltEvent,
     RunMode,
@@ -250,3 +253,119 @@ def load_news_items(session: Session, start: datetime, end: datetime) -> list[Ne
         )
         for row in rows
     ]
+
+
+def record_prediction(
+    session: Session,
+    *,
+    news_headline: str,
+    news_source: str,
+    news_published_at: datetime,
+    news_decision_timestamp: datetime,
+    topics: list[str],
+    symbol: str,
+    direction: PredictionDirection,
+    confidence: float,
+    rationale: str,
+    model_name: str,
+    model_knowledge_cutoff: datetime,
+    forward_safe: bool,
+    resolution_window_hours: float,
+    retrieved_context_ids: list[str] | None = None,
+) -> Prediction:
+    """Write one prediction row. Called before the outcome is known --
+    nothing here ever gets edited except by resolve_prediction(), once, when
+    the resolution window closes. See engine.journal.models.Prediction."""
+    prediction = Prediction(
+        news_headline=news_headline,
+        news_source=news_source,
+        news_published_at=news_published_at,
+        news_decision_timestamp=news_decision_timestamp,
+        topics=topics,
+        symbol=symbol,
+        direction=direction,
+        confidence=confidence,
+        rationale=rationale,
+        model_name=model_name,
+        model_knowledge_cutoff=model_knowledge_cutoff,
+        forward_safe=forward_safe,
+        resolution_window_hours=resolution_window_hours,
+        retrieved_context_ids=retrieved_context_ids or [],
+    )
+    session.add(prediction)
+    session.commit()
+    session.refresh(prediction)
+    return prediction
+
+
+def load_resolved_predictions_by_topics(
+    session: Session, topics: set[str], limit: int = 5
+) -> list[Prediction]:
+    """Retrieval for the prediction pipeline's few-shot context: past
+    resolved cases sharing at least one topic tag, most recent first.
+
+    Filters in Python rather than with a JSON-containment SQL query so the
+    same code works identically against SQLite (local dev) and Postgres
+    (prod) -- deliberate simplicity over query-side optimization while this
+    table stays small. Revisit if/when it doesn't.
+    """
+    if not topics:
+        return []
+    rows = session.exec(
+        select(Prediction)
+        .where(Prediction.status == PredictionStatus.RESOLVED)
+        .order_by(Prediction.resolved_at.desc())
+    ).all()
+    matched = [row for row in rows if set(row.topics) & topics]
+    return matched[:limit]
+
+
+def load_pending_predictions_past_window(session: Session, as_of: datetime) -> list[Prediction]:
+    """Predictions whose resolution window has closed but haven't been
+    scored yet -- what `engine resolve-predictions` operates on."""
+    rows = session.exec(select(Prediction).where(Prediction.status == PredictionStatus.PENDING)).all()
+    return [row for row in rows if _hours_elapsed(as_of, row.news_decision_timestamp) >= row.resolution_window_hours]
+
+
+def _hours_elapsed(later: datetime, earlier: datetime) -> float:
+    # SQLite drops tzinfo on round-trip; treat naive timestamps as UTC so
+    # comparisons work identically against SQLite (dev) and Postgres (prod).
+    if later.tzinfo is None:
+        later = later.replace(tzinfo=timezone.utc)
+    if earlier.tzinfo is None:
+        earlier = earlier.replace(tzinfo=timezone.utc)
+    return (later - earlier).total_seconds() / 3600.0
+
+
+def resolve_prediction(
+    session: Session,
+    prediction: Prediction,
+    *,
+    entry_price: float | None,
+    exit_price: float | None,
+    resolved_at: datetime,
+) -> Prediction:
+    """Fill in the outcome fields exactly once. If price data wasn't
+    available for either side, mark INVALID rather than guessing -- an
+    unresolvable prediction must never silently count as a miss."""
+    if entry_price is None or exit_price is None or entry_price <= 0:
+        prediction.status = PredictionStatus.INVALID
+        prediction.resolved_at = resolved_at
+        session.add(prediction)
+        session.commit()
+        session.refresh(prediction)
+        return prediction
+
+    actual_return_pct = (exit_price - entry_price) / entry_price * 100.0
+    actual_direction = PredictionDirection.UP if actual_return_pct >= 0 else PredictionDirection.DOWN
+
+    prediction.status = PredictionStatus.RESOLVED
+    prediction.resolved_at = resolved_at
+    prediction.entry_price = entry_price
+    prediction.exit_price = exit_price
+    prediction.actual_return_pct = actual_return_pct
+    prediction.outcome_correct = actual_direction == prediction.direction
+    session.add(prediction)
+    session.commit()
+    session.refresh(prediction)
+    return prediction

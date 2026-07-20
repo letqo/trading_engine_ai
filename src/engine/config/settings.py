@@ -51,6 +51,18 @@ class Settings(BaseSettings):
     news_api_key: str | None = None
     finnhub_api_key: str | None = None
 
+    # Consequence-prediction pipeline (engine.prediction). Absent key -> the
+    # pipeline refuses to run rather than silently doing nothing; see
+    # engine/prediction/client.py.
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-opus-4-8"
+    # Deliberately an obvious placeholder, not a guessed real date -- see
+    # engine/prediction/client.py. Must be set to the actual training-data
+    # knowledge cutoff of whatever model ANTHROPIC_MODEL names.
+    anthropic_model_knowledge_cutoff: str = "1970-01-01"
+    prediction_resolution_hours: float = 24.0
+    prediction_retrieval_limit: int = 5
+
     alert_webhook_url: str | None = None
 
     # Remote kill switch (Railway-friendly: flip env var + redeploy).

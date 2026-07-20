@@ -34,6 +34,8 @@ from engine.journal.registry import (
 )
 from engine.logging_setup import configure_logging, get_logger
 from engine.observability import alert_kill_switch, alert_risk_halt, alert_service_restart
+from engine.prediction.client import ConsequencePredictionClient, PredictionConfigError
+from engine.prediction.pipeline import resolve_pending_predictions, run_prediction_for_news_item
 from engine.risk.gate import RiskGate
 from engine.risk.kill_switch import disengage_kill_switch, engage_kill_switch, is_kill_switch_engaged
 from engine.strategy.baselines import BuyAndHoldStrategy, RandomEntryStrategy
@@ -281,6 +283,82 @@ def reconcile(
         )
     status = "WITHIN TOLERANCE" if rec.within_tolerance else "*** DIVERGENCE -- INVESTIGATE BEFORE ITERATING ***"
     typer.echo(f"divergence={rec.divergence_pct:.2f}% (tolerance={tolerance_pct}%) -- {status}")
+
+
+@app.command(name="predict-news")
+def predict_news(
+    limit: int = typer.Option(10, help="max headlines to analyze this run (each is a paid LLM call)"),
+) -> None:
+    """Consequence-prediction forward-test: for each current headline, ask
+    the LLM to identify indirect impacts on the tracked universe and log
+    the prediction *before* any outcome is known. Never scored at write
+    time -- see `engine resolve-predictions`. Requires ANTHROPIC_API_KEY and
+    ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF (see engine/prediction/client.py)."""
+    settings = get_settings()
+    try:
+        client = ConsequencePredictionClient(settings)
+    except PredictionConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+
+    universe = load_universe(settings.universe_path)
+    raw_items = fetch_all_rss()[:limit]
+    total_predictions = 0
+    with get_session(settings) as session:
+        for raw in raw_items:
+            tagged = tag_and_route(raw, universe)
+            predictions = run_prediction_for_news_item(
+                session, client, tagged, universe,
+                resolution_window_hours=settings.prediction_resolution_hours,
+                retrieval_limit=settings.prediction_retrieval_limit,
+            )
+            total_predictions += len(predictions)
+            for p in predictions:
+                typer.echo(f"  {p.symbol:6s} {p.direction.value:5s} conf={p.confidence:.2f} "
+                           f"forward_safe={p.forward_safe} -- {tagged.headline[:70]}")
+    typer.echo(f"analyzed {len(raw_items)} headlines, logged {total_predictions} predictions")
+
+
+@app.command(name="resolve-predictions")
+def resolve_predictions_cmd() -> None:
+    """Score every pending prediction whose resolution window has closed,
+    against real price data. Never re-scores an already-resolved row."""
+    settings = get_settings()
+    with get_session(settings) as session:
+        resolved = resolve_pending_predictions(session)
+    for p in resolved:
+        outcome = p.status.value if p.status.value == "invalid" else ("correct" if p.outcome_correct else "incorrect")
+        typer.echo(f"  {p.symbol:6s} predicted={p.direction.value:5s} -> {outcome}")
+    typer.echo(f"resolved {len(resolved)} predictions")
+
+
+@app.command(name="predictions-report")
+def predictions_report(
+    forward_safe_only: bool = typer.Option(True, help="only count predictions immune to hindsight leakage"),
+) -> None:
+    """Accuracy of resolved, forward-safe predictions -- the actual
+    evidence of whether the consequence-prediction pipeline has skill."""
+    from sqlmodel import select
+
+    from engine.journal.models import Prediction, PredictionStatus
+
+    settings = get_settings()
+    with get_session(settings) as session:
+        query = select(Prediction).where(Prediction.status == PredictionStatus.RESOLVED)
+        if forward_safe_only:
+            query = query.where(Prediction.forward_safe == True)  # noqa: E712
+        rows = session.exec(query).all()
+
+    if not rows:
+        typer.echo("no resolved predictions yet" + (" (forward-safe only)" if forward_safe_only else ""))
+        return
+    correct = sum(1 for r in rows if r.outcome_correct)
+    typer.echo(f"resolved: {len(rows)}  correct: {correct}  accuracy: {correct / len(rows) * 100:.1f}%")
+    if not forward_safe_only:
+        unsafe = sum(1 for r in rows if not r.forward_safe)
+        if unsafe:
+            typer.echo(f"WARNING: {unsafe} of these are NOT forward_safe (event predates the model's "
+                       f"knowledge cutoff) -- they cannot be trusted as genuine evidence of skill.")
 
 
 @app.command()

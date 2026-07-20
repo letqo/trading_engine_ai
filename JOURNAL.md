@@ -5,6 +5,42 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-20 -- Add: consequence-prediction forward-test pipeline + universe diversification
+
+**Consequence prediction (`engine.prediction`).** A second, separate news
+analysis mechanism alongside VADER sentiment and keyword topic routing: an
+LLM (Claude, `engine/prediction/client.py`) reasons about indirect,
+second-order consequences of a headline -- the "pandemic in China ->
+cruise/airline stocks exposed" kind of connection that keyword matching
+structurally cannot find. This does **not** feed any strategy, RiskGate, or
+the backtester -- it's a standalone research instrument.
+
+The core design problem: an LLM's training data already contains the
+outcomes of real historical events, so backtesting this the normal way
+would just measure recall dressed up as prediction. Fixed by making it a
+forward-test log instead (`Prediction` table) -- every prediction is
+written before its outcome is known, and a `forward_safe` flag (event
+timestamp vs. the model's actual training-data cutoff, `ANTHROPIC_MODEL_
+KNOWLEDGE_CUTOFF`) gates which rows may ever count as evidence of skill.
+`resolve_pending_predictions` scores rows against real price data exactly
+once, after the resolution window closes, and never revisits a resolved
+row. Retrieval of topic-matched past *resolved* cases is fed back into the
+prompt as precedent -- grounding on the pipeline's own verified track
+record rather than the model's training corpus, so it doesn't reintroduce
+the same hindsight problem. Full reasoning: `docs/prediction_pipeline.md`.
+
+New CLI: `engine predict-news`, `engine resolve-predictions`, `engine
+predictions-report`. Requires `ANTHROPIC_API_KEY` and (not guessable, ships
+as a refuse-to-run placeholder) `ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF`.
+
+**Universe diversification.** Tier 1 was 10 of 13 names in tech/tech-
+adjacent sectors. Added UNH (healthcare), CAT (industrials), WMT (retail),
+XOM (energy) -- same "reliable news magnet" selection logic as the
+original picks, different sectors. Matching keyword-router patterns added.
+Tier 1 is now 17 names.
+
+---
+
 ## 2026-07-20 -- Fix: news-driven backtests were silently using today's news
 
 **What happened.** Running `engine backtest --strategy overnight_gap

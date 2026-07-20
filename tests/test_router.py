@@ -31,6 +31,13 @@ def test_extract_topics_no_match_returns_empty():
     assert topics == frozenset()
 
 
+def test_extract_topics_new_non_tech_names():
+    assert "healthcare" in extract_topics("UnitedHealth shares fall on Medicare guidance cut")
+    assert "industrials" in extract_topics("Caterpillar beats on strong construction demand")
+    assert "retail" in extract_topics("Walmart raises full-year outlook")
+    assert "energy_sector" in extract_topics("Exxon posts record refining margins")
+
+
 def test_tag_and_route_boj_routes_to_ewj():
     universe = load_universe(UNIVERSE_PATH)
     item = make_item("BOJ raises rates in surprise move")
