@@ -4,6 +4,7 @@ import pytest
 
 from engine.journal.models import RunMode, TradeSide
 from engine.journal.registry import (
+    load_news_items,
     record_metrics,
     record_news_item,
     record_trade,
@@ -73,3 +74,21 @@ def test_record_news_item_preserves_raw_payload(db_session):
     )
     assert item.raw_payload == raw
     assert item.routed_symbols == ["SPY", "QQQ", "TLT"]
+
+
+def test_load_news_items_filters_by_published_at_range(db_session):
+    from datetime import timedelta
+
+    record_news_item(
+        db_session, source="rss", published_at=NOW, headline="in range",
+        raw_payload={}, routed_symbols=["SPY"], sentiment_score=0.5,
+    )
+    record_news_item(
+        db_session, source="rss", published_at=NOW - timedelta(days=30), headline="too old",
+        raw_payload={}, routed_symbols=["SPY"],
+    )
+    results = load_news_items(db_session, start=NOW - timedelta(days=1), end=NOW + timedelta(days=1))
+    assert len(results) == 1
+    assert results[0].headline == "in range"
+    assert results[0].routed_symbols == ("SPY",)
+    assert results[0].sentiment_score == 0.5

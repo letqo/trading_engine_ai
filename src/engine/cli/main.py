@@ -26,6 +26,7 @@ from engine.journal.db import get_session
 from engine.journal.models import RunMode, TradeSide
 from engine.journal.registry import (
     current_git_hash,
+    load_news_items,
     record_metrics,
     record_reconciliation,
     record_trade,
@@ -148,7 +149,23 @@ def backtest(
     symbols = sorted(universe.tradable_symbols())
     bars_df = fetch_bars(symbols, start=start, end=end, interval=interval)
     bars = bars_to_domain(bars_df)
-    news_items = _fetch_scored_news(universe) if strategy in NEWS_DRIVEN_STRATEGIES else []
+
+    news_items = []
+    if strategy in NEWS_DRIVEN_STRATEGIES:
+        start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+        end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+        with get_session(settings) as session:
+            news_items = load_news_items(session, start_dt, end_dt)
+        if not news_items:
+            typer.echo(
+                f"no stored news for {start}..{end} -- free RSS feeds have no historical archive, "
+                f"so this range only has news if `engine ingest` was run while it was current. "
+                f"Falling back to today's live RSS feed, which will NOT match this backtest window "
+                f"and will likely produce zero trades. Run `engine ingest` regularly to build a real "
+                f"historical corpus. See JOURNAL.md.",
+                err=True,
+            )
+            news_items = _fetch_scored_news(universe)
 
     strategy_obj = STRATEGY_FACTORIES[strategy](universe, seed)
     risk_gate = RiskGate(settings.risk)

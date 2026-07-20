@@ -5,6 +5,39 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-20 -- Fix: news-driven backtests were silently using today's news
+
+**What happened.** Running `engine backtest --strategy overnight_gap
+--start 2026-06-01 --end 2026-07-15` produced 0 trades. Root cause: free
+RSS feeds (Yahoo Finance, MarketWatch, PRNewswire -- see
+`engine/data/news.py`) have no historical archive, they only ever return
+*currently live* items. The backtest command was calling the same live-RSS
+fetch regardless of the requested date range, so a backtest over
+2026-06-01..2026-07-15 was being fed news timestamped ~2026-07-20 (today) --
+outside the bar window entirely, so nothing could ever fill.
+
+**Fix.** `engine ingest` already persisted fetched news to Postgres
+(`NewsItemRecord`, with real `published_at`/`ingested_at`) but nothing read
+it back. Added `engine.journal.registry.load_news_items(session, start,
+end)` and wired `engine backtest` to read historical news from the journal
+DB first, falling back to a live RSS fetch (with an explicit stderr
+warning that the result won't match the requested window) only when the DB
+has nothing for that range. This means: **news-driven backtests are only
+meaningful over date ranges where `engine ingest` was actually run while
+that news was current.** There is no way to backfill genuine historical
+news from free RSS after the fact -- that's an inherent limit of the
+source, not a bug to fix later. A real historical news corpus has to be
+built by running `engine ingest` regularly (e.g. a scheduled job) starting
+now, going forward.
+
+**Anti-self-deception note:** this is exactly the kind of thing the bias
+review process exists to catch -- a strategy that "looks dead" (0 trades)
+can be a data-availability bug, not evidence the strategy has no edge.
+Always check *why* a backtest produced zero trades before concluding
+anything about the strategy itself.
+
+---
+
 ## 2026-07-20 -- Initial build: Phases 0-5 implemented, Phase 6 scaffolded
 
 **What was built.** The full pipeline described in SPEC.md through Phase 5:

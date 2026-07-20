@@ -7,8 +7,9 @@ from __future__ import annotations
 import subprocess
 from datetime import datetime
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
+from engine.domain import NewsItem
 from engine.journal.models import (
     DataSnapshot,
     ExperimentRun,
@@ -214,3 +215,38 @@ def record_reconciliation(
     session.commit()
     session.refresh(report)
     return report
+
+
+def load_news_items(session: Session, start: datetime, end: datetime) -> list[NewsItem]:
+    """Read back previously-ingested news for a date range (published_at
+    within [start, end]) as domain NewsItem objects, for backtesting over a
+    historical window.
+
+    This matters because free RSS feeds have no historical archive -- they
+    only ever expose currently-live items. `engine ingest` is what builds
+    up a real historical news corpus over time (each run persists whatever
+    RSS currently shows, with real published/ingested timestamps, via
+    record_news_item). A backtest over a past window must read that stored
+    corpus rather than re-fetching live RSS, which would return today's
+    headlines regardless of the requested date range and silently produce
+    an empty/misleading backtest. See JOURNAL.md.
+    """
+    rows = session.exec(
+        select(NewsItemRecord)
+        .where(NewsItemRecord.published_at >= start, NewsItemRecord.published_at <= end)
+        .order_by(NewsItemRecord.published_at)
+    ).all()
+    return [
+        NewsItem(
+            id=row.id,
+            source=row.source,
+            published_at=row.published_at,
+            ingested_at=row.ingested_at,
+            headline=row.headline,
+            url=row.url,
+            raw_payload=row.raw_payload,
+            routed_symbols=tuple(row.routed_symbols),
+            sentiment_score=row.sentiment_score,
+        )
+        for row in rows
+    ]
