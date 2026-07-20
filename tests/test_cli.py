@@ -76,3 +76,92 @@ def test_backtest_rejects_unknown_strategy(monkeypatch, tmp_path):
         app, ["backtest", "--strategy", "not_a_real_strategy", "--start", "2026-01-01", "--end", "2026-01-02"]
     )
     assert result.exit_code == 1
+
+
+class _FakePredictionClient:
+    """Stands in for ConsequencePredictionClient: never calls the real API,
+    never finds any impacts, so predict-loop's cycle body runs for real but
+    produces zero predictions -- enough to exercise the loop's own control
+    flow (kill switch, drawdown halt, day rollover, max_iterations)."""
+
+    model = "claude-opus-4-8"
+
+    from datetime import date as _date
+    knowledge_cutoff = _date(2026, 1, 31)
+
+    def __init__(self, settings):
+        pass
+
+    def is_forward_safe(self, decision_timestamp):
+        return True
+
+    def analyze(self, headline, tracked_symbols, past_cases=None):
+        from engine.prediction.schema import ConsequenceAnalysis
+        return ConsequenceAnalysis(impacts=[], overall_reasoning="none")
+
+
+class _FakeAlpacaClient:
+    def __init__(self, settings):
+        self.canceled = False
+        self.closed = False
+
+    def get_account_equity(self):
+        return 10_000.0
+
+    def get_positions(self):
+        return {}
+
+    def get_open_orders(self):
+        return []
+
+    def submit_order(self, order):
+        raise NotImplementedError
+
+    def cancel_all_orders(self):
+        self.canceled = True
+
+    def close_all_positions(self):
+        self.closed = True
+
+
+def test_predict_loop_refuses_without_anthropic_key(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    result = runner.invoke(app, ["predict-loop", "--max-iterations", "1"])
+    assert result.exit_code == 1
+
+
+def test_predict_loop_runs_log_only_without_alpaca_key(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.ConsequencePredictionClient", _FakePredictionClient)
+    monkeypatch.setattr("engine.cli.main.fetch_all_rss", lambda: [])
+
+    result = runner.invoke(app, ["predict-loop", "--max-iterations", "2", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert "predict-loop stopped" in result.stdout
+
+
+def test_predict_loop_stops_immediately_when_kill_switch_engaged(monkeypatch, tmp_path):
+    halt_path = _isolated_env(monkeypatch, tmp_path)
+    halt_path.write_text("halted for test\n")
+    monkeypatch.setattr("engine.cli.main.ConsequencePredictionClient", _FakePredictionClient)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+    fake_broker = _FakeAlpacaClient(get_settings())
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+
+    result = runner.invoke(app, ["predict-loop", "--max-iterations", "5", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert fake_broker.canceled is True
+    assert fake_broker.closed is True
+
+
+def test_predict_loop_respects_max_iterations_in_log_only_mode(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.ConsequencePredictionClient", _FakePredictionClient)
+    calls = []
+    monkeypatch.setattr("engine.cli.main.fetch_all_rss", lambda: (calls.append(1), [])[1])
+
+    result = runner.invoke(app, ["predict-loop", "--max-iterations", "3", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert len(calls) == 3

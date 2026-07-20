@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     # order -- see engine.prediction.trading. Predictions below this are
     # still logged and scored, just never traded.
     prediction_action_confidence_threshold: float = 0.6
+    # Default cycle interval for `engine predict-loop`, the automatic
+    # version of predict-news + act-on-predictions + resolve-predictions.
+    prediction_loop_poll_seconds: int = 3600
 
     alert_webhook_url: str | None = None
 

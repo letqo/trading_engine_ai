@@ -9,6 +9,13 @@ Implemented in this repo, works locally today:
   (`alembic upgrade head`, run before the worker starts on every deploy),
   the start command (`engine papertrade`), and pins `numReplicas = 1`
   (never run two live instances against the same broker account).
+- `engine predict-loop` is a second always-on process (predict-news +
+  act-on-predictions + resolve-predictions, on a loop) -- it needs its own
+  Railway service. `railway.toml` only configures one service's start
+  command; add a second service in the Railway dashboard pointed at the
+  same repo/image, with its start command overridden to
+  `python -m engine.cli.main predict-loop`. Same `numReplicas = 1` rule
+  applies -- it submits real orders through the same broker account.
 - `Procfile` mirrors the same two process types for any Heroku-style
   buildpack path as a fallback to the Dockerfile route.
 - The paper-only guard (`engine.config.guard`), remote kill switch

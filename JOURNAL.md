@@ -5,6 +5,39 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-20 -- Add: automatic predict-loop, and a real daily-drawdown bug fix found while building it
+
+**`engine predict-loop`.** Automatic version of predict-news +
+act-on-predictions + resolve-predictions: runs all three every
+`PREDICTION_LOOP_POLL_SECONDS` (default 1h), forever, checking the kill
+switch and daily-drawdown halt each cycle like `papertrade` does. The
+individual commands remain available for manual, one-off runs -- this
+doesn't replace them, it's the default always-on mode once deployed.
+Runs log-only (predict + resolve, no real orders) if `ALPACA_API_KEY` isn't
+set. Needs its own Railway service alongside `papertrade` -- see
+`docs/deployment.md`.
+
+**Found and fixed while building it: the daily-drawdown halt in
+`papertrade` could never actually trigger.** Its loop called
+`reconcile_account_state(client)` on every iteration, and that function
+unconditionally resets `equity_at_session_start = current_equity`. So
+immediately before `check_daily_drawdown` ran, the baseline it compares
+against had just been reset to the current value -- the computed drawdown
+was always ~0%, regardless of what actually happened intraday. No test
+exercised the `papertrade` loop at all, so this went unnoticed. Fixed by
+splitting the concern: `reconcile_account_state` (resets the session
+baseline -- call once at startup and once per calendar day) vs. the new
+`refresh_account_state` (updates equity/cash/positions in place, leaves
+`equity_at_session_start`/`trades_today`/etc. untouched -- call every
+iteration in between). `predict-loop` was built on the correct pattern from
+the start; `papertrade`'s loop now tracks the calendar day the same way the
+backtester already does (`current_date` check before resetting the
+session). `tests/test_reconcile.py` now includes a test that would have
+caught this: intraday equity drop -> `check_daily_drawdown` must return
+`True`, and did not before this fix.
+
+---
+
 ## 2026-07-20 -- Add: real (paper) trading for the prediction pipeline + three technical strategies
 
 **Consequence-prediction pipeline now trades.** `engine act-on-predictions`

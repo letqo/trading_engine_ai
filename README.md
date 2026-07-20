@@ -46,7 +46,16 @@ engine predict-news --limit 10                                    # LLM conseque
 engine act-on-predictions                                         # trade confident predictions (real paper orders)
 engine resolve-predictions                                        # score predictions + close expired prediction trades
 engine predictions-report                                         # accuracy of resolved, forward-safe predictions
+engine predict-loop                                               # automatic: the three commands above, on a loop
 ```
+
+`engine predict-loop` is the default always-on mode -- it runs predict-news,
+act-on-predictions, and resolve-predictions every `PREDICTION_LOOP_POLL_SECONDS`
+(default 1h), forever, checking the kill switch and daily-drawdown halt each
+cycle exactly like `papertrade`. The individual commands above remain
+available any time for a manual, one-off run -- `predict-loop` doesn't
+replace them, it's just the automatic version. Without `ALPACA_API_KEY` set
+it still runs, but log-only (predictions get scored, never traded).
 
 Strategies: `buy_and_hold`, `random_entry` (Phase 3 baselines),
 `dumb_news` (Phase 4 control group), `overnight_gap` (Phase 5 candidate),

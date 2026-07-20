@@ -21,7 +21,7 @@ from engine.data.router import tag_and_route
 from engine.data.snapshot import create_snapshot
 from engine.data.universe import load_universe
 from engine.execution.alpaca import AlpacaAuthError, AlpacaPaperClient
-from engine.execution.reconcile import cancel_stale_orders, reconcile_account_state
+from engine.execution.reconcile import cancel_stale_orders, reconcile_account_state, refresh_account_state
 from engine.features.sentiment import score_news_item
 from engine.journal.db import get_session
 from engine.journal.models import RunMode, TradeSide
@@ -541,6 +541,7 @@ def papertrade(
     account = reconcile_account_state(client)
     cancel_stale_orders(client)
     risk_gate.start_new_session(account)
+    current_date = datetime.now(timezone.utc).date()
     logger.info("papertrade worker started", extra={"extra_fields": {"equity": account.equity}})
     alert_service_restart(settings)
 
@@ -555,7 +556,18 @@ def papertrade(
             break
 
         try:
-            account = reconcile_account_state(client)
+            today = datetime.now(timezone.utc).date()
+            if today != current_date:
+                # New trading day: this is the only point a fresh
+                # equity_at_session_start baseline should be taken -- doing
+                # this every iteration would make the daily-drawdown halt
+                # permanently see ~0% drawdown, since it'd always be
+                # comparing equity to itself. See engine.execution.reconcile.
+                account = reconcile_account_state(client)
+                risk_gate.start_new_session(account)
+                current_date = today
+            else:
+                refresh_account_state(client, account)
             if risk_gate.check_daily_drawdown(account):
                 logger.error("daily drawdown breached -- flattening", extra={"extra_fields": {"reason": account.halt_reason}})
                 alert_risk_halt(settings, account.halt_reason)
@@ -583,6 +595,128 @@ def papertrade(
         time.sleep(poll_seconds)
 
     logger.info("papertrade worker stopped")
+
+
+@app.command(name="predict-loop")
+def predict_loop(
+    poll_seconds: int = typer.Option(None, help="seconds between cycles; defaults to PREDICTION_LOOP_POLL_SECONDS"),
+    predict_limit: int = typer.Option(10, help="max headlines to analyze per cycle (each is a paid LLM call)"),
+    max_iterations: int = typer.Option(None, help="stop after N iterations (testing only; omit to run forever)"),
+) -> None:
+    """Automatic version of predict-news + act-on-predictions +
+    resolve-predictions: runs all three every `poll_seconds`, forever,
+    checking the kill switch and daily-drawdown halt each cycle exactly
+    like `papertrade` does. The individual commands remain available for
+    manual/one-off runs -- this is just the default always-on mode.
+
+    Requires ANTHROPIC_API_KEY (+ ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF). If
+    ALPACA_API_KEY isn't set, trading/closing is skipped and this becomes a
+    log-only forward-test loop (predict + resolve, never act-on/close).
+
+    Unlike papertrade, an unhandled exception inside one cycle is logged
+    and the loop continues to the next cycle rather than exiting -- a
+    transient RSS/API hiccup shouldn't permanently kill the whole
+    automatic mechanism the way it would a continuously-open-position
+    guardian process. A daily-drawdown breach or the kill switch still
+    stops it and flattens everything, same as papertrade.
+    """
+    settings = get_settings()
+    poll_seconds = poll_seconds if poll_seconds is not None else settings.prediction_loop_poll_seconds
+    try:
+        client = ConsequencePredictionClient(settings)
+    except PredictionConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+
+    universe = load_universe(settings.universe_path)
+    can_trade = bool(settings.alpaca_api_key and settings.alpaca_api_secret)
+    broker = risk_gate = account = current_date = None
+    if can_trade:
+        try:
+            enforce_paper_only(settings)
+        except PaperOnlyViolation as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1)
+        broker = AlpacaPaperClient(settings)
+        risk_gate = RiskGate(settings.risk)
+        account = reconcile_account_state(broker)
+        risk_gate.start_new_session(account)
+        current_date = datetime.now(timezone.utc).date()
+    else:
+        typer.echo("ALPACA_API_KEY not set -- running log-only (predictions will be scored but never traded).", err=True)
+
+    logger.info("predict-loop started", extra={"extra_fields": {"poll_seconds": poll_seconds, "can_trade": can_trade}})
+
+    iteration = 0
+    while max_iterations is None or iteration < max_iterations:
+        if is_kill_switch_engaged(settings):
+            logger.warning("kill switch engaged -- stopping predict-loop")
+            alert_kill_switch(settings)
+            if can_trade:
+                risk_gate.trigger_kill_switch(account, reason="kill switch engaged")
+                broker.cancel_all_orders()
+                broker.close_all_positions()
+            break
+
+        acted = closed = 0
+        try:
+            raw_items = fetch_all_rss()[:predict_limit]
+            predicted = 0
+            with get_session(settings) as session:
+                for raw in raw_items:
+                    tagged = tag_and_route(raw, universe)
+                    predicted += len(run_prediction_for_news_item(
+                        session, client, tagged, universe,
+                        resolution_window_hours=settings.prediction_resolution_hours,
+                        retrieval_limit=settings.prediction_retrieval_limit,
+                    ))
+
+            if can_trade:
+                today = datetime.now(timezone.utc).date()
+                if today != current_date:
+                    account = reconcile_account_state(broker)
+                    risk_gate.start_new_session(account)
+                    current_date = today
+                else:
+                    refresh_account_state(broker, account)
+
+                if risk_gate.check_daily_drawdown(account):
+                    logger.error(
+                        "daily drawdown breached -- flattening and stopping predict-loop",
+                        extra={"extra_fields": {"reason": account.halt_reason}},
+                    )
+                    alert_risk_halt(settings, account.halt_reason)
+                    broker.cancel_all_orders()
+                    broker.close_all_positions()
+                    break
+
+                with get_session(settings) as session:
+                    acted = len(act_on_pending_predictions(
+                        session, broker, risk_gate, account, universe,
+                        settings.prediction_action_confidence_threshold,
+                    ))
+                with get_session(settings) as session:
+                    closed = len(close_expired_prediction_trades(session, broker, risk_gate, account, universe))
+
+            with get_session(settings) as session:
+                resolved = len(resolve_pending_predictions(session))
+
+            logger.info(
+                "predict-loop cycle complete",
+                extra={"extra_fields": {
+                    "headlines": len(raw_items), "predicted": predicted,
+                    "acted": acted, "closed": closed, "resolved": resolved,
+                }},
+            )
+        except Exception:
+            logger.exception("unhandled exception in predict-loop cycle -- continuing to next cycle")
+
+        iteration += 1
+        if max_iterations is not None and iteration >= max_iterations:
+            break
+        time.sleep(poll_seconds)
+
+    logger.info("predict-loop stopped")
 
 
 if __name__ == "__main__":
