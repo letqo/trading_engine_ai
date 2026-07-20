@@ -5,6 +5,56 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-20 -- Add: Alpaca historical news backfill, replacing live-only RSS for backtests
+
+**What changed.** `engine/data/alpaca_news.py` fetches historical news from
+Alpaca's News API (`data.alpaca.markets/v1beta1/news`, Benzinga-sourced,
+real dated articles back to 2015). It reuses `ALPACA_API_KEY`/
+`ALPACA_API_SECRET` -- no new credential -- and isn't subject to the
+paper/live guard, since Alpaca's market data isn't split by paper/live
+account (only order routing is, which this doesn't touch).
+
+**Why.** The previous fix (2026-07-20, below) made `engine backtest` read
+news from the journal DB instead of blindly re-fetching live RSS, but that
+only solved the symptom: the DB was still only ever populated with
+"whatever RSS shows right now," so a backtest over a date range nobody had
+run `engine ingest` during would still come up empty. This endpoint has
+actual history, so that limitation is now fixed for anyone with an Alpaca
+key: `engine ingest --start <past date> --end <past date>` and
+`engine backtest` (when the DB has nothing cached for the range) both pull
+real news for that exact window. RSS remains the fallback when no Alpaca
+key is set or auth fails.
+
+**The bias-review trap this could have introduced, and how it's avoided.**
+`docs/bias_review.md` already flags this exact scenario: "a
+replayed/backfilled dataset assembled after the fact must not fabricate
+`ingested_at` from `published_at` ... or the backtest is quietly
+optimistic." We were not actually polling in, say, 2019, so there's no real
+historical ingestion timestamp for a backfilled article. Setting
+`ingested_at = published_at` (zero simulated lag) would assume a live
+poller learns about every headline the instant it's published, which no
+real polling pipeline does -- exactly the quietly-optimistic mistake. Fixed
+by simulating a fixed, pessimistic poll lag instead
+(`ALPACA_NEWS_BACKFILL_LAG_SECONDS`, default 900s): `ingested_at =
+published_at + lag`. This also uncovered a real latent bug:
+`record_news_item` had no `ingested_at` parameter at all -- it always used
+the row's `now()` default. For live RSS that's correct (the process really
+is seeing the item right now), but for backfilled historical rows it would
+have stamped every one with *today's* date regardless of how long ago it
+was published, pushing `NewsItem.decision_timestamp` past the entire
+backtest window and silently making the whole backfill inert. Added an
+optional `ingested_at` param, defaulting to `None` (old behavior preserved
+for RSS) with an explicit value required for backfill.
+
+**New CLI behavior.** `engine backtest`, when the DB has no cached news for
+the requested range: tries Alpaca backfill first (if `ALPACA_API_KEY` is
+set) and persists what it fetches to the DB so a repeat run over the same
+window hits the cache; only falls back to live RSS (with the existing
+"this will NOT match your window" warning) if no Alpaca key is configured
+or the Alpaca call fails auth.
+
+---
+
 ## 2026-07-20 -- Add: consequence-prediction forward-test pipeline + universe diversification
 
 **Consequence prediction (`engine.prediction`).** A second, separate news

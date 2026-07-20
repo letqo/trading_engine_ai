@@ -51,6 +51,22 @@ class Settings(BaseSettings):
     news_api_key: str | None = None
     finnhub_api_key: str | None = None
 
+    # Alpaca's historical news endpoint (data.alpaca.markets/v1beta1/news,
+    # Benzinga-sourced, back to 2015). Reuses alpaca_api_key/alpaca_api_secret
+    # above -- no separate credential. This is a market-data endpoint, not an
+    # order-routing one, so it isn't subject to the paper/live guard in
+    # engine.config.guard (Alpaca doesn't split market data by paper/live).
+    #
+    # ingested_at for backfilled articles can't be the real historical
+    # ingestion time (we weren't polling back then), so we simulate one:
+    # published_at + this lag. See engine/data/alpaca_news.py -- fabricating
+    # ingested_at = published_at (zero lag) would be the "quietly optimistic"
+    # mistake docs/bias_review.md warns about, so this defaults to a
+    # pessimistic worst-case poll interval instead of zero.
+    alpaca_news_backfill_lag_seconds: float = 900.0
+
+
+
     # Consequence-prediction pipeline (engine.prediction). Absent key -> the
     # pipeline refuses to run rather than silently doing nothing; see
     # engine/prediction/client.py.

@@ -76,6 +76,26 @@ def test_record_news_item_preserves_raw_payload(db_session):
     assert item.routed_symbols == ["SPY", "QQQ", "TLT"]
 
 
+def test_record_news_item_defaults_ingested_at_to_now(db_session):
+    before = datetime.now(timezone.utc)
+    item = record_news_item(
+        db_session, source="rss", published_at=NOW, headline="live", raw_payload={},
+    )
+    after = datetime.now(timezone.utc)
+    assert before <= item.ingested_at.replace(tzinfo=timezone.utc) <= after
+
+
+def test_record_news_item_accepts_explicit_ingested_at_for_backfill(db_session):
+    from datetime import timedelta
+
+    backfilled_ingested_at = NOW + timedelta(minutes=15)
+    item = record_news_item(
+        db_session, source="alpaca_benzinga", published_at=NOW, headline="historical",
+        raw_payload={}, ingested_at=backfilled_ingested_at,
+    )
+    assert item.ingested_at.replace(tzinfo=timezone.utc) == backfilled_ingested_at
+
+
 def test_load_news_items_filters_by_published_at_range(db_session):
     from datetime import timedelta
 

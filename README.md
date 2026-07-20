@@ -50,6 +50,13 @@ engine predictions-report                                         # accuracy of 
 Strategies: `buy_and_hold`, `random_entry` (Phase 3 baselines),
 `dumb_news` (Phase 4 control group), `overnight_gap` (Phase 5 candidate).
 
+`engine ingest`/`engine backtest` use Alpaca's News API (real dated
+articles back to 2015) for historical news whenever `ALPACA_API_KEY` is
+set, falling back to live-only RSS otherwise -- see
+`engine/data/alpaca_news.py`. This means a `backtest` over a past date
+range can now get news that actually existed in that range, instead of
+only whatever `engine ingest` happened to be running when it was current.
+
 The consequence-prediction pipeline (`engine.prediction`) is a separate,
 parallel research track -- not a strategy, doesn't touch RiskGate or the
 backtester. It asks an LLM to reason about indirect/second-order
@@ -61,7 +68,7 @@ what config it needs (`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF`).
 ## Architecture
 
 ```
-data/           ingestion (yfinance bars, RSS news) + storage, snapshots
+data/           ingestion (yfinance bars, RSS + Alpaca historical news) + storage, snapshots
 features/       sentiment scoring (VADER)
 strategy/       Strategy protocol + implementations (same object runs in
                 both the backtester and the live loop)

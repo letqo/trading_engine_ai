@@ -13,6 +13,7 @@ from engine.backtest.engine import BacktestEngine
 from engine.backtest.perturbation import run_perturbation_analysis
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
 from engine.config.settings import get_settings
+from engine.data.alpaca_news import AlpacaNewsAuthError, fetch_alpaca_news
 from engine.data.bars import bars_to_domain, fetch_bars
 from engine.data.events import EventType, build_event_stream
 from engine.data.news import fetch_all_rss
@@ -28,6 +29,7 @@ from engine.journal.registry import (
     current_git_hash,
     load_news_items,
     record_metrics,
+    record_news_item,
     record_reconciliation,
     record_trade,
     register_run,
@@ -62,6 +64,31 @@ def _fetch_scored_news(universe) -> list:
     return items
 
 
+def _backfill_alpaca_news(universe, settings, start_dt, end_dt) -> list:
+    """Fetch real historical news for [start_dt, end_dt] from Alpaca, tag +
+    score it, and persist it to the journal DB so a repeat backtest over the
+    same window hits the DB cache (load_news_items) instead of re-fetching."""
+    raw_items = fetch_alpaca_news(start_dt, end_dt, settings, symbols=sorted(universe.tradable_symbols()))
+    items = []
+    with get_session(settings) as session:
+        for raw in raw_items:
+            tagged = tag_and_route(raw, universe)
+            scored = score_news_item(tagged)
+            record_news_item(
+                session,
+                source=scored.source,
+                published_at=scored.published_at,
+                headline=scored.headline,
+                raw_payload=scored.raw_payload,
+                url=scored.url,
+                routed_symbols=list(scored.routed_symbols),
+                sentiment_score=scored.sentiment_score,
+                ingested_at=scored.ingested_at,
+            )
+            items.append(scored)
+    return items
+
+
 @app.callback()
 def main() -> None:
     settings = get_settings()
@@ -84,6 +111,7 @@ def ingest(
         snapshot = create_snapshot(
             session, universe, start=start, end=end, data_dir=settings.data_dir,
             interval=interval, include_news=news, description=description,
+            settings=settings,
         )
     typer.echo(f"snapshot {snapshot.id}: {snapshot.bar_row_count} bar rows, {snapshot.news_count} news items")
 
@@ -158,13 +186,21 @@ def backtest(
         end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
         with get_session(settings) as session:
             news_items = load_news_items(session, start_dt, end_dt)
-        if not news_items:
+        if not news_items and settings.alpaca_api_key:
+            try:
+                news_items = _backfill_alpaca_news(universe, settings, start_dt, end_dt)
+                typer.echo(f"backfilled {len(news_items)} historical news items from Alpaca for {start}..{end}")
+            except AlpacaNewsAuthError as exc:
+                typer.echo(f"alpaca news backfill failed ({exc}), falling back to today's live RSS", err=True)
+                news_items = _fetch_scored_news(universe)
+        elif not news_items:
             typer.echo(
                 f"no stored news for {start}..{end} -- free RSS feeds have no historical archive, "
-                f"so this range only has news if `engine ingest` was run while it was current. "
+                f"so this range only has news if `engine ingest` was run while it was current, and "
+                f"no ALPACA_API_KEY is set to backfill real historical news instead. "
                 f"Falling back to today's live RSS feed, which will NOT match this backtest window "
-                f"and will likely produce zero trades. Run `engine ingest` regularly to build a real "
-                f"historical corpus. See JOURNAL.md.",
+                f"and will likely produce zero trades. Set ALPACA_API_KEY/ALPACA_API_SECRET, or run "
+                f"`engine ingest` regularly, to build a real historical corpus. See JOURNAL.md.",
                 err=True,
             )
             news_items = _fetch_scored_news(universe)

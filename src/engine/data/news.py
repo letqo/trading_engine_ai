@@ -1,5 +1,11 @@
 """News ingestion: free RSS sources, no API key required.
 
+These feeds have no historical archive -- they only ever return
+currently-live items. For a real historical news corpus (e.g. to backtest
+over a past date range), see engine.data.alpaca_news, which is used
+automatically by `engine ingest`/`engine backtest` whenever ALPACA_API_KEY
+is set; RSS here remains the fallback.
+
 `Settings.news_api_key` / `Settings.finnhub_api_key` exist as config fields
 for a future NewsAPI/Finnhub source (SPEC.md: "one API free tier") but are
 not wired to a fetcher yet -- RSS is the only live source today. Don't

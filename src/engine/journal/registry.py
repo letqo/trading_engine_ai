@@ -150,7 +150,17 @@ def record_news_item(
     routed_symbols: list[str] | None = None,
     sentiment_score: float | None = None,
     sentiment_model: str | None = None,
+    ingested_at: datetime | None = None,
 ) -> NewsItemRecord:
+    """`ingested_at` defaults to the row's own default (now), which is
+    correct for live RSS ingestion -- the process really is seeing the item
+    right now. Backfilled historical news (engine.data.alpaca_news) must
+    pass an explicit `ingested_at`; otherwise every backfilled row would get
+    stamped with today's date regardless of how long ago it was published,
+    pushing NewsItem.decision_timestamp past the entire backtest window and
+    silently making the backfill useless for backtesting.
+    """
+    kwargs = {} if ingested_at is None else {"ingested_at": ingested_at}
     item = NewsItemRecord(
         source=source,
         published_at=published_at,
@@ -160,6 +170,7 @@ def record_news_item(
         routed_symbols=routed_symbols or [],
         sentiment_score=sentiment_score,
         sentiment_model=sentiment_model,
+        **kwargs,
     )
     session.add(item)
     session.commit()

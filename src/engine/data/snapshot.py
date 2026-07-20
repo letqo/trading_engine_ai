@@ -9,18 +9,23 @@ since the live worker needs them and the container filesystem is ephemeral.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from sqlmodel import Session
 
+from engine.config.settings import Settings, get_settings
+from engine.data.alpaca_news import AlpacaNewsAuthError, fetch_alpaca_news
 from engine.data.bars import fetch_bars, save_bars_parquet
 from engine.data.news import fetch_all_rss
 from engine.data.router import tag_and_route
 from engine.data.universe import Universe
 from engine.journal.models import DataSnapshot
 from engine.journal.registry import record_news_item, register_snapshot
+from engine.logging_setup import get_logger
+
+logger = get_logger(__name__)
 
 
 def create_snapshot(
@@ -32,13 +37,31 @@ def create_snapshot(
     interval: str = "1d",
     include_news: bool = True,
     description: str = "",
+    settings: Settings | None = None,
 ) -> DataSnapshot:
+    settings = settings or get_settings()
     symbols = sorted(universe.tradable_symbols())
     bars_df = fetch_bars(symbols, start=start, end=end, interval=interval)
 
     news_count = 0
     if include_news:
-        raw_news = fetch_all_rss()
+        start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+        end_dt = datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+
+        raw_news = None
+        use_alpaca_ingested_at = False
+        if settings.alpaca_api_key:
+            try:
+                raw_news = fetch_alpaca_news(start_dt, end_dt, settings, symbols=symbols)
+                use_alpaca_ingested_at = True
+            except AlpacaNewsAuthError as exc:
+                logger.warning("alpaca news fetch failed, falling back to RSS", extra={"extra_fields": {"error": str(exc)}})
+        if raw_news is None:
+            # No Alpaca key, or Alpaca auth failed: RSS only ever returns
+            # currently-live items, so this is only meaningful for an
+            # ingest run whose [start, end] covers "now".
+            raw_news = fetch_all_rss()
+
         for item in raw_news:
             tagged = tag_and_route(item, universe)
             record_news_item(
@@ -49,6 +72,7 @@ def create_snapshot(
                 raw_payload=tagged.raw_payload,
                 url=tagged.url,
                 routed_symbols=list(tagged.routed_symbols),
+                ingested_at=tagged.ingested_at if use_alpaca_ingested_at else None,
             )
             news_count += 1
 
