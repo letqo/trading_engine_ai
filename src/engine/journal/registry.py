@@ -407,10 +407,17 @@ def resolve_prediction(
     entry_price: float | None,
     exit_price: float | None,
     resolved_at: datetime,
+    mfe_pct: float | None = None,
+    mae_pct: float | None = None,
 ) -> Prediction:
     """Fill in the outcome fields exactly once. If price data wasn't
     available for either side, mark INVALID rather than guessing -- an
-    unresolvable prediction must never silently count as a miss."""
+    unresolvable prediction must never silently count as a miss.
+
+    mfe_pct/mae_pct are path context alongside the binary outcome, not a
+    replacement for it -- direction correctness is still decided purely by
+    entry_price vs. exit_price at the window boundary (see
+    docs/prediction_pipeline.md on why the horizon is never re-litigated)."""
     if entry_price is None or exit_price is None or entry_price <= 0:
         prediction.status = PredictionStatus.INVALID
         prediction.resolved_at = resolved_at
@@ -428,6 +435,8 @@ def resolve_prediction(
     prediction.exit_price = exit_price
     prediction.actual_return_pct = actual_return_pct
     prediction.outcome_correct = actual_direction == prediction.direction
+    prediction.mfe_pct = mfe_pct
+    prediction.mae_pct = mae_pct
     session.add(prediction)
     session.commit()
     session.refresh(prediction)

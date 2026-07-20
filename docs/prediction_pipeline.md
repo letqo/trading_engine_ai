@@ -67,6 +67,46 @@ impact -> [after the resolution window closes] fetch real price data,
 score, mark resolved -> that resolved row becomes available as context for
 the next cycle.
 
+## Resolution is a fixed-horizon snapshot, on purpose (2026-07-21)
+
+`resolve_prediction` compares exactly two prices: `entry_price` (the first
+bar at/after `news_decision_timestamp`) and `exit_price` (the last bar
+at/before `news_decision_timestamp + resolution_window_hours`, default
+24h). `outcome_correct` is set once, from that single comparison, and never
+revisited -- there is no mechanism, and deliberately none is planned, that
+lets a prediction scored "incorrect" become "correct" later because price
+kept moving. A forecast that claims "up over the next 24h" is a falsifiable
+statement about *that* window; letting the goalposts move until the market
+eventually agrees with it would make the accuracy metric measure patience,
+not skill.
+
+That said, a pure two-point comparison throws away everything that
+happened in between -- whether the prediction was ever actually validated
+by, say, an 8% adverse move mid-window before recovering. `mfe_pct` /
+`mae_pct` on `Prediction` capture that path context: the best
+(`mfe_pct`) and worst (`mae_pct`) the price moved relative to the
+predicted direction at any point during the window, both non-negative
+percentages of `entry_price`, computed from the same bars already being
+fetched for entry/exit (no extra data pulled). They're diagnostic, not
+scoring -- `outcome_correct` still depends only on the endpoint comparison
+above.
+
+This is also how the "wrong now, could become right later" concern
+actually gets addressed -- not by extending patience on the scoring side,
+but by keeping two independently-computed answers to two different
+questions: *was the forecast right at the horizon it committed to*
+(`outcome_correct`), and *would a real position have survived to collect
+that outcome* (`mae_pct` vs. `RiskGate`'s stop-loss threshold). A
+prediction can be `outcome_correct=True` with a `mae_pct` well past the
+live stop-loss -- that's not a contradiction, it means the directional
+call was right but a real position would have been stopped out before
+ever seeing it pay off. `engine predictions-report` flags exactly this
+count. See `engine.prediction.trading.close_expired_prediction_trades` for
+the actual (separate, already-existing) mechanism that realizes real P&L
+on this subset: it exits at the resolution window boundary or the
+stop-loss, whichever comes first, independent of how the prediction itself
+gets scored.
+
 ## What "skill" would actually look like
 
 Query `Prediction` where `status = resolved AND forward_safe = true`

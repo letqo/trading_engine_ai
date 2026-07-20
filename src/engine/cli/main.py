@@ -444,7 +444,8 @@ def resolve_predictions_cmd() -> None:
         resolved = resolve_pending_predictions(session)
     for p in resolved:
         outcome = p.status.value if p.status.value == "invalid" else ("correct" if p.outcome_correct else "incorrect")
-        typer.echo(f"  {p.symbol:6s} predicted={p.direction.value:5s} -> {outcome}")
+        excursion = f" mfe={p.mfe_pct:.2f}% mae={p.mae_pct:.2f}%" if p.mfe_pct is not None else ""
+        typer.echo(f"  {p.symbol:6s} predicted={p.direction.value:5s} -> {outcome}{excursion}")
     typer.echo(f"resolved {len(resolved)} predictions")
 
     if not settings.alpaca_api_key or not settings.alpaca_api_secret:
@@ -488,6 +489,26 @@ def predictions_report(
         return
     correct = sum(1 for r in rows if r.outcome_correct)
     typer.echo(f"resolved: {len(rows)}  correct: {correct}  accuracy: {correct / len(rows) * 100:.1f}%")
+
+    with_excursion = [r for r in rows if r.mae_pct is not None]
+    if with_excursion:
+        avg_mae = sum(r.mae_pct for r in with_excursion) / len(with_excursion)
+        avg_mfe = sum(r.mfe_pct for r in with_excursion) / len(with_excursion)
+        stop_pct = settings.risk.stop_loss_pct * 100.0
+        # A prediction can be right at the 24h mark yet have moved past the
+        # live stop-loss threshold at some point mid-window -- it would
+        # never have survived to collect that "correct" outcome for real.
+        would_have_stopped = sum(
+            1 for r in with_excursion if r.outcome_correct and r.mae_pct >= stop_pct
+        )
+        typer.echo(f"avg mfe: {avg_mfe:.2f}%  avg mae: {avg_mae:.2f}%")
+        if would_have_stopped:
+            typer.echo(
+                f"  {would_have_stopped} of {correct} 'correct' predictions moved past the "
+                f"{stop_pct:.1f}% stop-loss threshold before recovering -- a live position "
+                f"would have been stopped out despite the prediction ultimately being right."
+            )
+
     if not forward_safe_only:
         unsafe = sum(1 for r in rows if not r.forward_safe)
         if unsafe:
@@ -541,9 +562,10 @@ def prediction_trades_cmd() -> None:
         else:
             outcome = t.status.value
         move = f"{t.actual_return_pct:+.2f}%" if t.actual_return_pct is not None else "n/a"
+        excursion = f" mfe={t.mfe_pct:.2f}% mae={t.mae_pct:.2f}%" if t.mfe_pct is not None else ""
         typer.echo(
             f"  {t.symbol:6s} {t.direction.value:5s} qty={t.traded_quantity:.4f} conf={t.confidence:.2f} "
-            f"[{exit_state}] outcome={outcome} move={move}"
+            f"[{exit_state}] outcome={outcome} move={move}{excursion}"
         )
         typer.echo(f"      decision={t.news_decision_timestamp.isoformat()}  \"{t.news_headline[:70]}\"")
 

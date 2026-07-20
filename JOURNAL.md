@@ -5,6 +5,41 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-21 -- Add: max-favorable/max-adverse excursion (mfe_pct/mae_pct) on resolved predictions
+
+**Why.** Raised directly by a user question: "how do we handle the fact
+that price falls, then maybe rises again -- there's a time component where
+'wrong' can become 'right.'" The honest answer is that resolution never
+chases that (see the new "Resolution is a fixed-horizon snapshot, on
+purpose" section in `docs/prediction_pipeline.md` for why re-litigating the
+horizon would make the accuracy metric meaningless) -- but the
+`entry_price`/`exit_price` snapshot was throwing away real information
+that answers a related, legitimate question: not "did the market
+eventually agree," but "would a real position have survived to collect
+that outcome."
+
+**What changed.** `Prediction` gains `mfe_pct`/`mae_pct` (migration
+`9f2c7a4b1e3d`, both nullable, no backfill -- old resolved rows never kept
+their intermediate bars, so there's nothing honest to fill in). Computed in
+`engine.prediction.pipeline._fetch_resolution_data` from bars that were
+already being fetched for entry/exit -- no new data pull, just no longer
+discarding everything except the first and last bar. Both are non-negative
+pct-of-entry-price magnitudes relative to the *predicted* direction: how
+far price moved in its favor (mfe_pct) and against it (mae_pct) at any
+point during the window. `resolve_prediction` accepts them as optional
+params, set only on the RESOLVED path (never on INVALID, matching
+entry_price/exit_price's existing treatment).
+
+**Surfaced in `predictions-report`** as avg mfe/mae plus an explicit count:
+how many "correct" predictions had `mae_pct` past the configured
+`RISK_STOP_LOSS_PCT` -- i.e., directionally right at the 24h mark, but a
+live position with that stop would have been closed out before ever
+seeing it. Also shown per-row in `resolve-predictions` and
+`prediction-trades` output. Purely diagnostic -- `outcome_correct` still
+depends only on the entry/exit endpoint comparison, unchanged.
+
+---
+
 ## 2026-07-20 -- Add: live wiring for dumb_news/overnight_gap/momentum/mean_reversion/multi_factor
 
 **What changed.** `engine papertrade --strategy <name>` now actually trades

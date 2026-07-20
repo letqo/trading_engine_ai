@@ -231,6 +231,15 @@ class Prediction(SQLModel, table=True):
     exit_price: float | None = None
     actual_return_pct: float | None = None
     outcome_correct: bool | None = None
+    # Path context the entry/exit snapshot alone discards: how far price
+    # moved in the predicted direction's favor (mfe_pct) and against it
+    # (mae_pct) at any point during the window, not just at the endpoints.
+    # Both are non-negative pct magnitudes relative to entry_price. A
+    # prediction can be outcome_correct=True with a large mae_pct -- that
+    # means it was right at the 24h mark but would have needed a wider stop
+    # to actually capture it live. See docs/prediction_pipeline.md.
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
 
     # Set only if this prediction was acted on with a real (paper) order --
     # see engine.prediction.trading. None means "never traded, log-only."

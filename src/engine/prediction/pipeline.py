@@ -105,28 +105,50 @@ def run_prediction_for_news_item(
     return predictions
 
 
-def _fetch_entry_exit_prices(symbol: str, decision_timestamp: datetime, window_hours: float) -> tuple[float | None, float | None]:
+def _fetch_resolution_data(
+    symbol: str, decision_timestamp: datetime, window_hours: float, direction: PredictionDirection
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Entry/exit prices for scoring, plus max-favorable/max-adverse
+    excursion (mfe_pct/mae_pct) during the window -- the intermediate bars
+    were always fetched here, only entry/exit were ever kept. Excursions
+    are relative to `direction`: mfe_pct is the best the price got in the
+    predicted direction's favor, mae_pct the worst it moved against it,
+    both non-negative pct of entry_price. See docs/prediction_pipeline.md."""
     interval = "1h" if window_hours <= 72 else "1d"
     start = decision_timestamp.date()
     end = (decision_timestamp + timedelta(hours=window_hours, days=2)).date()
     df = fetch_bars([symbol], start=str(start), end=str(end), interval=interval)
     if df.empty:
-        return None, None
+        return None, None, None, None
 
-    df = df.sort_values("timestamp")
+    df = df.sort_values("timestamp").reset_index(drop=True)
     exit_deadline = decision_timestamp + timedelta(hours=window_hours)
 
-    entry_rows = df[df["timestamp"] >= decision_timestamp]
-    if entry_rows.empty:
-        return None, None
-    entry_price = float(entry_rows.iloc[0]["open"])
+    entry_positions = df.index[df["timestamp"] >= decision_timestamp]
+    if len(entry_positions) == 0:
+        return None, None, None, None
+    entry_pos = int(entry_positions[0])
+    entry_price = float(df.loc[entry_pos, "open"])
 
-    exit_rows = df[df["timestamp"] <= exit_deadline]
-    if exit_rows.empty:
-        exit_price = float(entry_rows.iloc[0]["close"])
+    exit_positions = df.index[df["timestamp"] <= exit_deadline]
+    if len(exit_positions) == 0:
+        exit_price = float(df.loc[entry_pos, "close"])
+        window = df.loc[[entry_pos]]
     else:
-        exit_price = float(exit_rows.iloc[-1]["close"])
-    return entry_price, exit_price
+        exit_pos = int(exit_positions[-1])
+        exit_price = float(df.loc[exit_pos, "close"])
+        lo, hi = sorted((entry_pos, exit_pos))
+        window = df.iloc[lo : hi + 1]
+
+    highest = float(window["high"].max())
+    lowest = float(window["low"].min())
+    if direction == PredictionDirection.UP:
+        mfe_pct = (highest - entry_price) / entry_price * 100.0
+        mae_pct = (entry_price - lowest) / entry_price * 100.0
+    else:
+        mfe_pct = (entry_price - lowest) / entry_price * 100.0
+        mae_pct = (highest - entry_price) / entry_price * 100.0
+    return entry_price, exit_price, mfe_pct, mae_pct
 
 
 def resolve_pending_predictions(session: Session, as_of: datetime | None = None) -> list[Prediction]:
@@ -137,10 +159,13 @@ def resolve_pending_predictions(session: Session, as_of: datetime | None = None)
     pending = load_pending_predictions_past_window(session, as_of)
     resolved = []
     for prediction in pending:
-        entry_price, exit_price = _fetch_entry_exit_prices(
-            prediction.symbol, prediction.news_decision_timestamp, prediction.resolution_window_hours
+        entry_price, exit_price, mfe_pct, mae_pct = _fetch_resolution_data(
+            prediction.symbol, prediction.news_decision_timestamp, prediction.resolution_window_hours, prediction.direction
         )
         resolved.append(
-            resolve_prediction(session, prediction, entry_price=entry_price, exit_price=exit_price, resolved_at=as_of)
+            resolve_prediction(
+                session, prediction, entry_price=entry_price, exit_price=exit_price,
+                resolved_at=as_of, mfe_pct=mfe_pct, mae_pct=mae_pct,
+            )
         )
     return resolved

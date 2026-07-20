@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from engine.data.universe import Instrument, Universe
 from engine.domain import NewsItem
@@ -164,3 +165,60 @@ def test_resolve_pending_predictions_marks_invalid_when_no_bars(db_session):
     with patch("engine.prediction.pipeline.fetch_bars", return_value=pd.DataFrame()):
         resolved = resolve_pending_predictions(db_session, as_of=NOW)
     assert resolved[0].status == PredictionStatus.INVALID
+    assert resolved[0].mfe_pct is None
+    assert resolved[0].mae_pct is None
+
+
+def test_resolve_pending_predictions_computes_excursion_for_down_prediction(db_session):
+    # Predicted DOWN. Price dips further than the endpoint (favorable) but
+    # also pops up mid-window before settling back down (adverse), then
+    # ends at the predicted direction.
+    pred = record_prediction(
+        db_session, news_headline="BOJ hikes", news_source="rss",
+        news_published_at=NOW - timedelta(days=2), news_decision_timestamp=NOW - timedelta(days=2),
+        topics=["boj"], symbol="EWJ", direction=PredictionDirection.DOWN, confidence=0.7, rationale="x",
+        model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF, forward_safe=True,
+        resolution_window_hours=24.0, in_tracked_universe=True,
+    )
+    decision_ts = pred.news_decision_timestamp
+    bars = _bars_df("EWJ", [
+        (decision_ts, 100.0, 100.0),                       # entry: open=100
+        (decision_ts + timedelta(hours=6), 100.0, 93.0),    # dips to low=93 (favorable for DOWN)
+        (decision_ts + timedelta(hours=12), 93.0, 104.0),   # pops to high=104 (adverse for DOWN)
+        (decision_ts + timedelta(hours=24), 104.0, 96.0),   # exit close=96
+    ])
+    with patch("engine.prediction.pipeline.fetch_bars", return_value=bars):
+        resolved = resolve_pending_predictions(db_session, as_of=NOW)
+
+    r = resolved[0]
+    assert r.status == PredictionStatus.RESOLVED
+    assert r.outcome_correct is True  # exit 96 < entry 100, predicted DOWN
+    assert r.mfe_pct == pytest.approx(7.0)   # (100 - 93) / 100 * 100
+    assert r.mae_pct == pytest.approx(4.0)   # (104 - 100) / 100 * 100
+
+
+def test_resolve_pending_predictions_correct_outcome_with_large_adverse_excursion(db_session):
+    # Predicted UP. Price craters mid-window (would have hit a stop-loss
+    # live) then recovers to close just above entry by the deadline --
+    # scored correct, but mae_pct reveals it would never have survived to
+    # collect that outcome in a live position with a tight stop.
+    pred = record_prediction(
+        db_session, news_headline="earnings beat", news_source="rss",
+        news_published_at=NOW - timedelta(days=2), news_decision_timestamp=NOW - timedelta(days=2),
+        topics=["earnings"], symbol="EWJ", direction=PredictionDirection.UP, confidence=0.7, rationale="x",
+        model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF, forward_safe=True,
+        resolution_window_hours=24.0, in_tracked_universe=True,
+    )
+    decision_ts = pred.news_decision_timestamp
+    bars = _bars_df("EWJ", [
+        (decision_ts, 100.0, 100.0),                      # entry: open=100
+        (decision_ts + timedelta(hours=8), 100.0, 90.0),  # craters to low=90
+        (decision_ts + timedelta(hours=24), 90.0, 101.0), # recovers, exit close=101
+    ])
+    with patch("engine.prediction.pipeline.fetch_bars", return_value=bars):
+        resolved = resolve_pending_predictions(db_session, as_of=NOW)
+
+    r = resolved[0]
+    assert r.outcome_correct is True  # exit 101 > entry 100, predicted UP
+    assert r.mae_pct == pytest.approx(10.0)  # (100 - 90) / 100 * 100 -- would've blown past a 2% stop
+    assert r.mfe_pct == pytest.approx(1.0)   # (101 - 100) / 100 * 100
