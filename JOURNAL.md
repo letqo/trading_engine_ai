@@ -5,6 +5,37 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-20 -- Add: unrestricted symbol naming (with universe growth via evidence, not automation)
+
+**What changed.** The consequence-prediction model was previously hard-
+restricted to naming only `universe.yaml` symbols ("the only symbols you
+may name" in the system prompt). That capped the pipeline's actual
+insight: if the real answer to "who's exposed by this headline" was a
+company outside the tracked 34, the model could only ever name the closest
+tracked proxy. The prompt/schema now let it name any real ticker it judges
+best; `Prediction.in_tracked_universe` (migration `6b0f3a85b65d`) records
+whether that symbol happens to be one we can act on. Off-universe
+predictions are logged and scored exactly like tracked ones -- they're
+real evidence either way -- they're just never eligible for a real order
+(`load_actionable_predictions` now filters on `in_tracked_universe`).
+
+**Growing the universe is a human decision, gated on accumulated evidence,
+never automatic.** `engine ticker-suggestions` aggregates every
+off-universe symbol by how many times it's been named, how many
+predictions have resolved, and the accuracy of those resolved ones (only
+forward_safe rows count, same integrity rule as everywhere else),
+flagging ones that cross a configurable count+accuracy bar as worth a
+look. Nothing in this codebase writes to `universe.yaml` -- the report
+surfaces the evidence, a human decides whether to add the symbol.
+
+**Visibility.** `engine prediction-trades` lists the history of every
+prediction actually acted on with a real order -- symbol, direction, size,
+open/closed state, and outcome once resolved -- separate from
+`predictions-report`'s aggregate accuracy number, since most predictions
+are logged and scored but never traded.
+
+---
+
 ## 2026-07-20 -- Add: automatic predict-loop, and a real daily-drawdown bug fix found while building it
 
 **`engine predict-loop`.** Automatic version of predict-news +

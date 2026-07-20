@@ -29,11 +29,15 @@ SYSTEM_PROMPT = """You analyze financial news for indirect, second-order market 
 -- the kind of reasoning that connects "a pandemic starts in China" to "cruise line and \
 airline stocks are exposed" without either company being named in the headline.
 
-You are given a headline and a fixed list of tracked ticker symbols (the only symbols you \
-may name). Identify zero or more symbols from that list that are plausibly, causally \
-affected by the news -- through supply chains, sector exposure, competitive dynamics, \
-macro sensitivity, or similar mechanisms -- even if the symbol is never mentioned directly. \
-Do not force a connection that isn't there; an empty result is a valid and often correct answer.
+You are given a headline and a list of symbols we currently have the ability to trade on. \
+That list is not a constraint on your reasoning -- name whichever real, exchange-listed \
+ticker is genuinely the best answer for a given effect, whether or not it's on that list. \
+Think about which sectors, themes, and specific companies plausibly win or lose from the \
+news first -- through supply chains, sector exposure, competitive dynamics, macro \
+sensitivity, or similar mechanisms, even if never mentioned directly -- then name the ticker. \
+Do not force a connection that isn't there; an empty result is a valid and often correct \
+answer. Do not guess at a ticker you're not confident actually exists for the company you \
+mean; say so in the rationale instead of inventing one.
 
 You may also be given a list of past cases: an earlier headline, what was predicted then, \
 and what actually happened. Use them as precedent -- notice if a similar mechanism worked or \
@@ -95,7 +99,8 @@ class ConsequencePredictionClient:
         lines = [
             f"Headline: {headline}",
             "",
-            f"Tracked symbols (only use these): {', '.join(tracked_symbols)}",
+            f"Symbols we can currently trade on (context, not a limit -- see system prompt): "
+            f"{', '.join(tracked_symbols)}",
         ]
         if past_cases:
             lines += ["", "Past cases:"] + [f"- {case}" for case in past_cases]

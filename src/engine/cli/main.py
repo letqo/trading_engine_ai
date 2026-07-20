@@ -28,6 +28,8 @@ from engine.journal.models import RunMode, TradeSide
 from engine.journal.registry import (
     current_git_hash,
     load_news_items,
+    load_off_universe_symbol_stats,
+    load_prediction_trades,
     record_metrics,
     record_news_item,
     record_reconciliation,
@@ -485,6 +487,59 @@ def predictions_report(
         if unsafe:
             typer.echo(f"WARNING: {unsafe} of these are NOT forward_safe (event predates the model's "
                        f"knowledge cutoff) -- they cannot be trusted as genuine evidence of skill.")
+
+
+@app.command(name="ticker-suggestions")
+def ticker_suggestions(
+    min_resolved: int = typer.Option(5, help="resolved forward-safe predictions needed before flagging as strong evidence"),
+    min_accuracy_pct: float = typer.Option(65.0, help="accuracy threshold (with min_resolved) to flag as strong evidence"),
+) -> None:
+    """Every symbol the model has named outside universe.yaml, with
+    accumulated evidence of how good that suggestion has been. Purely
+    informational -- nothing here ever adds a symbol to the universe
+    automatically; adding one to universe.yaml is always a human decision."""
+    settings = get_settings()
+    with get_session(settings) as session:
+        stats = load_off_universe_symbol_stats(session)
+    if not stats:
+        typer.echo("no off-universe suggestions yet")
+        return
+    for s in stats:
+        acc = f"{s.accuracy_pct:.1f}%" if s.accuracy_pct is not None else "n/a"
+        flag = ""
+        if s.resolved_count >= min_resolved and s.accuracy_pct is not None and s.accuracy_pct >= min_accuracy_pct:
+            flag = "  <-- STRONG EVIDENCE, consider adding to universe.yaml"
+        typer.echo(
+            f"  {s.symbol:8s} named={s.times_named:3d} resolved={s.resolved_count:3d} "
+            f"accuracy={acc:>6s} avg_conf={s.avg_confidence:.2f}{flag}"
+        )
+        typer.echo(f"      last: \"{s.most_recent_headline[:70]}\" -> {s.most_recent_rationale[:100]}")
+
+
+@app.command(name="prediction-trades")
+def prediction_trades_cmd() -> None:
+    """History of every prediction the pipeline actually acted on with a
+    real (paper) order -- entry, exit, and outcome once resolved. Most
+    recent first. Distinct from predictions-report: most predictions are
+    logged and scored but never traded."""
+    settings = get_settings()
+    with get_session(settings) as session:
+        trades = load_prediction_trades(session)
+    if not trades:
+        typer.echo("no prediction trades yet")
+        return
+    for t in trades:
+        exit_state = "OPEN" if t.exit_order_id is None else "CLOSED"
+        if t.status.value == "resolved":
+            outcome = "correct" if t.outcome_correct else "incorrect"
+        else:
+            outcome = t.status.value
+        move = f"{t.actual_return_pct:+.2f}%" if t.actual_return_pct is not None else "n/a"
+        typer.echo(
+            f"  {t.symbol:6s} {t.direction.value:5s} qty={t.traded_quantity:.4f} conf={t.confidence:.2f} "
+            f"[{exit_state}] outcome={outcome} move={move}"
+        )
+        typer.echo(f"      decision={t.news_decision_timestamp.isoformat()}  \"{t.news_headline[:70]}\"")
 
 
 @app.command()

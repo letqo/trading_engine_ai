@@ -211,6 +211,12 @@ class Prediction(SQLModel, table=True):
     direction: PredictionDirection
     confidence: float
     rationale: str
+    # False means the model named a symbol outside universe.yaml -- kept
+    # and scored (still real evidence) but never traded, since only vetted,
+    # Alpaca-tradable, risk-calibrated symbols are eligible for real orders.
+    # See `engine ticker-suggestions` for accumulated evidence on these,
+    # ahead of a human decision to add one to universe.yaml.
+    in_tracked_universe: bool = Field(index=True)
 
     model_name: str
     model_knowledge_cutoff: datetime

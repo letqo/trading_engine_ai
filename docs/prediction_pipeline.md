@@ -104,14 +104,52 @@ just happened, so it's always after the model's training cutoff by
 construction) -- it's still checked before trading anyway, out of caution,
 but confidence is the real gate here.
 
+## Reasoning isn't limited to the tracked universe; trading still is (2026-07-20)
+
+Earlier, the LLM's prompt hard-restricted it to naming only symbols from
+`universe.yaml` ("the only symbols you may name"). That was a real
+constraint on the reasoning itself -- if the actual best answer to "who's
+exposed by this" was a company we don't track, the model could only ever
+name the closest tracked proxy, which isn't the same thing as the real
+answer. This is now decoupled: the model can name any real ticker it
+judges to be the best fit; `Prediction.in_tracked_universe` records
+whether that symbol happens to be one we can act on.
+
+Every prediction is still logged and still scored by
+`resolve_pending_predictions` against real historical bars, tracked or not
+-- an off-universe pick is real evidence either way. Only
+`in_tracked_universe = true` rows are ever eligible for a real order
+(`load_actionable_predictions`), because only universe.yaml symbols are
+vetted as Alpaca-tradable and risk-calibrated; that's a hallucination and
+liquidity guardrail, not a reasoning limit.
+
+`engine ticker-suggestions` surfaces every off-universe symbol with its
+accumulated evidence (times named, resolved count, accuracy, most recent
+rationale), sorted by resolved sample size. It never adds anything to
+`universe.yaml` automatically -- growing the tracked universe is always a
+human decision, made by looking at accumulated evidence and editing
+`universe.yaml` directly. The report just makes that evidence visible
+instead of it sitting unexamined in the `Prediction` table.
+
+## Seeing what it's actually doing
+
+- `engine ticker-suggestions` -- off-universe symbol suggestions and their
+  track record (see above).
+- `engine prediction-trades` -- history of every prediction actually acted
+  on with a real order: symbol, direction, size, open/closed state, and
+  outcome once resolved. Distinct from `predictions-report`, which is
+  about the accuracy of the whole log; most predictions are never traded.
+
 ## What this pipeline is not
 
 - Not a general trading strategy wired into `engine papertrade`'s main
-  loop or the backtester's `Strategy` protocol -- `act-on-predictions` and
-  `resolve-predictions` are their own standalone commands, run on whatever
-  cadence you choose (e.g. a scheduled job), not driven by the bar-by-bar
-  event loop every other strategy uses. That's a deliberate difference:
-  this pipeline can't be backtested the normal way, so it was never worth
+  loop or the backtester's `Strategy` protocol -- `predict-news`,
+  `act-on-predictions`, and `resolve-predictions` are their own standalone
+  commands, not driven by the bar-by-bar event loop every other strategy
+  uses. `engine predict-loop` runs all three automatically on a schedule
+  (default hourly); the individual commands remain available for manual
+  runs. That's a deliberate difference from the other strategies: this
+  pipeline can't be backtested the normal way, so it was never worth
   forcing it into the same interface as strategies that can be.
 - Not a replacement for `engine.features.sentiment` or `engine.data.router`
   -- those still drive the actual dumb-news, Overnight-Gap, and

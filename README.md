@@ -46,6 +46,8 @@ engine predict-news --limit 10                                    # LLM conseque
 engine act-on-predictions                                         # trade confident predictions (real paper orders)
 engine resolve-predictions                                        # score predictions + close expired prediction trades
 engine predictions-report                                         # accuracy of resolved, forward-safe predictions
+engine ticker-suggestions                                         # off-universe symbols the model has named + evidence
+engine prediction-trades                                          # history of every prediction actually traded
 engine predict-loop                                               # automatic: the three commands above, on a loop
 ```
 
@@ -56,6 +58,14 @@ cycle exactly like `papertrade`. The individual commands above remain
 available any time for a manual, one-off run -- `predict-loop` doesn't
 replace them, it's just the automatic version. Without `ALPACA_API_KEY` set
 it still runs, but log-only (predictions get scored, never traded).
+
+The model isn't restricted to naming symbols from `universe.yaml` -- it
+can name any real ticker it judges relevant, and every prediction is
+logged and scored either way. Only tracked-universe symbols are ever
+eligible for a real order, though (vetted as tradable and risk-calibrated);
+`engine ticker-suggestions` shows what it's named outside that list and how
+those calls have done, as evidence toward a human decision to expand the
+universe -- nothing adds a symbol automatically.
 
 Strategies: `buy_and_hold`, `random_entry` (Phase 3 baselines),
 `dumb_news` (Phase 4 control group), `overnight_gap` (Phase 5 candidate),

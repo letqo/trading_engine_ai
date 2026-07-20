@@ -4,7 +4,9 @@ from engine.journal.models import PredictionDirection, PredictionStatus
 from engine.journal.registry import (
     load_actionable_predictions,
     load_expired_open_trades,
+    load_off_universe_symbol_stats,
     load_pending_predictions_past_window,
+    load_prediction_trades,
     load_resolved_predictions_by_topics,
     mark_prediction_exited,
     mark_prediction_traded,
@@ -16,7 +18,8 @@ NOW = datetime(2026, 7, 20, tzinfo=timezone.utc)
 CUTOFF = datetime(2026, 1, 31, tzinfo=timezone.utc)
 
 
-def _make(session, symbol="EWJ", topics=("boj",), status=None, decision_ts=NOW, resolution_hours=24.0):
+def _make(session, symbol="EWJ", topics=("boj",), status=None, decision_ts=NOW, resolution_hours=24.0,
+          confidence=0.7, in_tracked_universe=True):
     pred = record_prediction(
         session,
         news_headline="BOJ hikes rates unexpectedly",
@@ -26,12 +29,13 @@ def _make(session, symbol="EWJ", topics=("boj",), status=None, decision_ts=NOW, 
         topics=list(topics),
         symbol=symbol,
         direction=PredictionDirection.DOWN,
-        confidence=0.7,
+        confidence=confidence,
         rationale="rate hike strengthens yen, hurts exporters",
         model_name="claude-opus-4-8",
         model_knowledge_cutoff=CUTOFF,
         forward_safe=decision_ts > CUTOFF,
         resolution_window_hours=resolution_hours,
+        in_tracked_universe=in_tracked_universe,
     )
     if status is not None:
         pred.status = status
@@ -108,6 +112,7 @@ def test_load_actionable_predictions_filters_confidence_and_forward_safe(db_sess
         db_session, news_headline="x", news_source="rss", news_published_at=NOW, news_decision_timestamp=NOW,
         topics=["boj"], symbol="EWJ", direction=PredictionDirection.DOWN, confidence=0.3, rationale="x",
         model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF, forward_safe=True, resolution_window_hours=24.0,
+        in_tracked_universe=True,
     )
 
     results = load_actionable_predictions(db_session, min_confidence=0.6)
@@ -155,3 +160,55 @@ def test_mark_prediction_exited_sets_field(db_session):
     mark_prediction_traded(db_session, pred, order_id="order-1", quantity=10.0)
     updated = mark_prediction_exited(db_session, pred, order_id="order-2")
     assert updated.exit_order_id == "order-2"
+
+
+def test_load_off_universe_symbol_stats_aggregates_by_symbol(db_session):
+    p1 = _make(db_session, symbol="RANDOMCO", in_tracked_universe=False)
+    resolve_prediction(db_session, p1, entry_price=100.0, exit_price=95.0, resolved_at=NOW)  # DOWN predicted, correct
+    p2 = _make(db_session, symbol="RANDOMCO", in_tracked_universe=False, decision_ts=NOW - timedelta(days=1))
+    resolve_prediction(db_session, p2, entry_price=100.0, exit_price=110.0, resolved_at=NOW)  # DOWN predicted, wrong
+    _make(db_session, symbol="EWJ", in_tracked_universe=True)  # tracked -- must not appear
+
+    stats = load_off_universe_symbol_stats(db_session)
+    assert len(stats) == 1
+    s = stats[0]
+    assert s.symbol == "RANDOMCO"
+    assert s.times_named == 2
+    assert s.resolved_count == 2
+    assert s.correct_count == 1
+    assert s.accuracy_pct == 50.0
+
+
+def test_load_off_universe_symbol_stats_excludes_non_forward_safe_from_accuracy(db_session):
+    p1 = _make(
+        db_session, symbol="RANDOMCO", in_tracked_universe=False,
+        decision_ts=datetime(2025, 6, 1, tzinfo=timezone.utc),  # before CUTOFF -> forward_safe=False
+    )
+    resolve_prediction(db_session, p1, entry_price=100.0, exit_price=95.0, resolved_at=NOW)
+
+    stats = load_off_universe_symbol_stats(db_session)
+    assert stats[0].times_named == 1
+    assert stats[0].resolved_count == 0  # not forward_safe -- doesn't count as evidence
+
+
+def test_load_off_universe_symbol_stats_sorts_by_resolved_count_first(db_session):
+    lots_named_never_resolved = _make(db_session, symbol="NEVERRESOLVED", in_tracked_universe=False)
+    for _ in range(4):
+        _make(db_session, symbol="NEVERRESOLVED", in_tracked_universe=False)
+
+    p = _make(db_session, symbol="STRONGEVIDENCE", in_tracked_universe=False)
+    resolve_prediction(db_session, p, entry_price=100.0, exit_price=95.0, resolved_at=NOW)
+
+    stats = load_off_universe_symbol_stats(db_session)
+    assert stats[0].symbol == "STRONGEVIDENCE"  # 1 resolved beats 5 named-but-unresolved
+    assert lots_named_never_resolved.symbol == "NEVERRESOLVED"
+
+
+def test_load_prediction_trades_returns_only_traded_predictions(db_session):
+    traded = _make(db_session, symbol="EWJ")
+    mark_prediction_traded(db_session, traded, order_id="order-1", quantity=10.0)
+    _make(db_session, symbol="SPY")  # never traded -- must not appear
+
+    trades = load_prediction_trades(db_session)
+    assert len(trades) == 1
+    assert trades[0].id == traded.id

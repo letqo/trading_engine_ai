@@ -54,7 +54,17 @@ def run_prediction_for_news_item(
     retrieval_limit: int = 5,
 ) -> list[Prediction]:
     """Analyze one news item and persist a Prediction row per identified
-    impact. `item.topics` must already be set (engine.data.router.tag_and_route)."""
+    impact. `item.topics` must already be set (engine.data.router.tag_and_route).
+
+    The model is not restricted to the tracked universe (see
+    engine/prediction/client.py) -- every impact it names gets logged and
+    later scored, tracked or not. `in_tracked_universe` records which is
+    which: only tracked-universe predictions are eligible for real orders
+    (engine.prediction.trading), since only those symbols are vetted as
+    tradable and risk-calibrated. Off-universe predictions still count as
+    real evidence -- see `engine ticker-suggestions` for accumulating that
+    evidence toward a human decision to add a symbol to universe.yaml.
+    """
     tracked_symbols = sorted(universe.tradable_symbols())
     past_cases = load_resolved_predictions_by_topics(session, set(item.topics), limit=retrieval_limit)
     past_case_strings = [_format_past_case(p) for p in past_cases]
@@ -66,12 +76,12 @@ def run_prediction_for_news_item(
 
     predictions: list[Prediction] = []
     for impact in analysis.impacts:
-        if impact.symbol not in tracked_symbols:
-            logger.warning(
-                "prediction named a symbol outside the tracked universe -- dropped",
+        in_tracked_universe = impact.symbol in tracked_symbols
+        if not in_tracked_universe:
+            logger.info(
+                "prediction named a symbol outside the tracked universe -- logged, not tradable",
                 extra={"extra_fields": {"symbol": impact.symbol, "headline": item.headline}},
             )
-            continue
         predictions.append(
             record_prediction(
                 session,
@@ -88,6 +98,7 @@ def run_prediction_for_news_item(
                 model_knowledge_cutoff=knowledge_cutoff_dt,
                 forward_safe=forward_safe,
                 resolution_window_hours=resolution_window_hours,
+                in_tracked_universe=in_tracked_universe,
                 retrieved_context_ids=context_ids,
             )
         )

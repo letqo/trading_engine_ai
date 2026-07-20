@@ -5,6 +5,8 @@ format is defined in one place."""
 from __future__ import annotations
 
 import subprocess
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlmodel import Session, select
@@ -282,6 +284,7 @@ def record_prediction(
     model_knowledge_cutoff: datetime,
     forward_safe: bool,
     resolution_window_hours: float,
+    in_tracked_universe: bool,
     retrieved_context_ids: list[str] | None = None,
 ) -> Prediction:
     """Write one prediction row. Called before the outcome is known --
@@ -301,6 +304,7 @@ def record_prediction(
         model_knowledge_cutoff=model_knowledge_cutoff,
         forward_safe=forward_safe,
         resolution_window_hours=resolution_window_hours,
+        in_tracked_universe=in_tracked_universe,
         retrieved_context_ids=retrieved_context_ids or [],
     )
     session.add(prediction)
@@ -348,6 +352,7 @@ def load_actionable_predictions(session: Session, min_confidence: float) -> list
         select(Prediction).where(
             Prediction.status == PredictionStatus.PENDING,
             Prediction.forward_safe == True,  # noqa: E712
+            Prediction.in_tracked_universe == True,  # noqa: E712 -- only vetted, tradable symbols
             Prediction.confidence >= min_confidence,
             Prediction.traded_order_id.is_(None),
         )
@@ -427,3 +432,72 @@ def resolve_prediction(
     session.commit()
     session.refresh(prediction)
     return prediction
+
+
+@dataclass(frozen=True)
+class OffUniverseSymbolStats:
+    """One symbol the model named that isn't in universe.yaml, and
+    everything resolved so far about how good that suggestion has been --
+    the evidence a human should look at before deciding to add it."""
+
+    symbol: str
+    times_named: int
+    resolved_count: int
+    correct_count: int
+    avg_confidence: float
+    most_recent_headline: str
+    most_recent_rationale: str
+
+    @property
+    def accuracy_pct(self) -> float | None:
+        return (self.correct_count / self.resolved_count * 100.0) if self.resolved_count else None
+
+
+def load_off_universe_symbol_stats(session: Session) -> list[OffUniverseSymbolStats]:
+    """Aggregate every off-universe prediction by symbol, sorted by
+    resolved sample size first (most evidence first) -- a single lucky
+    guess with one resolved prediction is not the same kind of evidence as
+    ten resolved predictions at 70% accuracy. Only forward_safe rows count
+    toward resolved/correct, same integrity rule as everywhere else in this
+    pipeline. See `engine ticker-suggestions`."""
+    rows = session.exec(
+        select(Prediction)
+        .where(Prediction.in_tracked_universe == False)  # noqa: E712
+        .order_by(Prediction.created_at.desc())
+    ).all()
+
+    by_symbol: dict[str, list[Prediction]] = defaultdict(list)
+    for row in rows:
+        by_symbol[row.symbol].append(row)  # already created_at-desc from the query
+
+    stats = []
+    for symbol, preds in by_symbol.items():
+        resolved = [p for p in preds if p.status == PredictionStatus.RESOLVED and p.forward_safe]
+        correct = sum(1 for p in resolved if p.outcome_correct)
+        most_recent = preds[0]
+        stats.append(
+            OffUniverseSymbolStats(
+                symbol=symbol,
+                times_named=len(preds),
+                resolved_count=len(resolved),
+                correct_count=correct,
+                avg_confidence=sum(p.confidence for p in preds) / len(preds),
+                most_recent_headline=most_recent.news_headline,
+                most_recent_rationale=most_recent.rationale,
+            )
+        )
+    stats.sort(key=lambda s: (s.resolved_count, s.times_named), reverse=True)
+    return stats
+
+
+def load_prediction_trades(session: Session) -> list[Prediction]:
+    """Every prediction that was actually acted on with a real (paper)
+    order, most recent first -- the AI's trade history. Distinct from the
+    full prediction log: most predictions are logged and scored but never
+    traded (confidence too low, or the symbol isn't tradable)."""
+    rows = session.exec(
+        select(Prediction)
+        .where(Prediction.traded_order_id.is_not(None))
+        .order_by(Prediction.news_decision_timestamp.desc())
+    ).all()
+    return list(rows)

@@ -55,13 +55,13 @@ class FakeBroker:
         pass
 
 
-def make_prediction(session, *, direction, confidence=0.8, decision_ts=None, resolution_window_hours=24.0):
+def make_prediction(session, *, direction, confidence=0.8, decision_ts=None, resolution_window_hours=24.0, in_tracked_universe=True):
     decision_ts = decision_ts or NOW
     return record_prediction(
         session, news_headline="BOJ hikes rates", news_source="rss", news_published_at=decision_ts,
         news_decision_timestamp=decision_ts, topics=["boj"], symbol="EWJ", direction=direction,
         confidence=confidence, rationale="x", model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF,
-        forward_safe=True, resolution_window_hours=resolution_window_hours,
+        forward_safe=True, resolution_window_hours=resolution_window_hours, in_tracked_universe=in_tracked_universe,
     )
 
 

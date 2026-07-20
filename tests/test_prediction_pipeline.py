@@ -66,14 +66,18 @@ def test_run_prediction_persists_one_row_per_impact(db_session):
     assert pred.forward_safe is True
     assert pred.status == PredictionStatus.PENDING
     assert pred.model_name == "claude-opus-4-8"
+    assert pred.in_tracked_universe is True
 
 
-def test_run_prediction_drops_symbols_outside_universe(db_session):
+def test_run_prediction_keeps_but_flags_symbols_outside_universe(db_session):
+    # The model is not restricted to the tracked universe -- an off-universe
+    # name is logged (real evidence, see load_off_universe_symbol_stats), just
+    # flagged as untradable rather than silently dropped.
     universe = make_universe()
     analysis = ConsequenceAnalysis(
         impacts=[
             PredictedImpact(symbol="EWJ", direction="down", confidence=0.7, rationale="ok"),
-            PredictedImpact(symbol="NOTINUNIVERSE", direction="up", confidence=0.9, rationale="hallucinated"),
+            PredictedImpact(symbol="NOTINUNIVERSE", direction="up", confidence=0.9, rationale="off-universe pick"),
         ],
         overall_reasoning="x",
     )
@@ -81,8 +85,10 @@ def test_run_prediction_drops_symbols_outside_universe(db_session):
     predictions = run_prediction_for_news_item(
         db_session, client, make_news_item(), universe, resolution_window_hours=24.0
     )
-    assert len(predictions) == 1
-    assert predictions[0].symbol == "EWJ"
+    assert len(predictions) == 2
+    by_symbol = {p.symbol: p for p in predictions}
+    assert by_symbol["EWJ"].in_tracked_universe is True
+    assert by_symbol["NOTINUNIVERSE"].in_tracked_universe is False
 
 
 def test_run_prediction_passes_forward_safe_flag_from_client(db_session):
@@ -104,7 +110,7 @@ def test_run_prediction_includes_retrieved_past_cases_in_call(db_session):
         db_session, news_headline="past BOJ move", news_source="rss", news_published_at=NOW - timedelta(days=10),
         news_decision_timestamp=NOW - timedelta(days=10), topics=["boj"], symbol="EWJ",
         direction=PredictionDirection.DOWN, confidence=0.6, rationale="x", model_name="claude-opus-4-8",
-        model_knowledge_cutoff=CUTOFF, forward_safe=True, resolution_window_hours=24.0,
+        model_knowledge_cutoff=CUTOFF, forward_safe=True, resolution_window_hours=24.0, in_tracked_universe=True,
     )
     resolve_prediction(db_session, past, entry_price=100.0, exit_price=98.0, resolved_at=NOW)
 
@@ -131,7 +137,7 @@ def test_resolve_pending_predictions_computes_correct_outcome(db_session):
         news_published_at=NOW - timedelta(days=2), news_decision_timestamp=NOW - timedelta(days=2),
         topics=["boj"], symbol="EWJ", direction=PredictionDirection.DOWN, confidence=0.7, rationale="x",
         model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF, forward_safe=True,
-        resolution_window_hours=24.0,
+        resolution_window_hours=24.0, in_tracked_universe=True,
     )
     decision_ts = pred.news_decision_timestamp
     bars = _bars_df("EWJ", [
@@ -153,7 +159,7 @@ def test_resolve_pending_predictions_marks_invalid_when_no_bars(db_session):
         news_published_at=NOW - timedelta(days=2), news_decision_timestamp=NOW - timedelta(days=2),
         topics=["boj"], symbol="EWJ", direction=PredictionDirection.DOWN, confidence=0.7, rationale="x",
         model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF, forward_safe=True,
-        resolution_window_hours=24.0,
+        resolution_window_hours=24.0, in_tracked_universe=True,
     )
     with patch("engine.prediction.pipeline.fetch_bars", return_value=pd.DataFrame()):
         resolved = resolve_pending_predictions(db_session, as_of=NOW)
