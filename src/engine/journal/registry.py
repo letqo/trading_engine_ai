@@ -338,6 +338,53 @@ def load_pending_predictions_past_window(session: Session, as_of: datetime) -> l
     return [row for row in rows if _hours_elapsed(as_of, row.news_decision_timestamp) >= row.resolution_window_hours]
 
 
+def load_actionable_predictions(session: Session, min_confidence: float) -> list[Prediction]:
+    """Pending, forward-safe, confident-enough predictions not yet traded --
+    what `engine act-on-predictions` operates on. forward_safe is required
+    here too even though its real purpose is scoring integrity: trading on
+    a prediction that might reflect hindsight leakage would be reckless
+    regardless of which reason we'd be using it for."""
+    rows = session.exec(
+        select(Prediction).where(
+            Prediction.status == PredictionStatus.PENDING,
+            Prediction.forward_safe == True,  # noqa: E712
+            Prediction.confidence >= min_confidence,
+            Prediction.traded_order_id.is_(None),
+        )
+    ).all()
+    return list(rows)
+
+
+def mark_prediction_traded(session: Session, prediction: Prediction, *, order_id: str, quantity: float) -> Prediction:
+    prediction.traded_order_id = order_id
+    prediction.traded_quantity = quantity
+    session.add(prediction)
+    session.commit()
+    session.refresh(prediction)
+    return prediction
+
+
+def mark_prediction_exited(session: Session, prediction: Prediction, *, order_id: str) -> Prediction:
+    prediction.exit_order_id = order_id
+    session.add(prediction)
+    session.commit()
+    session.refresh(prediction)
+    return prediction
+
+
+def load_expired_open_trades(session: Session, as_of: datetime) -> list[Prediction]:
+    """Traded predictions whose resolution window has closed but whose
+    linked paper position hasn't been closed yet -- what closes real
+    exposure back out once the forward-test window ends."""
+    rows = session.exec(
+        select(Prediction).where(
+            Prediction.traded_order_id.is_not(None),
+            Prediction.exit_order_id.is_(None),
+        )
+    ).all()
+    return [row for row in rows if _hours_elapsed(as_of, row.news_decision_timestamp) >= row.resolution_window_hours]
+
+
 def _hours_elapsed(later: datetime, earlier: datetime) -> float:
     # SQLite drops tzinfo on round-trip; treat naive timestamps as UTC so
     # comparisons work identically against SQLite (dev) and Postgres (prod).

@@ -77,14 +77,47 @@ pipeline has no claim to skill yet -- it has no resolved forward-safe
 predictions until it's been run forward for a while. That absence is the
 expected starting state, not a bug.
 
+## Acting on predictions (`engine.prediction.trading`, 2026-07-20)
+
+The pipeline can now do more than log a hypothetical outcome: `engine
+act-on-predictions` submits a real paper order for any PENDING,
+forward_safe prediction whose confidence clears
+`PREDICTION_ACTION_CONFIDENCE_THRESHOLD` (default 0.6) -- "up" goes long,
+"down" goes short (see the short-selling support added to
+`engine.backtest.engine` the same day). `engine resolve-predictions` closes
+the linked position once the resolution window ends, in addition to its
+existing scoring step, if `ALPACA_API_KEY` is set.
+
+This does **not** change what makes the forward-test log honest:
+`forward_safe` still gates evidence-of-skill the same way, and every
+prediction -- traded or not -- is still scored against real historical bars
+by `resolve_pending_predictions`, independent of whether it was ever
+traded. Trading a subset of predictions adds a second, real-money-shaped
+(paper) consequence on top of the log; it doesn't touch the scoring itself.
+Every order still goes through `RiskGate.evaluate()`, no exceptions, same
+as every other order path in this codebase.
+
+Confidence gating for *trading* is deliberately separate from
+`forward_safe`, which is a scoring-integrity concept, not a trading-risk
+one: in live operation forward_safe is essentially always true (the event
+just happened, so it's always after the model's training cutoff by
+construction) -- it's still checked before trading anyway, out of caution,
+but confidence is the real gate here.
+
 ## What this pipeline is not
 
-- Not a trading strategy. Nothing here generates a `Signal` or touches
-  `RiskGate`/the backtester/paper trading. It is a research instrument for
-  finding out whether this kind of reasoning has any edge at all, logged
-  the same way any other experiment would be.
+- Not a general trading strategy wired into `engine papertrade`'s main
+  loop or the backtester's `Strategy` protocol -- `act-on-predictions` and
+  `resolve-predictions` are their own standalone commands, run on whatever
+  cadence you choose (e.g. a scheduled job), not driven by the bar-by-bar
+  event loop every other strategy uses. That's a deliberate difference:
+  this pipeline can't be backtested the normal way, so it was never worth
+  forcing it into the same interface as strategies that can be.
 - Not a replacement for `engine.features.sentiment` or `engine.data.router`
-  -- those still drive the actual dumb-news and Overnight-Gap strategies.
-  This is a separate, slower, LLM-cost-bearing track running in parallel.
+  -- those still drive the actual dumb-news, Overnight-Gap, and
+  price-action strategies. This is a separate, slower, LLM-cost-bearing
+  track running in parallel.
 - Not free. Each `engine predict-news` call is a paid Claude API call per
-  headline analyzed; `--limit` caps spend per run.
+  headline analyzed; `--limit` caps spend per run. Acting on a prediction
+  adds real (paper) order submission on top of that -- still no cost
+  beyond the LLM call itself, since Alpaca's paper trading is free.

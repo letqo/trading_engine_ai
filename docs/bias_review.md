@@ -79,8 +79,60 @@ strategies that already exist in this repo.
    trading against whatever cadence (if any) was assumed when a snapshot
    was built.
 4. **Other inflation risks:** The strategy only routes Tier 2 (macro basket)
-   symbols and only acts on positive sentiment (v1 is long-only, so negative
-   overnight sentiment is simply dropped rather than expressed as a hedge).
+   symbols and only acts on positive sentiment -- this strategy is long-only
+   by its own choice (the engine itself supports shorting as of 2026-07-20),
+   so negative overnight sentiment is simply dropped rather than expressed
+   as a short.
+
+## MomentumStrategy / MeanReversionStrategy / MultiFactorStrategy (`technical.py`) — pure price-action, 2026-07-20
+
+Grouped together: all three share the same indicator source and the same
+review answers except where noted.
+
+1. **Look-ahead:** None identified. Every indicator (`_pct_change`, the
+   z-score, `_recent_volatility_pct`) is computed from `ctx.bar_history`,
+   which the backtester only ever appends to as it walks forward one bar at
+   a time -- the list passed to a strategy at bar N never contains bar N+1.
+   A signal computed from bar N's close is queued and fills at bar N+1's
+   open, same as every other strategy. Risk specific to this family: the
+   indicator functions treat `bar_history`'s last element as "now," so any
+   caller that pre-populates `bar_history` with future bars (nothing in
+   this codebase does, but a careless test fixture could) would silently
+   leak foresight. The hand-computed tests in
+   `tests/test_technical_strategies.py` build history incrementally per
+   call, matching how the backtester actually calls `on_bar`, specifically
+   to guard against that.
+2. **Survivorship:** Same universe caveat as every other strategy -- these
+   trade whatever symbols are in `universe.tradable_symbols()` for the
+   requested window; no reconstruction of what was actually listed/liquid
+   at each historical point.
+3. **Publication vs ingestion:** N/A -- these strategies never call
+   `on_news`; they are pure price-action and have no publication-timing
+   surface at all.
+4. **Other inflation risks:**
+   - These are the first strategies in this repo to trade both directions
+     (BUY on bullish signals, SELL to open a short on bearish ones),
+     exercising `engine.backtest.engine`'s short-selling support added the
+     same day. See that module's docstring for the one open simplification
+     that applies to every short position in this codebase: margin/borrow
+     costs are not modeled.
+   - MomentumStrategy has no reversal detection -- it holds for a fixed
+     `exit_after_bars` regardless of whether the trend has already stalled
+     or reversed partway through. This is a known simplification, not a
+     bug: a smarter exit (trailing stop, momentum-decay exit) is a natural
+     next iteration but wasn't asked for here.
+   - MeanReversionStrategy's z-score assumes the lookback window's mean is
+     a meaningful "normal" level to revert to; it has no way to distinguish
+     "temporarily oversold" from "a genuine regime change" (e.g., a real
+     de-rating, not noise) -- RiskGate's stop-loss is the only backstop
+     against the latter.
+   - MultiFactorStrategy's volatility filter uses the *same* lookback
+     window as the long-term momentum measure, so in a strong, clean trend
+     that also happens to be volatile day-to-day (not unusual for single
+     names vs. ETFs), it may sit out real opportunities. Confidence scores
+     for all three are heuristic (scaled linearly off %move or z-score,
+     capped at 1.0) -- they size nothing on their own; RiskGate still owns
+     all position sizing.
    This means the backtest never sees how the strategy would have performed
    on the negative-news half of overnight events — it is not "wrong," but it
    is an intentionally incomplete strategy, and its win rate should not be

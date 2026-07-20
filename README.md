@@ -43,12 +43,15 @@ engine kill                                                       # kill switch
 engine papertrade                                                 # live worker loop
 
 engine predict-news --limit 10                                    # LLM consequence-prediction forward-test
-engine resolve-predictions                                        # score predictions past their resolution window
+engine act-on-predictions                                         # trade confident predictions (real paper orders)
+engine resolve-predictions                                        # score predictions + close expired prediction trades
 engine predictions-report                                         # accuracy of resolved, forward-safe predictions
 ```
 
 Strategies: `buy_and_hold`, `random_entry` (Phase 3 baselines),
-`dumb_news` (Phase 4 control group), `overnight_gap` (Phase 5 candidate).
+`dumb_news` (Phase 4 control group), `overnight_gap` (Phase 5 candidate),
+`momentum`, `mean_reversion`, `multi_factor` (pure price-action, trade both
+long and short -- see `engine/strategy/technical.py`).
 
 `engine ingest`/`engine backtest` use Alpaca's News API (real dated
 articles back to 2015) for historical news whenever `ALPACA_API_KEY` is
@@ -58,12 +61,17 @@ range can now get news that actually existed in that range, instead of
 only whatever `engine ingest` happened to be running when it was current.
 
 The consequence-prediction pipeline (`engine.prediction`) is a separate,
-parallel research track -- not a strategy, doesn't touch RiskGate or the
-backtester. It asks an LLM to reason about indirect/second-order
+parallel research track -- not a `Strategy`, not driven by the backtester's
+event loop. It asks an LLM to reason about indirect/second-order
 consequences of news (mechanisms keyword routing and VADER sentiment can't
-see), and forward-tests itself since it can't be backtested honestly. See
-[`docs/prediction_pipeline.md`](docs/prediction_pipeline.md) for why, and
-what config it needs (`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF`).
+see), and forward-tests itself since it can't be backtested honestly.
+Confident predictions can now be traded for real (paper) money via `engine
+act-on-predictions` -- both directions, through RiskGate like every other
+order -- with the position closed again by `engine resolve-predictions`
+once the resolution window ends. See
+[`docs/prediction_pipeline.md`](docs/prediction_pipeline.md) for why the
+forward-test design exists, and what config it needs (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF`, `PREDICTION_ACTION_CONFIDENCE_THRESHOLD`).
 
 ## Architecture
 
@@ -80,9 +88,9 @@ prediction/     LLM consequence-prediction forward-test loop (separate from stra
 cli/            ingest, replay, backtest, report, reconcile, kill, papertrade
 ```
 
-See module docstrings for the specific design decisions and why (long-only
-v1, no-overnight scoped to intraday bars, news `decision_timestamp` vs
-`published_at`, etc.) -- they're documented at the point of the decision,
+See module docstrings for the specific design decisions and why (long/short
+support in the backtester, no-overnight scoped to intraday bars, news
+`decision_timestamp` vs `published_at`, etc.) -- they're documented at the point of the decision,
 not duplicated here.
 
 ## Deployment

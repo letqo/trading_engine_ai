@@ -225,3 +225,11 @@ class Prediction(SQLModel, table=True):
     exit_price: float | None = None
     actual_return_pct: float | None = None
     outcome_correct: bool | None = None
+
+    # Set only if this prediction was acted on with a real (paper) order --
+    # see engine.prediction.trading. None means "never traded, log-only."
+    # traded_quantity is the actual approved fill size, needed to close the
+    # exact same size later without recomputing (equity may have moved).
+    traded_order_id: str | None = Field(default=None, index=True)
+    traded_quantity: float | None = None
+    exit_order_id: str | None = None

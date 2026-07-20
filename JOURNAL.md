@@ -5,6 +5,92 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-20 -- Add: real (paper) trading for the prediction pipeline + three technical strategies
+
+**Consequence-prediction pipeline now trades.** `engine act-on-predictions`
+submits a real paper order for any PENDING, forward_safe prediction whose
+confidence clears `PREDICTION_ACTION_CONFIDENCE_THRESHOLD` (default 0.6) --
+"up" goes long, "down" goes short. `engine resolve-predictions` now also
+closes the linked position once the resolution window ends (if
+`ALPACA_API_KEY` is set), in addition to its existing scoring step. Scoring
+itself is unchanged: every prediction, traded or not, is still scored
+against real historical bars the same way -- trading is a second, parallel
+consequence for a confident subset, not a replacement for the log's
+existing honesty mechanism. Every order still goes through
+`RiskGate.evaluate()`. New `Prediction` fields: `traded_order_id`,
+`traded_quantity`, `exit_order_id` (migration `dad98268679f`). New module:
+`engine/prediction/trading.py`.
+
+**Three new price-action strategies (`engine/strategy/technical.py`):**
+`momentum` (trend continuation over a configurable lookback), `mean_reversion`
+(z-score-based contrarian entries), `multi_factor` (momentum entries gated
+by a volatility/regime filter). None of these use news at all -- pure
+`bar_history`-driven indicators, a different signal source than the
+existing news-driven family. They're also the first strategies in this
+repo to actually trade both directions, which is what motivated reversing
+the long-only scope decision (previous entry, same day). Bias reviews for
+all three: `docs/bias_review.md`.
+
+**Found and fixed while touching `_default_params`/`--perturb` wiring:**
+`engine backtest --perturb` was silently non-functional for every strategy,
+not just the new ones. The CLI's perturbation factory
+(`lambda **kw: STRATEGY_FACTORIES[strategy](universe, seed)`) discarded the
+perturbed kwargs entirely and always rebuilt the identical default-param
+strategy, so every "perturbed" run was actually identical to the base run
+-- `fragile` could never be `True`. No test exercised this path (`grep
+perturb tests/` found only unit tests of `run_perturbation_analysis`
+itself, called with a correct factory directly, never through the CLI).
+Fixed with a separate `STRATEGY_PERTURBATION_FACTORIES` mapping that
+actually forwards perturbed values into each strategy's constructor.
+Verified against real data: `engine backtest --strategy momentum --start
+2026-04-01 --end 2026-07-01 --perturb` now shows perturbed sharpe values
+that actually differ from the base run and correctly flags two of four
+perturbations as fragile, where before this would have always printed
+`fragile=False` with identical perturbed/base numbers. This means **any
+prior `--perturb` output from before this fix should not be trusted** --
+it was reporting "not fragile" regardless of whether that was true.
+
+---
+
+## 2026-07-20 -- Add: short-selling support in the backtester (reversing the v1 long-only scope decision)
+
+**What changed.** The initial build's "long-only in v1" scope decision (see
+below, 2026-07-20 "Initial build") is reversed: `engine.backtest.engine` now
+supports opening, adding to, and closing short positions symmetrically with
+longs. A SELL signal from flat now opens a short instead of being silently
+dropped; a BUY signal against an existing short covers it; CLOSE flattens
+whichever direction is actually open.
+
+**Why now.** This was a deliberate v1 simplification, not a technical
+limitation -- `RiskGate.evaluate`/`_is_closing`/`is_stop_triggered`/
+`flatten_orders` were already written direction-agnostically (they key off
+`position.quantity`'s sign, not a long/short flag), because no existing
+strategy needed shorts yet. Only `BacktestEngine`'s own signal-queueing and
+fill/P&L logic assumed long-only, in four places: `_queue_signals` (dropped
+SELL-from-flat), `_fill_pending` (SELL only ever meant "close an existing
+long"), `_execute_fill` (BUY/SELL branches assumed long open/close, not
+short open/cover), and `_check_stop`/`_flatten_symbol` (both skipped any
+position with `quantity <= 0`, which would have silently never stopped-out
+or flattened a short once one existed -- a real latent safety gap, not just
+a missing feature). All four are now symmetric; P&L sign logic for
+closing/covering is centralized in one new helper (`_realize_close`) so a
+sign bug can't drift between the fill path, the stop-loss path, and the
+flatten path independently.
+
+**What's still a simplification, on purpose.** Margin requirements and
+stock-borrow fees for short positions are not modeled -- opening a short
+credits the sale proceeds to cash and debits them back on cover, with no
+borrow cost or margin-call mechanic. Acceptable for a paper-trading
+research engine; flagged so nobody mistakes backtest short P&L for what a
+real margin account would actually charge.
+
+**Existing strategies are unaffected.** `dumb_news` and `overnight_gap`
+still only ever emit BUY/CLOSE (never SELL-to-open) by their own choice --
+see their updated docstrings. The long-only assumption they document is now
+explicitly *their* design choice, not an engine-wide restriction.
+
+---
+
 ## 2026-07-20 -- Add: Alpaca historical news backfill, replacing live-only RSS for backtests
 
 **What changed.** `engine/data/alpaca_news.py` fetches historical news from

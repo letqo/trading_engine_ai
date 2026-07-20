@@ -29,18 +29,24 @@ def make_bar(symbol, ts, open_, close, high=None, low=None, timeframe="1h"):
 
 
 class ScriptedStrategy:
-    """Emits BUY at a chosen bar timestamp and CLOSE at another, nothing else."""
+    """Emits BUY/SELL at chosen bar timestamps and CLOSE at another, nothing else."""
 
     strategy_id = "scripted"
 
-    def __init__(self, buy_at: datetime | None = None, close_at: datetime | None = None, symbol="TEST"):
+    def __init__(
+        self, buy_at: datetime | None = None, sell_at: datetime | None = None,
+        close_at: datetime | None = None, symbol="TEST",
+    ):
         self.buy_at = buy_at
+        self.sell_at = sell_at
         self.close_at = close_at
         self.symbol = symbol
 
     def on_bar(self, ctx: MarketContext) -> list[Signal]:
         if self.buy_at is not None and ctx.timestamp == self.buy_at:
             return [Signal(symbol=self.symbol, action=SignalAction.BUY, strategy_id=self.strategy_id, timestamp=ctx.timestamp)]
+        if self.sell_at is not None and ctx.timestamp == self.sell_at:
+            return [Signal(symbol=self.symbol, action=SignalAction.SELL, strategy_id=self.strategy_id, timestamp=ctx.timestamp)]
         if self.close_at is not None and ctx.timestamp == self.close_at:
             return [Signal(symbol=self.symbol, action=SignalAction.CLOSE, strategy_id=self.strategy_id, timestamp=ctx.timestamp)]
         return []
@@ -165,6 +171,101 @@ def test_no_overnight_flattens_intraday_position_before_next_day():
     b2 = make_bar("TEST", day1_next, open_=100, close=105)  # last bar of day 1 -- must flatten here
     b3 = make_bar("TEST", day2, open_=110, close=110)
     strategy = ScriptedStrategy(buy_at=b1.timestamp)
+    engine = BacktestEngine(
+        strategy=strategy, universe=make_universe(), risk_gate=RiskGate(RiskLimits()),
+        initial_equity=10_000.0, cost_model=ZERO_COST,
+    )
+    result = engine.run([b1, b2, b3], news=[])
+    assert len(result.closed_trades) == 1
+    assert result.closed_trades[0].exit_reason == "no_overnight"
+    assert result.closed_trades[0].exit_time == b2.timestamp
+
+
+def test_short_sell_and_cover_hand_computed_pnl():
+    # Mirror of test_buy_and_close_hand_computed_pnl, but short: price falls
+    # from 100 to 80 instead of rising from 100 to 120, and it's the short
+    # side that profits. equity=10,000; 50% cap => $5,000 max position.
+    b1 = make_bar("TEST", T0, open_=100, close=100)
+    b2 = make_bar("TEST", T0 + timedelta(hours=1), open_=100, close=90)
+    b3 = make_bar("TEST", T0 + timedelta(hours=2), open_=80, close=80)
+
+    strategy = ScriptedStrategy(sell_at=b1.timestamp, close_at=b2.timestamp)
+    limits = RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0)
+    engine = BacktestEngine(
+        strategy=strategy, universe=make_universe(), risk_gate=RiskGate(limits),
+        initial_equity=10_000.0, cost_model=ZERO_COST,
+    )
+    result = engine.run([b1, b2, b3], news=[])
+
+    # SELL signal (queued after b1) opens a short at b2's open=100, sized to
+    # the $5,000 cap => 50 shares (short-sale proceeds credited to cash).
+    # CLOSE signal (queued after b2) covers at b3's open=80.
+    # realized pnl = (100 - 80) * 50 = 1000 -- a short profits when price falls.
+    assert len(result.closed_trades) == 1
+    trade = result.closed_trades[0]
+    assert trade.realized_pnl == pytest.approx(1000.0)
+    assert trade.entry_time == b2.timestamp
+    assert trade.exit_time == b3.timestamp
+
+    assert result.final_equity == pytest.approx(11_000.0)
+    assert result.metrics.total_return_pct == pytest.approx(10.0)
+    assert result.rejected_orders == 0
+
+    # b1 flat at 10,000; b2 short opened, marked at cash(15,000) + (-50*90) = 10,500;
+    # b3 covered, cash = 11,000
+    assert [round(p.equity, 2) for p in result.equity_curve] == [10_000.0, 10_500.0, 11_000.0]
+
+
+def test_stop_loss_triggers_intrabar_on_high_for_short():
+    # Mirror of test_stop_loss_triggers_intrabar_on_low: short at 100 (b2
+    # open), stop = 102 (2% default, adverse direction is UP for a short).
+    # b3's high pierces 102.
+    b1 = make_bar("TEST", T0, open_=100, close=100)
+    b2 = make_bar("TEST", T0 + timedelta(hours=1), open_=100, close=100)
+    b3 = make_bar("TEST", T0 + timedelta(hours=2), open_=101, close=101, high=103.0, low=100.5)
+    strategy = ScriptedStrategy(sell_at=b1.timestamp)
+    limits = RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0, stop_loss_pct=0.02)
+    engine = BacktestEngine(
+        strategy=strategy, universe=make_universe(), risk_gate=RiskGate(limits),
+        initial_equity=10_000.0, cost_model=ZERO_COST,
+    )
+    result = engine.run([b1, b2, b3], news=[])
+    assert len(result.closed_trades) == 1
+    assert result.closed_trades[0].exit_reason == "stop_loss"
+    assert result.closed_trades[0].realized_pnl < 0
+
+
+def test_daily_drawdown_halt_flattens_short_position():
+    # Mirror of test_daily_drawdown_halt_flattens_and_blocks_new_entries: a
+    # short position loses enough on a price spike to breach 3% daily
+    # drawdown. stop_loss_pct is set high so the halt (not the stop) fires.
+    b1 = make_bar("TEST", T0, open_=100, close=100)
+    b2 = make_bar("TEST", T0 + timedelta(hours=1), open_=100, close=100)
+    # stop_loss_pct=0.60 -> stop at 160; high=155 stays under it so the
+    # drawdown halt (not the stop) is what fires, mirroring the long version.
+    b3 = make_bar("TEST", T0 + timedelta(hours=2), open_=100, close=150, high=155, low=100)
+    strategy = ScriptedStrategy(sell_at=b1.timestamp)
+    limits = RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0, max_daily_drawdown_pct=0.03, stop_loss_pct=0.60)
+    engine = BacktestEngine(
+        strategy=strategy, universe=make_universe(), risk_gate=RiskGate(limits),
+        initial_equity=10_000.0, cost_model=ZERO_COST,
+    )
+    result = engine.run([b1, b2, b3], news=[])
+    assert len(result.halt_events) == 1
+    assert "drawdown" in result.halt_events[0]
+    assert len(result.closed_trades) == 1
+    assert result.closed_trades[0].exit_reason == "daily_drawdown_halt"
+    assert result.closed_trades[0].realized_pnl < 0
+
+
+def test_no_overnight_flattens_short_position_before_next_day():
+    day1 = T0
+    day1_next = T0 + timedelta(hours=1)
+    day2 = T0 + timedelta(days=1)
+    b1 = make_bar("TEST", day1, open_=100, close=100)
+    b2 = make_bar("TEST", day1_next, open_=100, close=95)  # last bar of day 1 -- must flatten here
+    b3 = make_bar("TEST", day2, open_=90, close=90)
+    strategy = ScriptedStrategy(sell_at=b1.timestamp)
     engine = BacktestEngine(
         strategy=strategy, universe=make_universe(), risk_gate=RiskGate(RiskLimits()),
         initial_equity=10_000.0, cost_model=ZERO_COST,

@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     anthropic_model_knowledge_cutoff: str = "1970-01-01"
     prediction_resolution_hours: float = 24.0
     prediction_retrieval_limit: int = 5
+    # Minimum confidence before a prediction is acted on with a real (paper)
+    # order -- see engine.prediction.trading. Predictions below this are
+    # still logged and scored, just never traded.
+    prediction_action_confidence_threshold: float = 0.6
 
     alert_webhook_url: str | None = None
 

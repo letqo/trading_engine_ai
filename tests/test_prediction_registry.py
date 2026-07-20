@@ -2,8 +2,12 @@ from datetime import datetime, timedelta, timezone
 
 from engine.journal.models import PredictionDirection, PredictionStatus
 from engine.journal.registry import (
+    load_actionable_predictions,
+    load_expired_open_trades,
     load_pending_predictions_past_window,
     load_resolved_predictions_by_topics,
+    mark_prediction_exited,
+    mark_prediction_traded,
     record_prediction,
     resolve_prediction,
 )
@@ -94,3 +98,60 @@ def test_resolve_prediction_invalid_when_price_missing(db_session):
     resolved = resolve_prediction(db_session, pred, entry_price=None, exit_price=95.0, resolved_at=NOW)
     assert resolved.status == PredictionStatus.INVALID
     assert resolved.outcome_correct is None
+
+
+def test_load_actionable_predictions_filters_confidence_and_forward_safe(db_session):
+    confident = _make(db_session)  # confidence=0.7, forward_safe=True (decision_ts=NOW > CUTOFF)
+    _make(db_session, decision_ts=datetime(2025, 6, 1, tzinfo=timezone.utc))  # forward_safe=False
+
+    low_confidence = record_prediction(
+        db_session, news_headline="x", news_source="rss", news_published_at=NOW, news_decision_timestamp=NOW,
+        topics=["boj"], symbol="EWJ", direction=PredictionDirection.DOWN, confidence=0.3, rationale="x",
+        model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF, forward_safe=True, resolution_window_hours=24.0,
+    )
+
+    results = load_actionable_predictions(db_session, min_confidence=0.6)
+    ids = {p.id for p in results}
+    assert confident.id in ids
+    assert low_confidence.id not in ids
+    assert len(ids) == 1
+
+
+def test_load_actionable_predictions_excludes_already_traded(db_session):
+    pred = _make(db_session)
+    mark_prediction_traded(db_session, pred, order_id="order-1", quantity=10.0)
+    results = load_actionable_predictions(db_session, min_confidence=0.6)
+    assert results == []
+
+
+def test_mark_prediction_traded_sets_fields(db_session):
+    pred = _make(db_session)
+    updated = mark_prediction_traded(db_session, pred, order_id="order-1", quantity=42.0)
+    assert updated.traded_order_id == "order-1"
+    assert updated.traded_quantity == 42.0
+    assert updated.exit_order_id is None
+
+
+def test_load_expired_open_trades_filters_window_and_exit_state(db_session):
+    expired_open = _make(db_session, decision_ts=NOW - timedelta(hours=25), resolution_hours=24.0)
+    mark_prediction_traded(db_session, expired_open, order_id="order-1", quantity=10.0)
+
+    still_open_within_window = _make(db_session, decision_ts=NOW - timedelta(hours=1), resolution_hours=24.0)
+    mark_prediction_traded(db_session, still_open_within_window, order_id="order-2", quantity=10.0)
+
+    _make(db_session, decision_ts=NOW - timedelta(hours=25), resolution_hours=24.0)  # never traded -- not in scope
+
+    already_exited = _make(db_session, decision_ts=NOW - timedelta(hours=25), resolution_hours=24.0)
+    mark_prediction_traded(db_session, already_exited, order_id="order-3", quantity=10.0)
+    mark_prediction_exited(db_session, already_exited, order_id="order-4")
+
+    results = load_expired_open_trades(db_session, as_of=NOW)
+    ids = {p.id for p in results}
+    assert ids == {expired_open.id}
+
+
+def test_mark_prediction_exited_sets_field(db_session):
+    pred = _make(db_session)
+    mark_prediction_traded(db_session, pred, order_id="order-1", quantity=10.0)
+    updated = mark_prediction_exited(db_session, pred, order_id="order-2")
+    assert updated.exit_order_id == "order-2"

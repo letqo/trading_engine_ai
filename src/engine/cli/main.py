@@ -38,11 +38,13 @@ from engine.logging_setup import configure_logging, get_logger
 from engine.observability import alert_kill_switch, alert_risk_halt, alert_service_restart
 from engine.prediction.client import ConsequencePredictionClient, PredictionConfigError
 from engine.prediction.pipeline import resolve_pending_predictions, run_prediction_for_news_item
+from engine.prediction.trading import act_on_pending_predictions, close_expired_prediction_trades
 from engine.risk.gate import RiskGate
 from engine.risk.kill_switch import disengage_kill_switch, engage_kill_switch, is_kill_switch_engaged
 from engine.strategy.baselines import BuyAndHoldStrategy, RandomEntryStrategy
 from engine.strategy.dumb_news import DumbNewsStrategy
 from engine.strategy.overnight_gap import OvernightGapStrategy
+from engine.strategy.technical import MeanReversionStrategy, MomentumStrategy, MultiFactorStrategy
 
 app = typer.Typer(add_completion=False, help="News-driven trading research engine (paper trading only).")
 logger = get_logger("engine.cli")
@@ -52,8 +54,34 @@ STRATEGY_FACTORIES = {
     "random_entry": lambda universe, seed: RandomEntryStrategy(symbols=sorted(universe.tradable_symbols()), seed=seed),
     "dumb_news": lambda universe, seed: DumbNewsStrategy(),
     "overnight_gap": lambda universe, seed: OvernightGapStrategy(universe),
+    "momentum": lambda universe, seed: MomentumStrategy(symbols=sorted(universe.tradable_symbols())),
+    "mean_reversion": lambda universe, seed: MeanReversionStrategy(symbols=sorted(universe.tradable_symbols())),
+    "multi_factor": lambda universe, seed: MultiFactorStrategy(symbols=sorted(universe.tradable_symbols())),
 }
 NEWS_DRIVEN_STRATEGIES = {"dumb_news", "overnight_gap"}
+
+def _int_cast(kw: dict, *keys: str) -> dict:
+    return {k: (int(v) if k in keys else v) for k, v in kw.items()}
+
+
+# Separate from STRATEGY_FACTORIES: these actually forward perturbed
+# parameter values into the strategy constructor (--perturb varies one
+# param at a time and needs the perturbed value to reach the strategy, not
+# just rebuild the same default-param strategy every iteration).
+STRATEGY_PERTURBATION_FACTORIES = {
+    "random_entry": lambda universe, seed, **kw: RandomEntryStrategy(
+        symbols=sorted(universe.tradable_symbols()), seed=seed, **_int_cast(kw, "exit_after_bars"),
+    ),
+    "dumb_news": lambda universe, seed, **kw: DumbNewsStrategy(**kw),
+    "overnight_gap": lambda universe, seed, **kw: OvernightGapStrategy(universe, **kw),
+    "momentum": lambda universe, seed, **kw: MomentumStrategy(
+        symbols=sorted(universe.tradable_symbols()), **_int_cast(kw, "exit_after_bars"),
+    ),
+    "mean_reversion": lambda universe, seed, **kw: MeanReversionStrategy(symbols=sorted(universe.tradable_symbols()), **kw),
+    "multi_factor": lambda universe, seed, **kw: MultiFactorStrategy(
+        symbols=sorted(universe.tradable_symbols()), **_int_cast(kw, "exit_after_bars"),
+    ),
+}
 
 
 def _fetch_scored_news(universe) -> list:
@@ -250,8 +278,9 @@ def backtest(
         if not base_params:
             typer.echo("no numeric params to perturb for this strategy")
         else:
+            perturbation_factory = STRATEGY_PERTURBATION_FACTORIES[strategy]
             report = run_perturbation_analysis(
-                strategy_factory=lambda **kw: STRATEGY_FACTORIES[strategy](universe, seed),
+                strategy_factory=lambda **kw: perturbation_factory(universe, seed, **kw),
                 base_params=base_params, bars=bars, news=news_items, universe=universe,
                 risk_gate_factory=lambda: RiskGate(settings.risk),
             )
@@ -269,6 +298,12 @@ def _default_params(strategy: str, universe, seed: int) -> dict:
         return {"sentiment_threshold": 0.5, "exit_after_hours": 4.0}
     if strategy == "overnight_gap":
         return {"sentiment_threshold": 0.5, "exit_after_hours": 3.0}
+    if strategy == "momentum":
+        return {"entry_threshold_pct": 2.0, "exit_after_bars": 10}
+    if strategy == "mean_reversion":
+        return {"entry_zscore": 1.5, "exit_zscore": 0.3}
+    if strategy == "multi_factor":
+        return {"max_volatility_pct": 5.0, "exit_after_bars": 10}
     return {}
 
 
@@ -355,10 +390,47 @@ def predict_news(
     typer.echo(f"analyzed {len(raw_items)} headlines, logged {total_predictions} predictions")
 
 
+@app.command(name="act-on-predictions")
+def act_on_predictions_cmd(
+    min_confidence: float = typer.Option(None, help="override PREDICTION_ACTION_CONFIDENCE_THRESHOLD for this run"),
+) -> None:
+    """Submit a real paper order for every actionable prediction (pending,
+    forward_safe, confident enough, not yet traded) -- "up" goes long,
+    "down" goes short, both through RiskGate like every other order path.
+    Predictions below the confidence threshold are left log-only. Requires
+    ALPACA_API_KEY/ALPACA_API_SECRET; refuses to run against anything but
+    the paper endpoint (engine.config.guard)."""
+    settings = get_settings()
+    try:
+        enforce_paper_only(settings)
+    except PaperOnlyViolation as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+    if not settings.alpaca_api_key or not settings.alpaca_api_secret:
+        typer.echo("ALPACA_API_KEY / ALPACA_API_SECRET not set -- cannot trade predictions.", err=True)
+        raise typer.Exit(1)
+
+    threshold = min_confidence if min_confidence is not None else settings.prediction_action_confidence_threshold
+    universe = load_universe(settings.universe_path)
+    client = AlpacaPaperClient(settings)
+    risk_gate = RiskGate(settings.risk)
+    account = reconcile_account_state(client)
+    risk_gate.start_new_session(account)
+
+    with get_session(settings) as session:
+        acted = act_on_pending_predictions(session, client, risk_gate, account, universe, threshold)
+    for p in acted:
+        typer.echo(f"  TRADED {p.symbol:6s} {p.direction.value:5s} qty={p.traded_quantity:.4f} conf={p.confidence:.2f} order={p.traded_order_id}")
+    typer.echo(f"acted on {len(acted)} predictions (confidence >= {threshold})")
+
+
 @app.command(name="resolve-predictions")
 def resolve_predictions_cmd() -> None:
     """Score every pending prediction whose resolution window has closed,
-    against real price data. Never re-scores an already-resolved row."""
+    against real price data. Never re-scores an already-resolved row. Also
+    closes the real paper position for any traded prediction whose window
+    has closed, if ALPACA_API_KEY is set -- scoring itself never needs a
+    broker connection, only realizing the linked trade's P&L does."""
     settings = get_settings()
     with get_session(settings) as session:
         resolved = resolve_pending_predictions(session)
@@ -366,6 +438,24 @@ def resolve_predictions_cmd() -> None:
         outcome = p.status.value if p.status.value == "invalid" else ("correct" if p.outcome_correct else "incorrect")
         typer.echo(f"  {p.symbol:6s} predicted={p.direction.value:5s} -> {outcome}")
     typer.echo(f"resolved {len(resolved)} predictions")
+
+    if not settings.alpaca_api_key or not settings.alpaca_api_secret:
+        return
+    try:
+        enforce_paper_only(settings)
+    except PaperOnlyViolation as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+    universe = load_universe(settings.universe_path)
+    client = AlpacaPaperClient(settings)
+    risk_gate = RiskGate(settings.risk)
+    account = reconcile_account_state(client)
+    risk_gate.start_new_session(account)
+    with get_session(settings) as session:
+        closed = close_expired_prediction_trades(session, client, risk_gate, account, universe)
+    for p in closed:
+        typer.echo(f"  CLOSED {p.symbol:6s} order={p.exit_order_id}")
+    typer.echo(f"closed {len(closed)} prediction trades")
 
 
 @app.command(name="predictions-report")

@@ -10,11 +10,19 @@ SPEC.md requirements this satisfies:
   - daily-drawdown halt, consecutive-loss halt, and no-overnight flattening
     are enforced identically to how the live loop would enforce them.
 
-Scope decision (v1): LONG ONLY. Every strategy SPEC.md actually asks for in
-v1 (buy-and-hold, random-entry, positive-sentiment-headline, Overnight-Gap)
-is long-side; short-selling brings margin/borrow mechanics that are out of
-scope until a strategy needs them. A SELL/CLOSE signal with no open long
-position is simply dropped -- it is never turned into a short.
+Both directions are supported: a BUY signal opens/adds to a long (or covers
+an existing short), a SELL signal opens/adds to a short (or closes an
+existing long), and CLOSE flattens whatever is open, whichever direction
+that is. Position.quantity is signed (positive = long, negative = short)
+throughout -- RiskGate.evaluate/_is_closing/is_stop_triggered/flatten_orders
+were already written direction-agnostically; only this module's fill/P&L
+logic needed to stop assuming long-only. One deliberate simplification
+carried forward: margin requirements and stock-borrow fees for short
+positions are not modeled -- opening a short here just credits the sale
+proceeds to cash and debits them back on cover, with no borrow cost or
+margin-call mechanic. That's an acceptable simplification for a paper-
+trading research engine, but means the backtest is somewhat optimistic
+about the true cost of holding a short relative to a real margin account.
 
 Scope decision (v1): the no-overnight-positions rule is enforced for
 intraday timeframes (where "before market close" is a real moment within
@@ -170,19 +178,16 @@ class BacktestEngine:
     def _queue_signals(pending_orders, signals, account: AccountState) -> None:
         for signal in signals:
             existing = account.positions.get(signal.symbol)
-            is_long = existing is not None and existing.quantity > 0
+            signed_qty = existing.quantity if existing is not None else 0.0
 
             if signal.action == SignalAction.BUY:
                 side = Side.BUY
             elif signal.action == SignalAction.SELL:
                 side = Side.SELL
-            else:  # CLOSE
-                if not is_long:
+            else:  # CLOSE -- flatten whichever direction is actually open
+                if signed_qty == 0:
                     continue
-                side = Side.SELL
-
-            if side == Side.SELL and not is_long:
-                continue  # v1 is long-only: nothing open to sell/close
+                side = Side.SELL if signed_qty > 0 else Side.BUY
 
             pending_orders[signal.symbol].append(
                 PendingOrder(symbol=signal.symbol, side=side, strategy_id=signal.strategy_id, reason=signal.reason)
@@ -196,11 +201,11 @@ class BacktestEngine:
             if fill_price <= 0:
                 continue
             existing = account.positions.get(bar.symbol)
+            is_closing_long = po.side == Side.SELL and existing is not None and existing.quantity > 0
+            is_covering_short = po.side == Side.BUY and existing is not None and existing.quantity < 0
 
-            if po.side == Side.SELL:
-                if existing is None or existing.quantity <= 0:
-                    continue
-                quantity = existing.quantity
+            if is_closing_long or is_covering_short:
+                quantity = abs(existing.quantity)
             else:
                 cap_value = account.equity * self.risk_gate.limits.max_capital_per_position_pct
                 quantity = (cap_value * 2) / fill_price  # oversize on purpose; RiskGate clips to the real cap
@@ -222,46 +227,71 @@ class BacktestEngine:
     def _execute_fill(self, account: AccountState, decision, timestamp, closed_trades, position_open_time, exit_reason: str) -> None:
         order = decision.order
         qty = decision.approved_quantity
-        fees = self.costs.commission(qty)
         existing = account.positions.get(order.symbol)
+        is_closing_long = order.side == Side.SELL and existing is not None and existing.quantity > 0
+        is_covering_short = order.side == Side.BUY and existing is not None and existing.quantity < 0
 
+        if is_closing_long or is_covering_short:
+            self._realize_close(
+                account, order.symbol, existing, qty, order.price, timestamp,
+                closed_trades, position_open_time, exit_reason, order.strategy_id,
+            )
+            return
+
+        # Opening or adding to a position: BUY opens/adds long, SELL opens/adds short.
+        fees = self.costs.commission(qty)
         if order.side == Side.BUY:
             account.cash -= qty * order.price + fees
-            if existing is None or existing.quantity <= 0:
-                account.positions[order.symbol] = Position(
-                    symbol=order.symbol, quantity=qty, avg_entry_price=order.price, opened_at=timestamp,
-                    strategy_id=order.strategy_id,
-                )
-                position_open_time[order.symbol] = timestamp
-            else:
-                total_cost = existing.avg_entry_price * existing.quantity + order.price * qty
-                new_qty = existing.quantity + qty
-                existing.avg_entry_price = total_cost / new_qty
-                existing.quantity = new_qty
-        else:  # SELL closing a long
-            proceeds = qty * order.price - fees
-            account.cash += proceeds
-            realized_pnl = (order.price - existing.avg_entry_price) * qty - fees
-            # account.equity is reconciled by _mark_to_market right after the fill loop runs
-            closed_trades.append(
-                ClosedTrade(
-                    symbol=order.symbol,
-                    entry_time=position_open_time.get(order.symbol, timestamp),
-                    exit_time=timestamp,
-                    realized_pnl=realized_pnl,
-                    strategy_id=order.strategy_id,
-                    quantity=qty,
-                    exit_price=order.price,
-                    exit_reason=exit_reason,
-                )
+        else:
+            account.cash += qty * order.price - fees  # short-sale proceeds
+
+        signed_qty = qty if order.side == Side.BUY else -qty
+        if existing is None or existing.quantity == 0:
+            account.positions[order.symbol] = Position(
+                symbol=order.symbol, quantity=signed_qty, avg_entry_price=order.price, opened_at=timestamp,
+                strategy_id=order.strategy_id,
             )
-            self.risk_gate.record_trade_result(account, realized_pnl)
-            remaining = existing.quantity - qty
-            if remaining <= 1e-9:
-                del account.positions[order.symbol]
-                position_open_time.pop(order.symbol, None)
-            else:
-                existing.quantity = remaining
+            position_open_time[order.symbol] = timestamp
+        else:
+            total_cost = existing.avg_entry_price * abs(existing.quantity) + order.price * qty
+            new_qty_abs = abs(existing.quantity) + qty
+            existing.avg_entry_price = total_cost / new_qty_abs
+            existing.quantity = new_qty_abs if existing.quantity > 0 else -new_qty_abs
+
+    def _realize_close(
+        self, account, symbol, position, qty, fill_price, timestamp,
+        closed_trades, position_open_time, reason, strategy_id,
+    ) -> None:
+        """Shared close/cover P&L for a signed position -- used by
+        _execute_fill (a strategy's own SELL/CLOSE signal), _check_stop, and
+        _flatten_symbol, so the long-vs-short sign logic lives in one place."""
+        fees = self.costs.commission(qty)
+        if position.quantity > 0:  # closing a long
+            realized_pnl = (fill_price - position.avg_entry_price) * qty - fees
+            account.cash += qty * fill_price - fees
+        else:  # covering a short
+            realized_pnl = (position.avg_entry_price - fill_price) * qty - fees
+            account.cash -= qty * fill_price + fees
+
+        closed_trades.append(
+            ClosedTrade(
+                symbol=symbol,
+                entry_time=position_open_time.get(symbol, timestamp),
+                exit_time=timestamp,
+                realized_pnl=realized_pnl,
+                strategy_id=strategy_id,
+                quantity=qty,
+                exit_price=fill_price,
+                exit_reason=reason,
+            )
+        )
+        self.risk_gate.record_trade_result(account, realized_pnl)
+        remaining = abs(position.quantity) - qty
+        if remaining <= 1e-9:
+            del account.positions[symbol]
+            position_open_time.pop(symbol, None)
+        else:
+            position.quantity = remaining if position.quantity > 0 else -remaining
 
     @staticmethod
     def _mark_to_market(account: AccountState, latest_bars: dict[str, Bar]) -> None:
@@ -274,54 +304,31 @@ class BacktestEngine:
 
     def _check_stop(self, account: AccountState, bar: Bar, closed_trades, position_open_time) -> None:
         position = account.positions.get(bar.symbol)
-        if position is None or position.quantity <= 0:
+        if position is None or position.quantity == 0:
             return
-        if not self.risk_gate.is_stop_triggered(position, current_price=bar.low):
+        # Worst-case price within the bar: the low hurts a long, the high hurts a short.
+        adverse_price = bar.high if position.quantity < 0 else bar.low
+        if not self.risk_gate.is_stop_triggered(position, current_price=adverse_price):
             return
-        stop_price = self.risk_gate.stop_loss_price(position.avg_entry_price, Side.BUY)
-        fill_price = self.costs.adverse_fill_price(stop_price, Side.SELL)
-        fees = self.costs.commission(position.quantity)
-        realized_pnl = (fill_price - position.avg_entry_price) * position.quantity - fees
-        account.cash += position.quantity * fill_price - fees
-        closed_trades.append(
-            ClosedTrade(
-                symbol=bar.symbol,
-                entry_time=position_open_time.get(bar.symbol, bar.timestamp),
-                exit_time=bar.timestamp,
-                realized_pnl=realized_pnl,
-                strategy_id=position.strategy_id,
-                quantity=position.quantity,
-                exit_price=fill_price,
-                exit_reason="stop_loss",
-            )
+        entry_side = Side.BUY if position.quantity > 0 else Side.SELL
+        exit_side = Side.SELL if position.quantity > 0 else Side.BUY
+        stop_price = self.risk_gate.stop_loss_price(position.avg_entry_price, entry_side)
+        fill_price = self.costs.adverse_fill_price(stop_price, exit_side)
+        self._realize_close(
+            account, bar.symbol, position, abs(position.quantity), fill_price, bar.timestamp,
+            closed_trades, position_open_time, "stop_loss", position.strategy_id,
         )
-        self.risk_gate.record_trade_result(account, realized_pnl)
-        del account.positions[bar.symbol]
-        position_open_time.pop(bar.symbol, None)
 
     def _flatten_symbol(self, account, symbol, timestamp, price, closed_trades, position_open_time, reason: str) -> None:
         position = account.positions.get(symbol)
-        if position is None or position.quantity <= 0:
+        if position is None or position.quantity == 0:
             return
-        fill_price = self.costs.adverse_fill_price(price, Side.SELL)
-        fees = self.costs.commission(position.quantity)
-        realized_pnl = (fill_price - position.avg_entry_price) * position.quantity - fees
-        account.cash += position.quantity * fill_price - fees
-        closed_trades.append(
-            ClosedTrade(
-                symbol=symbol,
-                entry_time=position_open_time.get(symbol, timestamp),
-                exit_time=timestamp,
-                realized_pnl=realized_pnl,
-                strategy_id=position.strategy_id,
-                quantity=position.quantity,
-                exit_price=fill_price,
-                exit_reason=reason,
-            )
+        exit_side = Side.SELL if position.quantity > 0 else Side.BUY
+        fill_price = self.costs.adverse_fill_price(price, exit_side)
+        self._realize_close(
+            account, symbol, position, abs(position.quantity), fill_price, timestamp,
+            closed_trades, position_open_time, reason, position.strategy_id,
         )
-        self.risk_gate.record_trade_result(account, realized_pnl)
-        del account.positions[symbol]
-        position_open_time.pop(symbol, None)
 
     def _flatten_all(self, account, timestamp, latest_bars, closed_trades, position_open_time, reason: str) -> None:
         for symbol in list(account.positions.keys()):

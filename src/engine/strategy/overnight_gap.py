@@ -8,9 +8,12 @@ millisecond reaction, which suits retail infrastructure.
 
 Known v1 simplifications (revisit only via a journaled experiment, per the
 anti-self-deception protocol -- see JOURNAL.md):
-  - Long-only, like the rest of v1 (see engine.backtest.engine). Only
-    positive-sentiment overnight macro news produces a signal; negative
-    sentiment is currently dropped rather than expressed as a hedge/short.
+  - Long-only by this strategy's own choice, not an engine limitation --
+    engine.backtest.engine supports short-selling as of 2026-07-20. Only
+    positive-sentiment overnight macro news produces a signal here; negative
+    sentiment is currently dropped rather than expressed as a short. Revisit
+    if this strategy specifically should trade the bearish half of overnight
+    news too.
   - "Overnight" and "the US open" are UTC hour-of-day windows that ignore
     DST transitions -- acceptable slop for a first pass, flagged here so
     nobody mistakes it for a deliberate design choice.
