@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from engine.data.bars import fetch_bars
 from engine.data.universe import Universe
 from engine.execution.broker import Broker
+from engine.execution.position_bookkeeping import apply_closing_fill, apply_opening_fill
 from engine.journal.models import Prediction, PredictionDirection
 from engine.journal.registry import (
     load_actionable_predictions,
@@ -30,7 +31,7 @@ from engine.journal.registry import (
 )
 from engine.logging_setup import get_logger
 from engine.risk.gate import RiskGate
-from engine.risk.models import AccountState, OrderRequest, Position, Side
+from engine.risk.models import AccountState, OrderRequest, Side
 
 logger = get_logger(__name__)
 
@@ -42,22 +43,6 @@ def _latest_price(symbol: str) -> float | None:
     if df.empty:
         return None
     return float(df.sort_values("timestamp").iloc[-1]["close"])
-
-
-def _apply_fill_to_account(account: AccountState, symbol: str, side: Side, quantity: float, price: float, strategy_id: str) -> None:
-    """Mirrors the backtester's opening-fill bookkeeping so RiskGate's
-    per-run exposure/position caps see this fill on the next prediction in
-    the same batch. Cash isn't tracked here -- the broker owns real cash;
-    the next `papertrade`/act-on-predictions run re-reconciles from it."""
-    existing = account.positions.get(symbol)
-    signed_qty = quantity if side == Side.BUY else -quantity
-    if existing is None or existing.quantity == 0:
-        account.positions[symbol] = Position(symbol=symbol, quantity=signed_qty, avg_entry_price=price, strategy_id=strategy_id)
-    else:
-        total_cost = existing.avg_entry_price * abs(existing.quantity) + price * quantity
-        new_qty_abs = abs(existing.quantity) + quantity
-        existing.avg_entry_price = total_cost / new_qty_abs
-        existing.quantity = new_qty_abs if existing.quantity > 0 else -new_qty_abs
 
 
 def act_on_pending_predictions(
@@ -104,7 +89,7 @@ def act_on_pending_predictions(
                 timestamp=order.timestamp, strategy_id="consequence_prediction",
             )
         )
-        _apply_fill_to_account(account, prediction.symbol, side, decision.approved_quantity, price, "consequence_prediction")
+        apply_opening_fill(account, prediction.symbol, side, decision.approved_quantity, price, "consequence_prediction")
         mark_prediction_traded(session, prediction, order_id=broker_order.broker_order_id, quantity=decision.approved_quantity)
         acted.append(prediction)
     return acted
@@ -153,25 +138,7 @@ def close_expired_prediction_trades(
                 timestamp=as_of, strategy_id="consequence_prediction",
             )
         )
-        _apply_close_to_account(account, risk_gate, prediction.symbol, existing, decision.approved_quantity, price)
+        apply_closing_fill(account, risk_gate, prediction.symbol, existing, decision.approved_quantity, price)
         mark_prediction_exited(session, prediction, order_id=broker_order.broker_order_id)
         closed.append(prediction)
     return closed
-
-
-def _apply_close_to_account(account: AccountState, risk_gate: RiskGate, symbol: str, position: Position, qty: float, price: float) -> None:
-    """Mirrors the backtester's _realize_close bookkeeping: reduce/remove
-    the in-memory position and feed realized P&L into RiskGate's
-    consecutive-loss tracking, so a losing prediction trade counts toward
-    the same daily halt as every other order path."""
-    if position.quantity > 0:  # was long
-        realized_pnl = (price - position.avg_entry_price) * qty
-    else:  # was short
-        realized_pnl = (position.avg_entry_price - price) * qty
-    risk_gate.record_trade_result(account, realized_pnl)
-
-    remaining = abs(position.quantity) - qty
-    if remaining <= 1e-9:
-        del account.positions[symbol]
-    else:
-        position.quantity = remaining if position.quantity > 0 else -remaining

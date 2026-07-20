@@ -40,7 +40,8 @@ engine report                                                    # recent runs
 engine reconcile --run-id <id> --week-start ... --week-end ... \
     --backtest-expected-pct 1.2 --realized-pct 0.8               # weekly Phase 6 check
 engine kill                                                       # kill switch
-engine papertrade                                                 # live worker loop
+engine papertrade                                                 # live worker loop (reconcile/kill-switch only)
+engine papertrade --strategy momentum --interval 1h               # ...or actually trade a strategy live
 
 engine predict-news --limit 10                                    # LLM consequence-prediction forward-test
 engine act-on-predictions                                         # trade confident predictions (real paper orders)
@@ -67,10 +68,17 @@ eligible for a real order, though (vetted as tradable and risk-calibrated);
 those calls have done, as evidence toward a human decision to expand the
 universe -- nothing adds a symbol automatically.
 
-Strategies: `buy_and_hold`, `random_entry` (Phase 3 baselines),
-`dumb_news` (Phase 4 control group), `overnight_gap` (Phase 5 candidate),
-`momentum`, `mean_reversion`, `multi_factor` (pure price-action, trade both
-long and short -- see `engine/strategy/technical.py`).
+Strategies: `buy_and_hold`, `random_entry` (Phase 3 baselines, backtest-only
+by design -- never eligible for `papertrade --strategy`), `dumb_news`
+(Phase 4 control group), `overnight_gap` (Phase 5 candidate), `momentum`,
+`mean_reversion`, `multi_factor` (pure price-action, trade both long and
+short -- see `engine/strategy/technical.py`). The last five can all run
+live via `papertrade --strategy <name>` -- same `Strategy` object, same
+`RiskGate`, same signal semantics as `engine backtest`, just reacting to
+polled real-time bars/news instead of replayed history (see
+`engine/execution/live_loop.py`). None of them have been validated against
+the baselines yet -- that's a deliberate next step, not done by wiring
+this up.
 
 `engine ingest`/`engine backtest` use Alpaca's News API (real dated
 articles back to 2015) for historical news whenever `ALPACA_API_KEY` is
@@ -102,6 +110,7 @@ strategy/       Strategy protocol + implementations (same object runs in
 backtest/       event-driven simulator, cost model, metrics, perturbation
 risk/           RiskGate -- single non-bypassable choke point for every order
 execution/      Broker interface + Alpaca paper client + startup reconciliation
+                + live_loop (real-time analog of backtest/engine)
 journal/        SQLModel tables + registry (experiment/trade/journal, Postgres)
 prediction/     LLM consequence-prediction forward-test loop (separate from strategy/)
 cli/            ingest, replay, backtest, report, reconcile, kill, papertrade

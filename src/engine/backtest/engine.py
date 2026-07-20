@@ -44,7 +44,8 @@ from engine.backtest.costs import CostModel
 from engine.backtest.metrics import ClosedTrade, EquityPoint, Metrics, compute_metrics
 from engine.data.events import EventType, build_event_stream
 from engine.data.universe import Universe
-from engine.domain import Bar, MarketContext, NewsItem, SignalAction
+from engine.domain import Bar, MarketContext, NewsItem
+from engine.execution.signal_translation import signal_to_side
 from engine.risk.gate import RiskGate
 from engine.risk.models import AccountState, OrderRequest, Position, Side
 
@@ -179,16 +180,9 @@ class BacktestEngine:
         for signal in signals:
             existing = account.positions.get(signal.symbol)
             signed_qty = existing.quantity if existing is not None else 0.0
-
-            if signal.action == SignalAction.BUY:
-                side = Side.BUY
-            elif signal.action == SignalAction.SELL:
-                side = Side.SELL
-            else:  # CLOSE -- flatten whichever direction is actually open
-                if signed_qty == 0:
-                    continue
-                side = Side.SELL if signed_qty > 0 else Side.BUY
-
+            side = signal_to_side(signal, signed_qty)
+            if side is None:
+                continue
             pending_orders[signal.symbol].append(
                 PendingOrder(symbol=signal.symbol, side=side, strategy_id=signal.strategy_id, reason=signal.reason)
             )

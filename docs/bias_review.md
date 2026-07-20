@@ -82,7 +82,11 @@ strategies that already exist in this repo.
    symbols and only acts on positive sentiment -- this strategy is long-only
    by its own choice (the engine itself supports shorting as of 2026-07-20),
    so negative overnight sentiment is simply dropped rather than expressed
-   as a short.
+   as a short. This means the backtest never sees how the strategy would
+   have performed on the negative-news half of overnight events — it is not
+   "wrong," but it is an intentionally incomplete strategy, and its win rate
+   should not be read as representative of "how the engine would trade all
+   overnight macro news," only "how it trades the bullish half of it."
 
 ## MomentumStrategy / MeanReversionStrategy / MultiFactorStrategy (`technical.py`) — pure price-action, 2026-07-20
 
@@ -133,8 +137,44 @@ review answers except where noted.
      for all three are heuristic (scaled linearly off %move or z-score,
      capped at 1.0) -- they size nothing on their own; RiskGate still owns
      all position sizing.
-   This means the backtest never sees how the strategy would have performed
-   on the negative-news half of overnight events — it is not "wrong," but it
-   is an intentionally incomplete strategy, and its win rate should not be
-   read as representative of "how the engine would trade all overnight
-   macro news," only "how it trades the bullish half of it."
+
+## Live wiring (`engine.execution.live_loop`, `papertrade --strategy`) — 2026-07-20
+
+This isn't a new strategy, it's a new *execution path* for the five
+strategies above -- worth its own review since "backtest vs. live" is
+exactly what bias review exists to catch, and this is the first time any
+strategy in this repo can place a real order outside the backtester.
+
+1. **Look-ahead:** None introduced. The same `Signal`/`RiskGate`/
+   `signal_to_side` objects and logic run unmodified; bars/news are polled
+   incrementally and dispatched to `on_bar`/`on_news` the same way the
+   backtester replays them, just built up live instead of upfront.
+   `seed_bar_history` populates real historical lookback at startup
+   *without* dispatching any `on_bar` calls specifically so indicator
+   strategies don't fire off stale information replayed as if it just
+   happened.
+2. **Survivorship:** N/A here -- live trading only ever sees symbols that
+   currently exist, by construction.
+3. **Publication vs ingestion:** Same as backtest -- `decision_timestamp`
+   governs everything, and since this is genuinely live, `ingested_at` is
+   always the real fetch time, never backfilled or approximated.
+4. **Other inflation risks / known fidelity gaps vs. the backtester:**
+   - **No live equivalent of the no-overnight-position rule yet.** The
+     backtester's version relies on knowing, in advance, which bar is the
+     last of the trading day (look-ahead within already-fetched historical
+     data) -- that information doesn't exist live. Each strategy's own
+     exit-after-N-hours/bars logic is what currently bounds live holding
+     time instead. This is a real behavioral difference from backtest
+     results, not just a documentation gap -- a strategy whose own exit
+     window is long relative to a trading day could hold overnight live in
+     a way the backtest never modeled.
+   - Bars and news are dispatched in two separate passes per cycle (all
+     new bars, then all new news), not perfectly timestamp-interleaved the
+     way `build_event_stream` sorts a full backtest upfront. Immaterial
+     over a short poll interval; would not be over a long one.
+   - **None of these five strategies have been validated against the
+     Phase 3 baselines yet.** Wiring live trading and proving a strategy
+     deserves live capital (even paper) are two different things -- see
+     JOURNAL.md and SPEC.md's anti-self-deception protocol. Treat any
+     live results from this wiring as informal until that comparison
+     happens.

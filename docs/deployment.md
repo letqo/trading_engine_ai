@@ -9,6 +9,12 @@ Implemented in this repo, works locally today:
   (`alembic upgrade head`, run before the worker starts on every deploy),
   the start command (`engine papertrade`), and pins `numReplicas = 1`
   (never run two live instances against the same broker account).
+  `papertrade` reconciles/watches the kill switch either way; set
+  `PAPERTRADE_STRATEGY` (one of `dumb_news`, `overnight_gap`, `momentum`,
+  `mean_reversion`, `multi_factor`) in Railway's environment variables to
+  also actually trade that strategy live -- no start-command or code
+  change needed to switch strategies, just the env var + redeploy. Leave
+  it unset to run the reconcile-only skeleton with no trading.
 - `engine predict-loop` is a second always-on process (predict-news +
   act-on-predictions + resolve-predictions, on a loop) -- it needs its own
   Railway service. `railway.toml` only configures one service's start

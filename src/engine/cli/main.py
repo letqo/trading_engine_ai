@@ -21,6 +21,7 @@ from engine.data.router import tag_and_route
 from engine.data.snapshot import create_snapshot
 from engine.data.universe import load_universe
 from engine.execution.alpaca import AlpacaAuthError, AlpacaPaperClient
+from engine.execution.live_loop import LiveLoopState, run_live_cycle, seed_bar_history
 from engine.execution.reconcile import cancel_stale_orders, reconcile_account_state, refresh_account_state
 from engine.features.sentiment import score_news_item
 from engine.journal.db import get_session
@@ -61,6 +62,11 @@ STRATEGY_FACTORIES = {
     "multi_factor": lambda universe, seed: MultiFactorStrategy(symbols=sorted(universe.tradable_symbols())),
 }
 NEWS_DRIVEN_STRATEGIES = {"dumb_news", "overnight_gap"}
+
+# buy_and_hold/random_entry are explicitly documented reference benchmarks
+# ("never a candidate for live trading" -- see engine/strategy/baselines.py)
+# -- backtest-only by design, not eligible for `papertrade --strategy`.
+LIVE_ELIGIBLE_STRATEGIES = {"dumb_news", "overnight_gap", "momentum", "mean_reversion", "multi_factor"}
 
 def _int_cast(kw: dict, *keys: str) -> dict:
     return {k: (int(v) if k in keys else v) for k, v in kw.items()}
@@ -573,13 +579,27 @@ def kill_reset() -> None:
 
 @app.command()
 def papertrade(
+    strategy: str = typer.Option(
+        None, envvar="PAPERTRADE_STRATEGY",
+        help=f"one of: {', '.join(sorted(LIVE_ELIGIBLE_STRATEGIES))} (omit to run the reconcile/kill-switch "
+             f"skeleton only, no trading). Also settable via PAPERTRADE_STRATEGY, so a Railway deployment "
+             f"can switch strategies with an env var change instead of a start-command edit.",
+    ),
+    interval: str = typer.Option("1h", envvar="PAPERTRADE_INTERVAL", help="bar timeframe for the selected strategy"),
     poll_seconds: int = typer.Option(60, help="loop interval"),
     max_iterations: int = typer.Option(None, help="stop after N iterations (testing only; omit to run forever)"),
 ) -> None:
-    """Live paper-trading worker loop (Phase 6). Paper-only guard is
-    enforced before anything else; the loop reconciles broker state on
-    startup and checks the kill switch every iteration."""
+    """Live paper-trading worker loop. Paper-only guard is enforced before
+    anything else; the loop reconciles broker state on startup and checks
+    the kill switch and daily-drawdown halt every iteration. With
+    `--strategy`, it also polls for new bars/news and trades that strategy
+    live through RiskGate -- the same object, same signal semantics, as
+    `engine backtest`. Without it, this is the pre-existing crash-safe
+    skeleton with no trading at all."""
     settings = get_settings()
+    if strategy is not None and strategy not in LIVE_ELIGIBLE_STRATEGIES:
+        typer.echo(f"unknown or backtest-only strategy {strategy!r}, choices: {sorted(LIVE_ELIGIBLE_STRATEGIES)}", err=True)
+        raise typer.Exit(1)
     try:
         enforce_paper_only(settings)
     except PaperOnlyViolation as exc:
@@ -597,7 +617,20 @@ def papertrade(
     cancel_stale_orders(client)
     risk_gate.start_new_session(account)
     current_date = datetime.now(timezone.utc).date()
-    logger.info("papertrade worker started", extra={"extra_fields": {"equity": account.equity}})
+
+    universe = None
+    strategy_obj = None
+    live_state = None
+    if strategy is not None:
+        universe = load_universe(settings.universe_path)
+        strategy_obj = STRATEGY_FACTORIES[strategy](universe, settings.random_seed)
+        live_state = LiveLoopState()
+        seed_bar_history(universe, interval, live_state)
+
+    logger.info(
+        "papertrade worker started",
+        extra={"extra_fields": {"equity": account.equity, "strategy": strategy, "interval": interval}},
+    )
     alert_service_restart(settings)
 
     iteration = 0
@@ -629,12 +662,11 @@ def papertrade(
                 client.cancel_all_orders()
                 client.close_all_positions()
                 break
-            # Signal generation / order submission wiring is intentionally
-            # not implemented here yet: this loop is the crash-safe skeleton
-            # (reconcile -> check halt/kill -> [strategy hook] -> sleep)
-            # required before any live capital-adjacent behavior ships. See
-            # JOURNAL.md for why strategy wiring waits on the 3-month paper
-            # track record described in SPEC.md Phase 6.
+
+            if strategy_obj is not None:
+                summary = run_live_cycle(strategy_obj, universe, risk_gate, client, account, live_state, interval)
+                if summary["bars"] or summary["news"]:
+                    logger.info("papertrade live cycle", extra={"extra_fields": summary})
         except Exception:
             logger.exception("unhandled exception in papertrade loop -- failing flat")
             try:

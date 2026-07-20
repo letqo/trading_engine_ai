@@ -5,6 +5,51 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-20 -- Add: live wiring for dumb_news/overnight_gap/momentum/mean_reversion/multi_factor
+
+**What changed.** `engine papertrade --strategy <name>` now actually trades
+live -- the crash-safe skeleton loop (reconcile, kill switch, daily-
+drawdown halt) that previously never called any strategy now polls for new
+bars/news each cycle and dispatches them to the *same* `Strategy` object
+`engine backtest` uses, through the *same* `RiskGate`. New module
+`engine/execution/live_loop.py`. Eligible: `dumb_news`, `overnight_gap`,
+`momentum`, `mean_reversion`, `multi_factor`. Not eligible, on purpose:
+`buy_and_hold`/`random_entry`, which are documented reference benchmarks,
+never meant to trade live.
+
+**Two pieces of logic were extracted into shared modules specifically so
+backtest and live can never drift apart**, rather than reimplementing the
+same math twice: `engine.execution.signal_translation.signal_to_side`
+(BUY/SELL/CLOSE -> broker side, now used by both `BacktestEngine` and the
+live loop) and `engine.execution.position_bookkeeping` (open/close P&L and
+quantity math, now shared by `engine.prediction.trading` and the live
+loop, replacing that module's own private copy of the same logic).
+
+**Where live necessarily differs from backtest, and why (full detail in
+`docs/bias_review.md`'s new "Live wiring" section):**
+- `seed_bar_history` populates real lookback at startup *without* firing
+  `on_bar`, so indicator strategies (momentum, mean_reversion,
+  multi_factor) have working history immediately without replaying it as
+  if it just happened.
+- Stop-loss checks bypass `RiskGate.evaluate()` entirely and write
+  straight to the account, exactly like the backtester's `_check_stop` --
+  a forced risk-reducing exit was never supposed to be blockable by
+  opening-order caps.
+- **The backtester's no-overnight-position rule has no live equivalent
+  yet.** It relies on knowing in advance which bar is the last of the
+  trading day -- look-ahead within already-fetched historical data that
+  doesn't exist live. Each strategy's own exit timer is what currently
+  bounds live holding time instead. Flagged as a real fidelity gap, not
+  just a docs note.
+
+**Still true, unchanged by wiring this up: none of these five strategies
+have been validated against the Phase 3 baselines.** That comparison is a
+separate, deliberate next step -- wiring live trading and proving a
+strategy has earned the right to trade capital (even paper) are two
+different things.
+
+---
+
 ## 2026-07-20 -- Add: unrestricted symbol naming (with universe growth via evidence, not automation)
 
 **What changed.** The consequence-prediction model was previously hard-

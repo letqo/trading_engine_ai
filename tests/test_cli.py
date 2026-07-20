@@ -124,6 +124,40 @@ class _FakeAlpacaClient:
         self.closed = True
 
 
+def test_papertrade_rejects_backtest_only_strategy(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    result = runner.invoke(app, ["papertrade", "--strategy", "buy_and_hold", "--max-iterations", "1"])
+    assert result.exit_code == 1
+
+
+def test_papertrade_with_strategy_runs_live_cycle_cleanly(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+    fake_broker = _FakeAlpacaClient(get_settings())
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+    monkeypatch.setattr("engine.execution.live_loop.fetch_bars", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr("engine.execution.live_loop.fetch_all_rss", lambda: [])
+
+    result = runner.invoke(app, ["papertrade", "--strategy", "momentum", "--max-iterations", "2", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert "papertrade worker stopped" in result.stdout
+
+
+def test_papertrade_without_strategy_still_runs_skeleton_only(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+    fake_broker = _FakeAlpacaClient(get_settings())
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+
+    result = runner.invoke(app, ["papertrade", "--max-iterations", "1", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert "papertrade worker stopped" in result.stdout
+
+
 def test_predict_loop_refuses_without_anthropic_key(monkeypatch, tmp_path):
     _isolated_env(monkeypatch, tmp_path)
     result = runner.invoke(app, ["predict-loop", "--max-iterations", "1"])
