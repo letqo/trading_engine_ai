@@ -43,6 +43,14 @@ RSS_FEEDS: dict[str, str] = {
     "prnewswire_all": "https://www.prnewswire.com/rss/news-releases-list.rss",
 }
 
+# Fixed rotation order for predict-loop's hourly source rotation -- its own
+# constant, decoupled from RSS_FEEDS's dict order, so adding/reordering feeds
+# later can't silently reshuffle whose rotation slot is whose. Without
+# rotation, yahoo's ~47 live items vs marketwatch's ~10/prnewswire's ~20
+# structurally starve the other two sources every cycle (yahoo is iterated
+# first and fills the whole predict_limit before they're ever reached).
+RSS_ROTATION_ORDER: tuple[str, ...] = ("yahoo_finance_top", "marketwatch_top", "prnewswire_all")
+
 _USER_AGENT = "trading-research-engine/0.1 (paper-trading research; contact via repo)"
 
 
@@ -95,3 +103,30 @@ def fetch_all_rss(feeds: dict[str, str] | None = None) -> list[NewsItem]:
             logger.warning("rss feed fetch failed", extra={"extra_fields": {"source": source_name, "error": str(exc)}})
             continue
     return items
+
+
+def active_rss_source(
+    anchor: datetime,
+    now: datetime,
+    rotation_hours: float,
+    order: tuple[str, ...] = RSS_ROTATION_ORDER,
+) -> str:
+    """Which RSS source predict-loop should pull from this cycle, as a pure
+    function of wall-clock time -- deliberately not a persisted "current
+    index" counter. A stored counter needs something to advance it and can
+    drift or double-advance across restarts; this gives the same answer from
+    any process, at any time, after any number of restarts, with zero
+    coordination."""
+    # SQLite drops tzinfo on round-trip (anchor comes back from
+    # PredictLoopConfig.rotation_anchor naive) -- treat naive as UTC so this
+    # works identically against SQLite (dev) and Postgres (prod). See
+    # registry._hours_elapsed for the same pattern.
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    elapsed_hours = (now - anchor).total_seconds() / 3600.0
+    if rotation_hours <= 0:
+        rotation_hours = 1.0  # a bad dashboard value must not wedge the loop
+    slot = int(elapsed_hours // rotation_hours)
+    return order[slot % len(order)]

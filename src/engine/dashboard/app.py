@@ -1,15 +1,22 @@
-"""Read-only reporting dashboard. Deliberately never imports anything that
-can submit, modify, or cancel an order -- engine.execution.broker/RiskGate
-are not imported here. The only broker calls made are AlpacaPaperClient's
-read methods (get_account_equity, get_positions), same as any other
-dashboard consumer of a paper account's public state.
+"""Mostly-read-only reporting dashboard. Never imports anything that can
+submit, modify, or cancel an order -- engine.execution.broker/RiskGate are
+not imported here. The only broker calls made are AlpacaPaperClient's read
+methods (get_account_equity, get_positions), same as any other dashboard
+consumer of a paper account's public state.
+
+The one exception is /predict-loop-config: a GET/POST pair that reads and
+writes PredictLoopConfig (poll interval, RSS rotation, headline quotas,
+near-duplicate thresholds, pause/resume). It can pause or retune the
+predict-loop research loop, but it cannot place or cancel an order -- same
+trust boundary as everything else here, just no longer read-only for that
+one setting.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlmodel import select
@@ -20,10 +27,12 @@ from engine.dashboard.auth import require_auth
 from engine.journal.db import get_session
 from engine.journal.models import Prediction, PredictionStatus
 from engine.journal.registry import (
+    get_predict_loop_config,
     load_off_universe_symbol_stats,
     load_prediction_trades,
     load_recent_experiment_runs,
     load_recent_risk_halts,
+    update_predict_loop_config,
 )
 
 app = FastAPI(title="Trading engine dashboard")
@@ -141,6 +150,38 @@ def risk_events(request: Request, _user: str = Depends(require_auth), settings: 
     with get_session(settings) as session:
         rows = load_recent_risk_halts(session, limit=200)
     return _templates.TemplateResponse(request, "risk_events.html", {"events": rows})
+
+
+@app.get("/predict-loop-config", response_class=HTMLResponse)
+def predict_loop_config_view(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    with get_session(settings) as session:
+        config = get_predict_loop_config(session)
+    return _templates.TemplateResponse(request, "predict_loop_config.html", {"config": config, "saved": False})
+
+
+@app.post("/predict-loop-config", response_class=HTMLResponse)
+def predict_loop_config_update(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    enabled: bool = Form(False),
+    poll_seconds: int = Form(...),
+    rotation_hours: float = Form(...),
+    headlines_per_source: int = Form(...),
+    near_dup_window_hours: float = Form(...),
+    near_dup_threshold: float = Form(...),
+):
+    with get_session(settings) as session:
+        config = update_predict_loop_config(
+            session,
+            enabled=enabled,
+            poll_seconds=poll_seconds,
+            rotation_hours=rotation_hours,
+            headlines_per_source=headlines_per_source,
+            near_dup_window_hours=near_dup_window_hours,
+            near_dup_threshold=near_dup_threshold,
+        )
+    return _templates.TemplateResponse(request, "predict_loop_config.html", {"config": config, "saved": True})
 
 
 @app.get("/health")

@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from typing import ClassVar
 
 from sqlalchemy import JSON, Column
 from sqlmodel import Field, SQLModel
@@ -248,3 +249,32 @@ class Prediction(SQLModel, table=True):
     traded_order_id: str | None = Field(default=None, index=True)
     traded_quantity: float | None = None
     exit_order_id: str | None = None
+
+
+class PredictLoopConfig(SQLModel, table=True):
+    """Single-row live-tunable config for `engine predict-loop`, polled once
+    per cycle so an operator can change strategy from the dashboard without
+    a redeploy. Deliberately NOT engine.config.settings.Settings -- that's
+    env-var-only and cached for process lifetime via @lru_cache
+    get_settings(), so it can never change without a restart.
+
+    rotation_anchor + rotation_hours let predict_loop compute which RSS
+    source is "active" this cycle as a pure function of wall-clock time
+    (engine.data.news.active_rss_source) -- there is no separate "current
+    source index" column here on purpose, since a persisted counter would
+    need something to advance it and could drift or double-advance across
+    restarts."""
+
+    __tablename__ = "predict_loop_config"
+    SINGLETON_ID: ClassVar[str] = "singleton"
+
+    id: str = Field(default="singleton", primary_key=True)
+    updated_at: datetime = Field(default_factory=_now)
+
+    enabled: bool = Field(default=True)  # False = pause cycle body only, loop keeps polling
+    poll_seconds: int = Field(default=3600)
+    rotation_hours: float = Field(default=1.0)
+    rotation_anchor: datetime = Field(default_factory=_now)
+    headlines_per_source: int = Field(default=10)
+    near_dup_window_hours: float = Field(default=48.0)
+    near_dup_threshold: float = Field(default=90.0)

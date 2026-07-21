@@ -7,8 +7,9 @@ from __future__ import annotations
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from rapidfuzz import fuzz
 from sqlmodel import Session, select
 
 from engine.domain import NewsItem
@@ -16,6 +17,7 @@ from engine.journal.models import (
     DataSnapshot,
     ExperimentRun,
     NewsItemRecord,
+    PredictLoopConfig,
     Prediction,
     PredictionDirection,
     PredictionStatus,
@@ -295,6 +297,46 @@ def headline_already_predicted(session: Session, headline: str) -> bool:
         session.exec(select(Prediction.id).where(Prediction.news_headline == headline).limit(1)).first()
         is not None
     )
+
+
+def headline_near_duplicate(session: Session, headline: str, *, window_hours: float, threshold: float) -> bool:
+    """Catches the same real-world event covered by a *different* outlet
+    with different wording -- headline_already_predicted only catches exact
+    text matches, so it misses this. Compared against Prediction.created_at
+    (when we logged it), not news_published_at (each source's own publish
+    skew) -- the question is "did we already spend a call on something like
+    this recently," not when the source claims it went out. Uses
+    rapidfuzz.token_set_ratio rather than an LLM call: cheap, deterministic,
+    and cost is the whole reason this check exists in the first place."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    recent = session.exec(select(Prediction.news_headline).where(Prediction.created_at >= cutoff)).all()
+    return any(fuzz.token_set_ratio(headline, other) >= threshold for other in recent)
+
+
+def get_predict_loop_config(session: Session) -> PredictLoopConfig:
+    """Live-tunable predict-loop config, polled fresh every cycle (see
+    engine.cli.main.predict_loop) so the dashboard can change strategy
+    without a redeploy. Get-or-create keeps defaults defined in exactly one
+    place -- PredictLoopConfig's field defaults -- rather than duplicated
+    into a migration seed row."""
+    row = session.get(PredictLoopConfig, PredictLoopConfig.SINGLETON_ID)
+    if row is None:
+        row = PredictLoopConfig(id=PredictLoopConfig.SINGLETON_ID)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row
+
+
+def update_predict_loop_config(session: Session, **fields) -> PredictLoopConfig:
+    row = get_predict_loop_config(session)
+    for key, value in fields.items():
+        setattr(row, key, value)
+    row.updated_at = datetime.now(timezone.utc)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
 
 
 def record_prediction(

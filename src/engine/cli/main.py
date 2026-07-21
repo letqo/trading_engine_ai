@@ -16,7 +16,7 @@ from engine.config.settings import get_settings
 from engine.data.alpaca_news import AlpacaNewsAuthError, fetch_alpaca_news
 from engine.data.bars import bars_to_domain, fetch_bars
 from engine.data.events import EventType, build_event_stream
-from engine.data.news import fetch_all_rss
+from engine.data.news import RSS_FEEDS, active_rss_source, fetch_all_rss, fetch_rss_feed
 from engine.data.router import tag_and_route
 from engine.data.snapshot import create_snapshot
 from engine.data.universe import load_universe
@@ -28,7 +28,9 @@ from engine.journal.db import get_session
 from engine.journal.models import RunMode, TradeSide
 from engine.journal.registry import (
     current_git_hash,
+    get_predict_loop_config,
     headline_already_predicted,
+    headline_near_duplicate,
     load_news_items,
     load_off_universe_symbol_stats,
     load_prediction_trades,
@@ -37,6 +39,7 @@ from engine.journal.registry import (
     record_reconciliation,
     record_trade,
     register_run,
+    update_predict_loop_config,
 )
 from engine.logging_setup import configure_logging, get_logger
 from engine.observability import alert_kill_switch, alert_risk_halt, alert_service_restart
@@ -710,15 +713,30 @@ def papertrade(
 
 @app.command(name="predict-loop")
 def predict_loop(
-    poll_seconds: int = typer.Option(None, help="seconds between cycles; defaults to PREDICTION_LOOP_POLL_SECONDS"),
-    predict_limit: int = typer.Option(10, help="max headlines to analyze per cycle (each is a paid LLM call)"),
+    poll_seconds: int = typer.Option(None, help="seed the dashboard-tunable poll interval on first run; defaults to PREDICTION_LOOP_POLL_SECONDS"),
+    predict_limit: int = typer.Option(None, help="seed the dashboard-tunable per-source headline quota on first run (each is a paid LLM call)"),
     max_iterations: int = typer.Option(None, help="stop after N iterations (testing only; omit to run forever)"),
 ) -> None:
     """Automatic version of predict-news + act-on-predictions +
-    resolve-predictions: runs all three every `poll_seconds`, forever,
-    checking the kill switch and daily-drawdown halt each cycle exactly
-    like `papertrade` does. The individual commands remain available for
-    manual/one-off runs -- this is just the default always-on mode.
+    resolve-predictions: runs all three every cycle, forever, checking the
+    kill switch and daily-drawdown halt each cycle exactly like `papertrade`
+    does. The individual commands remain available for manual/one-off runs
+    -- this is just the default always-on mode.
+
+    Poll interval, rotation length, per-source headline quota,
+    near-duplicate detection, and pause/resume are all read fresh from
+    PredictLoopConfig (engine.journal.models) every cycle -- live-tunable
+    from the dashboard's /predict-loop-config page with no redeploy. The
+    poll_seconds/predict_limit CLI options here only seed that config on
+    first run; after that the DB row is authoritative, the same way
+    is_kill_switch_engaged(settings) is re-checked every cycle rather than
+    read once.
+
+    Each cycle pulls headlines from exactly one RSS source -- whichever
+    engine.data.news.active_rss_source says is active this hour -- rather
+    than all three sources every cycle. Without rotation, yahoo's much
+    larger item count structurally starves the other two sources of any of
+    the cycle's headline budget.
 
     Requires ANTHROPIC_API_KEY (+ ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF). If
     ALPACA_API_KEY isn't set, trading/closing is skipped and this becomes a
@@ -729,10 +747,13 @@ def predict_loop(
     transient RSS/API hiccup shouldn't permanently kill the whole
     automatic mechanism the way it would a continuously-open-position
     guardian process. A daily-drawdown breach or the kill switch still
-    stops it and flattens everything, same as papertrade.
+    stops it and flattens everything, same as papertrade. Pausing from the
+    dashboard (PredictLoopConfig.enabled=False) is deliberately much
+    gentler than either of those -- it only skips the cycle body; positions
+    are left alone and the loop keeps polling so it resumes the instant
+    it's re-enabled, no redeploy either way.
     """
     settings = get_settings()
-    poll_seconds = poll_seconds if poll_seconds is not None else settings.prediction_loop_poll_seconds
     try:
         client = build_prediction_client(settings)
     except PredictionConfigError as exc:
@@ -756,7 +777,20 @@ def predict_loop(
     else:
         typer.echo("ALPACA_API_KEY not set -- running log-only (predictions will be scored but never traded).", err=True)
 
-    logger.info("predict-loop started", extra={"extra_fields": {"poll_seconds": poll_seconds, "can_trade": can_trade}})
+    seed_fields = {}
+    if poll_seconds is not None:
+        seed_fields["poll_seconds"] = poll_seconds
+    elif settings.prediction_loop_poll_seconds:
+        seed_fields["poll_seconds"] = settings.prediction_loop_poll_seconds
+    if predict_limit is not None:
+        seed_fields["headlines_per_source"] = predict_limit
+    with get_session(settings) as session:
+        if seed_fields:
+            config = update_predict_loop_config(session, **seed_fields)
+        else:
+            config = get_predict_loop_config(session)
+
+    logger.info("predict-loop started", extra={"extra_fields": {"poll_seconds": config.poll_seconds, "can_trade": can_trade}})
 
     iteration = 0
     while max_iterations is None or iteration < max_iterations:
@@ -769,24 +803,44 @@ def predict_loop(
                 broker.close_all_positions()
             break
 
+        with get_session(settings) as session:
+            config = get_predict_loop_config(session)
+
+        if not config.enabled:
+            logger.info("predict-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds}})
+            iteration += 1
+            if max_iterations is not None and iteration >= max_iterations:
+                break
+            time.sleep(config.poll_seconds)
+            continue
+
         acted = closed = 0
         try:
-            raw_items = fetch_all_rss()
+            active_source = active_rss_source(config.rotation_anchor, datetime.now(timezone.utc), config.rotation_hours)
+            raw_items = fetch_rss_feed(active_source, RSS_FEEDS[active_source])
             predicted = 0
             skipped_duplicate = 0
+            skipped_near_duplicate = 0
             fresh_items = []
             with get_session(settings) as session:
                 # Filter duplicates across the whole feed before capping to
-                # predict_limit -- otherwise a quiet-news hour where the top
-                # results happen to repeat would waste the cycle's entire
-                # budget on nothing, even if genuinely new headlines exist
-                # further down the same feed. See headline_already_predicted.
+                # headlines_per_source -- otherwise a quiet-news hour where
+                # the top results happen to repeat would waste the cycle's
+                # entire budget on nothing, even if genuinely new headlines
+                # exist further down the same feed. See
+                # headline_already_predicted / headline_near_duplicate.
                 for raw in raw_items:
                     if headline_already_predicted(session, raw.headline):
                         skipped_duplicate += 1
                         continue
+                    if headline_near_duplicate(
+                        session, raw.headline,
+                        window_hours=config.near_dup_window_hours, threshold=config.near_dup_threshold,
+                    ):
+                        skipped_near_duplicate += 1
+                        continue
                     fresh_items.append(raw)
-                    if len(fresh_items) >= predict_limit:
+                    if len(fresh_items) >= config.headlines_per_source:
                         break
 
                 for raw in fresh_items:
@@ -830,9 +884,10 @@ def predict_loop(
             logger.info(
                 "predict-loop cycle complete",
                 extra={"extra_fields": {
+                    "active_source": active_source,
                     "headlines_fetched": len(raw_items), "headlines_new": len(fresh_items),
-                    "skipped_duplicate": skipped_duplicate, "predicted": predicted,
-                    "acted": acted, "closed": closed, "resolved": resolved,
+                    "skipped_duplicate": skipped_duplicate, "skipped_near_duplicate": skipped_near_duplicate,
+                    "predicted": predicted, "acted": acted, "closed": closed, "resolved": resolved,
                 }},
             )
         except Exception:
@@ -841,7 +896,7 @@ def predict_loop(
         iteration += 1
         if max_iterations is not None and iteration >= max_iterations:
             break
-        time.sleep(poll_seconds)
+        time.sleep(config.poll_seconds)
 
     logger.info("predict-loop stopped")
 

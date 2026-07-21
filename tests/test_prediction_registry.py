@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 
 from engine.journal.models import PredictionDirection, PredictionStatus
 from engine.journal.registry import (
+    get_predict_loop_config,
+    headline_near_duplicate,
     load_actionable_predictions,
     load_expired_open_trades,
     load_off_universe_symbol_stats,
@@ -12,6 +14,7 @@ from engine.journal.registry import (
     mark_prediction_traded,
     record_prediction,
     resolve_prediction,
+    update_predict_loop_config,
 )
 
 NOW = datetime(2026, 7, 20, tzinfo=timezone.utc)
@@ -212,3 +215,76 @@ def test_load_prediction_trades_returns_only_traded_predictions(db_session):
     trades = load_prediction_trades(db_session)
     assert len(trades) == 1
     assert trades[0].id == traded.id
+
+
+def test_get_predict_loop_config_creates_defaults_then_is_idempotent(db_session):
+    first = get_predict_loop_config(db_session)
+    assert first.enabled is True
+    assert first.headlines_per_source == 10
+
+    second = get_predict_loop_config(db_session)
+    assert second.id == first.id
+    assert second.headlines_per_source == first.headlines_per_source
+
+
+def test_update_predict_loop_config_updates_given_fields_and_bumps_updated_at(db_session):
+    original = get_predict_loop_config(db_session)
+    original_updated_at = original.updated_at
+
+    updated = update_predict_loop_config(db_session, enabled=False, headlines_per_source=3)
+    assert updated.enabled is False
+    assert updated.headlines_per_source == 3
+    # Fields not passed must be left untouched.
+    assert updated.poll_seconds == original.poll_seconds
+    assert updated.updated_at >= original_updated_at
+
+
+def _record_with_headline(session, headline, symbol="SPY", decision_ts=NOW):
+    return record_prediction(
+        session,
+        news_headline=headline,
+        news_source="rss",
+        news_published_at=decision_ts,
+        news_decision_timestamp=decision_ts,
+        topics=["macro"],
+        symbol=symbol,
+        direction=PredictionDirection.UP,
+        confidence=0.7,
+        rationale="test",
+        model_name="claude-opus-4-8",
+        model_knowledge_cutoff=CUTOFF,
+        forward_safe=True,
+        resolution_window_hours=24.0,
+        in_tracked_universe=True,
+    )
+
+
+def test_headline_near_duplicate_true_for_in_window_paraphrase(db_session):
+    _record_with_headline(db_session, "Fed cuts interest rates by half a point")
+    assert headline_near_duplicate(
+        db_session, "Federal Reserve cuts interest rates by half a point",
+        window_hours=48.0, threshold=90.0,
+    )
+
+
+def test_headline_near_duplicate_false_for_different_event_sharing_a_company_name(db_session):
+    _record_with_headline(db_session, "Apple beats quarterly earnings estimates")
+    assert not headline_near_duplicate(
+        db_session, "Apple faces new antitrust investigation",
+        window_hours=48.0, threshold=90.0,
+    )
+
+
+def test_headline_near_duplicate_false_outside_window(db_session):
+    pred = _record_with_headline(db_session, "Fed cuts interest rates by half a point")
+    # record_prediction always stamps created_at=now(); backdate it past the
+    # lookback window to test the cutoff itself, same pattern _make() uses to
+    # backdate status/resolved_at after insert.
+    pred.created_at = datetime.now(timezone.utc) - timedelta(hours=100)
+    db_session.add(pred)
+    db_session.commit()
+
+    assert not headline_near_duplicate(
+        db_session, "Federal Reserve cuts interest rates by half a point",
+        window_hours=48.0, threshold=90.0,
+    )

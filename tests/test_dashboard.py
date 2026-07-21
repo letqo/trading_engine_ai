@@ -39,9 +39,63 @@ def test_rejects_wrong_password(client):
 
 
 def test_all_routes_render_with_empty_database(client):
-    for path in ("/", "/predictions", "/trades", "/ticker-suggestions", "/backtests", "/risk-events"):
+    for path in (
+        "/", "/predictions", "/trades", "/ticker-suggestions", "/backtests", "/risk-events",
+        "/predict-loop-config",
+    ):
         resp = client.get(path, headers=_auth_header("admin", "testpass"))
         assert resp.status_code == 200, f"{path} returned {resp.status_code}: {resp.text[:300]}"
+
+
+def test_predict_loop_config_get_requires_auth(client):
+    resp = client.get("/predict-loop-config")
+    assert resp.status_code == 401
+
+
+def test_predict_loop_config_post_requires_auth(client):
+    resp = client.post("/predict-loop-config", data={
+        "poll_seconds": "3600", "rotation_hours": "1", "headlines_per_source": "10",
+        "near_dup_window_hours": "48", "near_dup_threshold": "90",
+    })
+    assert resp.status_code == 401
+
+
+def test_predict_loop_config_post_updates_the_row(client):
+    resp = client.post(
+        "/predict-loop-config",
+        headers=_auth_header("admin", "testpass"),
+        data={
+            "enabled": "on",
+            "poll_seconds": "1800",
+            "rotation_hours": "2",
+            "headlines_per_source": "7",
+            "near_dup_window_hours": "24",
+            "near_dup_threshold": "85",
+        },
+    )
+    assert resp.status_code == 200
+    assert "1800" in resp.text
+    assert "checked" in resp.text.split('name="enabled"')[1].split(">")[0]
+
+    # A follow-up GET must reflect the saved values, not stale defaults.
+    resp2 = client.get("/predict-loop-config", headers=_auth_header("admin", "testpass"))
+    assert 'value="1800"' in resp2.text
+    assert 'value="7"' in resp2.text
+
+
+def test_predict_loop_config_post_omitting_enabled_saves_as_disabled(client):
+    # An unchecked HTML checkbox sends no field at all -- the route must
+    # treat that as enabled=False, not error or silently keep the old value.
+    resp = client.post(
+        "/predict-loop-config",
+        headers=_auth_header("admin", "testpass"),
+        data={
+            "poll_seconds": "3600", "rotation_hours": "1", "headlines_per_source": "10",
+            "near_dup_window_hours": "48", "near_dup_threshold": "90",
+        },
+    )
+    assert resp.status_code == 200
+    assert "checked" not in resp.text.split('name="enabled"')[1].split(">")[0]
 
 
 def test_health_check_requires_no_auth(client):
