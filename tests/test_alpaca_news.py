@@ -94,3 +94,23 @@ def test_retries_on_429_then_succeeds():
     with patch("requests.Session.get", side_effect=[rate_limited, ok]):
         items = fetch_alpaca_news(START, END, settings)
     assert len(items) == 1
+
+
+def test_splits_multi_year_range_into_chunks_so_the_page_cap_cant_truncate_it():
+    # A single _MAX_PAGES budget across a 400-day range could silently drop
+    # everything past wherever the cap landed (sort=asc -> drops the tail).
+    # Chunking gives each ~90-day window its own budget instead.
+    settings = _settings(alpaca_api_key="key", alpaca_api_secret="secret")
+    start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2021, 2, 4, tzinfo=timezone.utc)  # 400 days -> 5 chunks of 90 days
+    page = MagicMock(status_code=200)
+    page.json.return_value = {"news": [_article()], "next_page_token": None}
+    with patch("requests.Session.get", return_value=page) as mock_get:
+        items = fetch_alpaca_news(start, end, settings)
+
+    assert mock_get.call_count == 5
+    assert len(items) == 5
+    first_call_params = mock_get.call_args_list[0].kwargs["params"]
+    assert first_call_params["start"] == start.isoformat()
+    last_call_params = mock_get.call_args_list[-1].kwargs["params"]
+    assert last_call_params["end"] == end.isoformat()

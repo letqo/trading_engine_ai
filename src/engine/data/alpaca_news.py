@@ -39,7 +39,8 @@ logger = get_logger(__name__)
 ALPACA_NEWS_BASE_URL = "https://data.alpaca.markets"
 _NEWS_PATH = "/v1beta1/news"
 _PAGE_LIMIT = 50  # API max per page
-_MAX_PAGES = 500  # safety cap against a runaway pagination loop
+_MAX_PAGES = 500  # safety cap against a runaway pagination loop, per chunk (see _CHUNK_DAYS)
+_CHUNK_DAYS = 90  # split [start, end] into windows this wide before paginating each
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -87,31 +88,17 @@ def _to_news_item(article: dict, ingestion_lag_seconds: float) -> NewsItem:
     )
 
 
-def fetch_alpaca_news(
+def _fetch_window(
+    session: requests.Session,
     start: datetime,
     end: datetime,
-    settings: Settings,
-    symbols: list[str] | None = None,
+    symbols: list[str] | None,
+    ingestion_lag_seconds: float,
 ) -> list[NewsItem]:
-    """Fetch every article published in [start, end], paginating as needed.
-
-    Raises AlpacaNewsAuthError if credentials are missing -- callers should
-    catch this and fall back to RSS rather than silently returning nothing.
-    """
-    if not settings.alpaca_api_key or not settings.alpaca_api_secret:
-        raise AlpacaNewsAuthError(
-            "ALPACA_API_KEY / ALPACA_API_SECRET are not set -- refusing to call "
-            "Alpaca's news API rather than silently doing nothing."
-        )
-
-    session = requests.Session()
-    session.headers.update(
-        {
-            "APCA-API-KEY-ID": settings.alpaca_api_key,
-            "APCA-API-SECRET-KEY": settings.alpaca_api_secret,
-        }
-    )
-
+    """Paginate a single [start, end] window. _MAX_PAGES is a safety net for
+    a runaway loop within this window, not a budget for the whole caller
+    range -- see fetch_alpaca_news for why the range gets chunked before
+    this is called."""
     params: dict[str, str] = {
         "start": start.astimezone(timezone.utc).isoformat(),
         "end": end.astimezone(timezone.utc).isoformat(),
@@ -138,15 +125,59 @@ def fetch_alpaca_news(
         payload = response.json()
 
         for article in payload.get("news", []):
-            items.append(_to_news_item(article, settings.alpaca_news_backfill_lag_seconds))
+            items.append(_to_news_item(article, ingestion_lag_seconds))
 
         page_token = payload.get("next_page_token")
         if not page_token:
             break
     else:
         logger.warning(
-            "alpaca news pagination hit the safety cap",
+            "alpaca news pagination hit the safety cap within a chunk -- "
+            "some articles in this window were silently dropped",
             extra={"extra_fields": {"max_pages": _MAX_PAGES, "start": str(start), "end": str(end)}},
         )
+
+    return items
+
+
+def fetch_alpaca_news(
+    start: datetime,
+    end: datetime,
+    settings: Settings,
+    symbols: list[str] | None = None,
+) -> list[NewsItem]:
+    """Fetch every article published in [start, end], paginating as needed.
+
+    [start, end] is split into _CHUNK_DAYS-wide windows before paginating,
+    each with its own _MAX_PAGES budget. A multi-year backfill can easily
+    exceed 500 pages (25,000 articles) as a single range -- sort=asc means
+    hitting that cap would silently drop everything after wherever the cap
+    landed (in practice, the most recent portion of the range) rather than
+    raising. Chunking keeps each window's article count well under the cap
+    so the safety net stays a safety net, not a silent data-loss bug.
+
+    Raises AlpacaNewsAuthError if credentials are missing -- callers should
+    catch this and fall back to RSS rather than silently returning nothing.
+    """
+    if not settings.alpaca_api_key or not settings.alpaca_api_secret:
+        raise AlpacaNewsAuthError(
+            "ALPACA_API_KEY / ALPACA_API_SECRET are not set -- refusing to call "
+            "Alpaca's news API rather than silently doing nothing."
+        )
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "APCA-API-KEY-ID": settings.alpaca_api_key,
+            "APCA-API-SECRET-KEY": settings.alpaca_api_secret,
+        }
+    )
+
+    items: list[NewsItem] = []
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + timedelta(days=_CHUNK_DAYS), end)
+        items.extend(_fetch_window(session, chunk_start, chunk_end, symbols, settings.alpaca_news_backfill_lag_seconds))
+        chunk_start = chunk_end
 
     return items
