@@ -28,6 +28,7 @@ from engine.journal.db import get_session
 from engine.journal.models import RunMode, TradeSide
 from engine.journal.registry import (
     current_git_hash,
+    headline_already_predicted,
     load_news_items,
     load_off_universe_symbol_stats,
     load_prediction_trades,
@@ -770,10 +771,25 @@ def predict_loop(
 
         acted = closed = 0
         try:
-            raw_items = fetch_all_rss()[:predict_limit]
+            raw_items = fetch_all_rss()
             predicted = 0
+            skipped_duplicate = 0
+            fresh_items = []
             with get_session(settings) as session:
+                # Filter duplicates across the whole feed before capping to
+                # predict_limit -- otherwise a quiet-news hour where the top
+                # results happen to repeat would waste the cycle's entire
+                # budget on nothing, even if genuinely new headlines exist
+                # further down the same feed. See headline_already_predicted.
                 for raw in raw_items:
+                    if headline_already_predicted(session, raw.headline):
+                        skipped_duplicate += 1
+                        continue
+                    fresh_items.append(raw)
+                    if len(fresh_items) >= predict_limit:
+                        break
+
+                for raw in fresh_items:
                     tagged = tag_and_route(raw, universe)
                     predicted += len(run_prediction_for_news_item(
                         session, client, tagged, universe,
@@ -814,7 +830,8 @@ def predict_loop(
             logger.info(
                 "predict-loop cycle complete",
                 extra={"extra_fields": {
-                    "headlines": len(raw_items), "predicted": predicted,
+                    "headlines_fetched": len(raw_items), "headlines_new": len(fresh_items),
+                    "skipped_duplicate": skipped_duplicate, "predicted": predicted,
                     "acted": acted, "closed": closed, "resolved": resolved,
                 }},
             )

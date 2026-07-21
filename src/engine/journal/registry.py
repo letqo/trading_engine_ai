@@ -281,6 +281,22 @@ def load_news_items(session: Session, start: datetime, end: datetime) -> list[Ne
     ]
 
 
+def headline_already_predicted(session: Session, headline: str) -> bool:
+    """predict-loop calls this before spending a Claude call on a headline --
+    live RSS feeds (engine.data.news.fetch_all_rss) have no memory of their
+    own, so the exact same "top stories" can and do reappear across
+    consecutive hourly cycles on a quiet news day. Without this check,
+    predict-loop would silently re-pay for (and re-log a duplicate
+    Prediction row for) the same headline every cycle it stays on the feed --
+    wasted subscription usage, and a false sense of sample size in
+    predictions-report from correlated, non-independent duplicates of the
+    same event. See JOURNAL.md 2026-07-21."""
+    return (
+        session.exec(select(Prediction.id).where(Prediction.news_headline == headline).limit(1)).first()
+        is not None
+    )
+
+
 def record_prediction(
     session: Session,
     *,

@@ -199,3 +199,57 @@ def test_predict_loop_respects_max_iterations_in_log_only_mode(monkeypatch, tmp_
     result = runner.invoke(app, ["predict-loop", "--max-iterations", "3", "--poll-seconds", "0"])
     assert result.exit_code == 0, result.stdout
     assert len(calls) == 3
+
+
+def test_predict_loop_skips_already_predicted_headlines(monkeypatch, tmp_path):
+    # fetch_all_rss has no memory of its own (RSS "top stories" don't
+    # necessarily change hour to hour), so predict-loop must dedup by
+    # headline itself -- otherwise the same headline would be re-sent to
+    # the model (and re-logged as a fresh Prediction) on every cycle it
+    # stays on the feed. See headline_already_predicted, JOURNAL.md 2026-07-21.
+    from datetime import datetime, timezone
+
+    from engine.prediction.schema import ConsequenceAnalysis, PredictedImpact
+
+    _isolated_env(monkeypatch, tmp_path)
+
+    analyze_calls = []
+
+    class _FakeClientWithOneImpact(_FakePredictionClient):
+        def analyze(self, headline, tracked_symbols, past_cases=None):
+            analyze_calls.append(headline)
+            return ConsequenceAnalysis(
+                impacts=[PredictedImpact(symbol="SPY", direction="up", confidence=0.9, rationale="test")],
+                overall_reasoning="test",
+            )
+
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakeClientWithOneImpact)
+
+    fixed_headline_item = type(
+        "FakeRawNewsItem",
+        (),
+        {
+            "id": "fixed-id", "source": "test_feed",
+            "published_at": datetime(2026, 7, 21, tzinfo=timezone.utc),
+            "ingested_at": datetime(2026, 7, 21, tzinfo=timezone.utc),
+            "headline": "Same headline every cycle", "url": None, "raw_payload": {},
+        },
+    )()
+    monkeypatch.setattr("engine.cli.main.fetch_all_rss", lambda: [fixed_headline_item])
+    # tag_and_route normally scores sentiment/topics from real text; patch a
+    # minimal pass-through so the pipeline gets a real NewsItem to work with.
+    import engine.cli.main as cli_main
+    from engine.domain import NewsItem
+
+    def _fake_tag_and_route(raw, universe):
+        return NewsItem(
+            id=raw.id, source=raw.source, published_at=raw.published_at, ingested_at=raw.ingested_at,
+            headline=raw.headline, url=raw.url, raw_payload=raw.raw_payload,
+        )
+
+    monkeypatch.setattr(cli_main, "tag_and_route", _fake_tag_and_route)
+
+    result = runner.invoke(app, ["predict-loop", "--max-iterations", "2", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    # Same headline on both cycles -- the model should only ever be asked once.
+    assert analyze_calls == ["Same headline every cycle"]

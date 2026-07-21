@@ -201,7 +201,7 @@ class Prediction(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
     created_at: datetime = Field(default_factory=_now, index=True)
 
-    news_headline: str
+    news_headline: str = Field(index=True)  # dedup key -- see registry.headline_already_predicted
     news_source: str
     news_published_at: datetime
     news_decision_timestamp: datetime = Field(index=True)  # see engine.domain.NewsItem.decision_timestamp
