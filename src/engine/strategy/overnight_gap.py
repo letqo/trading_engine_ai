@@ -6,6 +6,14 @@ Tier 2 ETFs, and act at or shortly after the US open with a defined exit
 horizon. Targets one well-defined decision moment (the open) rather than
 millisecond reaction, which suits retail infrastructure.
 
+Requires intraday bars (`--interval 1h`, not `1d`). `_entry_signals` only
+fires once `ctx.timestamp.hour >= US_MARKET_OPEN_UTC_HOUR` -- daily bars
+always carry hour == 0, so this strategy silently produces zero trades
+under `--interval 1d` rather than erroring. Discovered 2026-07-21 running
+the item-5 backtest suite; see JOURNAL.md that date for the full story,
+including the yfinance 730-day hard cap on hourly history this forces on
+how far back a backtest can go.
+
 Known v1 simplifications (revisit only via a journaled experiment, per the
 anti-self-deception protocol -- see JOURNAL.md):
   - Long-only by this strategy's own choice, not an engine limitation --

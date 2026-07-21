@@ -578,3 +578,124 @@ for why that's a deliberate stopping point, not an oversight.
 **Bias review:** see `docs/bias_review.md` for the mandatory look-ahead /
 survivorship / publication-vs-ingestion writeups for `DumbNewsStrategy` and
 `OvernightGapStrategy`.
+
+---
+
+## 2026-07-21 -- Item 5: full walk-forward backtest suite (dev + validation)
+
+All 5 live-eligible strategies (`dumb_news`, `overnight_gap`, `momentum`,
+`mean_reversion`, `multi_factor`) plus both baselines (`buy_and_hold`,
+`random_entry`) run over a development period (2020-01-01..2025-07-20) and,
+in one deliberate pass, the held-out validation period
+(2025-07-21..2026-07-20), per SPEC.md's "touched only for final validation,
+at most a few times ever" rule. Each `--validation` run is logged in the DB
+via `--validation-reason`.
+
+**Three real bugs found and fixed along the way -- not cosmetic, each one
+would have quietly corrupted results if missed:**
+
+1. **Alpaca News API 429s had no retry.** A 5.5-year, 27-symbol backfill
+   routinely hit the rate limit and crashed outright. Added
+   exponential-backoff retry (`engine/data/alpaca_news.py`, up to 6
+   attempts) specific to 429s; 401/403 still fail fast as auth errors.
+
+2. **The 500-page pagination cap silently truncated multi-year fetches.**
+   `_MAX_PAGES` was a budget for the whole `[start, end]` range, not a
+   safety net -- the first `dumb_news` dev-period run hit it and, because
+   `sort=asc`, silently dropped everything after 2021-01-11 out of a
+   requested 2020-01-01..2025-07-20 range (150,909 real articles vs. the
+   25,000 it actually fetched). The resulting backtest looked *good*
+   (return 6.79%, Sharpe 0.15) purely because it was unknowingly trading
+   only the 2020-2021 COVID-recovery bull run. Fixed by chunking the fetch
+   into 90-day windows, each with its own page budget, then deleted the
+   truncated cache rows and re-ran. Corrected result: return -0.47%, Sharpe
+   -0.00. **The "good" number was a data-truncation artifact, not a
+   finding** -- exactly the kind of self-deception this project's process
+   exists to catch, and it would have gone unnoticed without checking why
+   the fetch logged a cap warning.
+
+3. **`load_news_items` returned naive datetimes on a second read of an
+   already-cached range**, crashing `build_event_stream`'s sort
+   (`TypeError: can't compare offset-naive and offset-aware datetimes`)
+   the moment `overnight_gap` tried to backtest the same range `dumb_news`
+   had just warmed the cache for. SQLite drops tzinfo on datetime
+   round-trip regardless of the column's declared type; `_hours_elapsed`
+   already had a workaround for this, `load_news_items` didn't. Fixed with
+   a shared `_as_utc` helper in `engine/journal/registry.py`.
+
+**A fourth issue, structural rather than a bug to fix:** `overnight_gap`
+produced exactly 0 trades over the 2020-2025 daily-bar dev period. Root
+cause: `_entry_signals` only fires when `ctx.timestamp.hour >=
+US_MARKET_OPEN_UTC_HOUR (14)`, but daily bars from yfinance always carry
+`hour == 0` -- this strategy is structurally incompatible with `--interval
+1d`, full stop, not something the perturbation/tuning knobs can fix. It
+needs intraday bars to ever act. yfinance hard-caps hourly history to the
+last 730 days, so `overnight_gap`'s dev period had to be shrunk to
+2024-07-22..2025-07-20 (`--interval 1h`) instead of the 5.5-year range
+every other strategy used -- the best available window that doesn't
+overlap the reserved validation period. This is a real data-availability
+ceiling, not a workaround to revisit later without a paid intraday data
+source.
+
+### Results
+
+**Development period (2020-01-01..2025-07-20, `--interval 1d` except
+overnight_gap which used `1h` over 2024-07-22..2025-07-20):**
+
+| Strategy | Return | Max DD | Sharpe | Win rate | PF | Trades | Fragile? |
+|---|---|---|---|---|---|---|---|
+| buy_and_hold | -0.51% | 1.21% | -0.05 | 0.0% | 0.00 | 6 | -- |
+| random_entry | 1.15% | 10.39% | 0.02 | 27.6% | 1.06 | 5,869 | -- |
+| dumb_news | -0.47% | 10.41% | -0.00 | 30.1% | 1.03 | 3,762 | No |
+| overnight_gap | -0.81% | 1.30% | -0.12 | 48.6% | 0.81 | 247 | No |
+| momentum | -15.25% | 17.69% | -0.18 | 23.3% | 0.96 | 8,133 | No |
+| mean_reversion | -29.65% | 30.77% | -0.44 | 27.4% | 0.83 | 6,493 | No |
+| multi_factor | -22.18% | 23.34% | -0.31 | 23.2% | 0.91 | 8,311 | No |
+
+**Validation period (2025-07-21..2026-07-20, held-out, first use):**
+
+| Strategy | Return | Max DD | Sharpe | Win rate | PF | Trades |
+|---|---|---|---|---|---|---|
+| buy_and_hold | 5.28% | 2.14% | 0.30 | 0.0% | 0.00 | 5 |
+| random_entry | 3.46% | 2.79% | 0.21 | 27.1% | 1.19 | 1,037 |
+| dumb_news | 0.28% | 3.63% | 0.02 | 29.7% | 1.06 | 748 |
+| overnight_gap | -0.74% | 1.13% | -0.10 | 51.5% | 0.86 | 264 |
+| momentum | 2.73% | 2.56% | 0.17 | 24.7% | 1.15 | 1,514 |
+| mean_reversion | -1.92% | 4.39% | -0.11 | 29.1% | 0.96 | 1,127 |
+| multi_factor | 1.05% | 2.80% | 0.07 | 24.5% | 1.09 | 1,411 |
+
+### Honest interpretation
+
+**None of the 5 deterministic strategies beat both baselines' Sharpe ratio
+in the validation period, and none beat `buy_and_hold` in either period.**
+`buy_and_hold` (0.30) and `random_entry` (0.21) both outrank every real
+strategy on validation Sharpe; the closest real strategy is `momentum`
+(0.17), still below both. `dumb_news` (0.02) and `multi_factor` (0.07) are
+roughly flat. `overnight_gap` (-0.10) and `mean_reversion` (-0.11) are
+negative on the exact window that matters most (the one never touched
+until this run). None of the dev-period perturbation checks flagged any
+strategy as fragile, so this isn't a parameter-sensitivity artifact --
+the dev-period numbers (all substantially worse, -15% to -30% return for
+the factor-based strategies) reflect the 2020 COVID crash and 2022
+drawdown sitting inside that window, which the shorter validation window
+avoids.
+
+**Conclusion: this backtest suite found no validated edge for any of the
+5 deterministic strategies over naive baselines.** That is a real result,
+not a setback to explain away -- it's exactly the outcome the "beat both
+baselines after costs, same universe, same window" bar in this project's
+own process (see the Overnight-Gap note above, 2026-05-xx entries) was
+designed to catch before anything trades with real signal-driven logic.
+None of these 5 strategies should be handed real (even paper) capital on
+the strength of this data. This does not touch the separate LLM
+consequence-prediction pipeline (`engine.prediction`), which was never
+claimed to be validated this way and has its own forward-test-only
+evidence bar (see "What 'skill' would actually look like" in
+`docs/prediction_pipeline.md`) -- that pipeline's evidence, once it
+accumulates enough forward-safe resolved predictions, is the more
+promising track going forward.
+
+Per SPEC.md, the validation period is now considered touched and should
+not be re-run casually -- any future re-validation needs its own
+deliberate `--validation-reason` and should be treated as a rare event,
+not a tuning loop.
