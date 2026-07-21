@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Predictions{% endblock %}
+{% block content %}
+<h1>Predictions</h1>
+<div class="subtitle">Forward-test log. outcome_correct is frozen at resolution -- see docs/prediction_pipeline.md.</div>
+
+<div class="cards">
+  <div class="card"><div class="label">Resolved (forward-safe)</div><div class="value">{{ resolved_count }}</div></div>
+  <div class="card"><div class="label">Accuracy</div><div class="value">{{ "%.1f%%"|format(accuracy_pct) if accuracy_pct is not none else "n/a" }}</div></div>
+  <div class="card"><div class="label">Avg MFE</div><div class="value">{{ "%.2f%%"|format(avg_mfe) if avg_mfe is not none else "n/a" }}</div></div>
+  <div class="card"><div class="label">Avg MAE</div><div class="value">{{ "%.2f%%"|format(avg_mae) if avg_mae is not none else "n/a" }}</div></div>
+</div>
+{% if would_have_stopped %}
+<div class="note">{{ would_have_stopped }} of {{ correct_count }} "correct" predictions moved past the {{ stop_pct }}% stop-loss threshold before recovering -- directionally right, but a live position would've been stopped out first.</div>
+{% endif %}
+
+<h1>Recent predictions</h1>
+{% if predictions %}
+<table>
+  <tr><th>Decision time</th><th>Symbol</th><th>Predicted</th><th>Status</th><th>Move</th><th>MFE</th><th>MAE</th><th>Tracked</th><th>Headline</th></tr>
+  {% for p in predictions %}
+  <tr>
+    <td>{{ p.news_decision_timestamp.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td>{{ p.symbol }}</td>
+    <td><span class="tag {{ p.direction.value }}">{{ p.direction.value }}</span></td>
+    <td>
+      {% if p.status.value == "resolved" %}
+        <span class="tag {{ 'correct' if p.outcome_correct else 'incorrect' }}">{{ 'correct' if p.outcome_correct else 'incorrect' }}</span>
+      {% else %}
+        <span class="tag {{ p.status.value }}">{{ p.status.value }}</span>
+      {% endif %}
+    </td>
+    <td>{{ "%+.2f%%"|format(p.actual_return_pct) if p.actual_return_pct is not none else "-" }}</td>
+    <td>{{ "%.2f%%"|format(p.mfe_pct) if p.mfe_pct is not none else "-" }}</td>
+    <td>{{ "%.2f%%"|format(p.mae_pct) if p.mae_pct is not none else "-" }}</td>
+    <td>{{ "yes" if p.in_tracked_universe else "no" }}</td>
+    <td class="headline">{{ p.news_headline }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No predictions logged yet.</div>
+{% endif %}
+{% endblock %}

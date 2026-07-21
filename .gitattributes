@@ -1,0 +1,4 @@
+# Shell scripts run inside the Linux container -- CRLF line endings break
+# the shebang there ("bad interpreter"). Force LF regardless of platform
+# autocrlf settings.
+*.sh text eol=lf

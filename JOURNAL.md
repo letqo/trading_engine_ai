@@ -5,6 +5,51 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-21 -- Add: read-only reporting dashboard (engine.dashboard) + role-aware deploy image
+
+**What changed.** New FastAPI service (`engine.dashboard.app`) serving six
+read-only pages -- overview (equity, accuracy, MFE/MAE summary), full
+predictions log, AI trade history, off-universe ticker suggestions,
+backtest/live-run registry, and risk-halt audit trail. HTTP Basic Auth,
+single shared password (`DASHBOARD_PASSWORD`); refuses to serve
+unauthenticated rather than defaulting open. Deliberately never imports
+`engine.execution.broker`/`RiskGate` -- the only broker calls are
+`AlpacaPaperClient`'s read methods (`get_account_equity`,
+`get_positions`), same trust boundary as any other consumer of a paper
+account's public state. Reuses existing `engine.journal.registry` queries;
+added `load_recent_experiment_runs`/`load_recent_risk_halts` for the two
+tables that had no read path yet.
+
+**Two real bugs caught before they reached production, not after:**
+- Starlette's `TemplateResponse` signature changed to `(request, name,
+  context)` in the version pinned by the current FastAPI release --  the
+  old `(name, {"request": request, ...})` calling convention silently
+  passed the context dict as the template *name*, producing a Jinja2
+  internal cache-key error on every route. Caught by actually hitting
+  every route with curl before calling it done, not by trusting that
+  "the code looks right."
+- `pip install .` (a real, non-editable install, i.e. what the Dockerfile
+  does) does not bundle `templates/*.html` by default -- setuptools only
+  packages `.py` files without explicit `package-data` config. Verified by
+  installing into a throwaway venv exactly the way the Dockerfile does,
+  confirming the templates directory was missing, adding
+  `[tool.setuptools.package-data]`, and re-verifying the fix in the same
+  clean venv rather than trusting the editable dev install (which never
+  would have shown this).
+
+**Deploy shape changed to support this without three separate Dockerfiles:**
+one image now serves three possible Railway services (`worker`,
+`predict-loop`, `dashboard`), selected at container start by a
+`SERVICE_ROLE` env var (`docker-entrypoint.sh`) rather than a per-service
+Railway startCommand override -- the CLI has no clean way to set that
+per-service, and this mirrors the `PAPERTRADE_STRATEGY` pattern already
+used inside the worker role itself. `railway.toml`'s `startCommand` was
+removed accordingly (would have overridden the entrypoint script for
+every service sharing the repo); `releaseCommand` (alembic) still applies
+to all three.
+
+---
+
 ## 2026-07-21 -- Add: max-favorable/max-adverse excursion (mfe_pct/mae_pct) on resolved predictions
 
 **Why.** Raised directly by a user question: "how do we handle the fact

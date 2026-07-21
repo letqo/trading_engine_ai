@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Risk events{% endblock %}
+{% block content %}
+<h1>Risk halt events</h1>
+<div class="subtitle">Every time RiskGate halted trading or the kill switch fired -- independent of trade outcomes.</div>
+
+{% if events %}
+<table>
+  <tr><th>Time</th><th>Reason</th><th>Triggered by</th><th>Account equity</th></tr>
+  {% for e in events %}
+  <tr>
+    <td>{{ e.timestamp.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td>{{ e.reason }}</td>
+    <td>{{ e.triggered_by }}</td>
+    <td>{{ "%.2f"|format(e.account_equity) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No risk halts recorded.</div>
+{% endif %}
+{% endblock %}

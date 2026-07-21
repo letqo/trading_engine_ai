@@ -5,25 +5,41 @@
 Implemented in this repo, works locally today:
 - `Dockerfile` builds a single image that runs the same code locally and on
   Railway (`docker build . && docker run ...`, or `docker-compose up`).
-- `railway.toml` declares the build (Dockerfile), the release command
-  (`alembic upgrade head`, run before the worker starts on every deploy),
-  the start command (`engine papertrade`), and pins `numReplicas = 1`
-  (never run two live instances against the same broker account).
-  `papertrade` reconciles/watches the kill switch either way; set
-  `PAPERTRADE_STRATEGY` (one of `dumb_news`, `overnight_gap`, `momentum`,
-  `mean_reversion`, `multi_factor`) in Railway's environment variables to
-  also actually trade that strategy live -- no start-command or code
-  change needed to switch strategies, just the env var + redeploy. Leave
-  it unset to run the reconcile-only skeleton with no trading.
-- `engine predict-loop` is a second always-on process (predict-news +
-  act-on-predictions + resolve-predictions, on a loop) -- it needs its own
-  Railway service. `railway.toml` only configures one service's start
-  command; add a second service in the Railway dashboard pointed at the
-  same repo/image, with its start command overridden to
-  `python -m engine.cli.main predict-loop`. Same `numReplicas = 1` rule
-  applies -- it submits real orders through the same broker account.
-- `Procfile` mirrors the same two process types for any Heroku-style
-  buildpack path as a fallback to the Dockerfile route.
+  One image serves three possible Railway services -- which process
+  actually runs is chosen at container start by the `SERVICE_ROLE` env var
+  (`docker-entrypoint.sh`), not a per-service Railway startCommand
+  override (the CLI has no clean way to set that per-service). Set
+  `SERVICE_ROLE` to `worker`, `predict-loop`, or `dashboard` on each
+  Railway service; local dev invokes the CLI/uvicorn directly instead and
+  never needs it set.
+- `railway.toml` declares the build (Dockerfile) and the release command
+  (`alembic upgrade head`, run before any of the three services starts on
+  every deploy), and pins `numReplicas = 1` for the worker/predict-loop
+  roles (never run two live instances against the same broker account --
+  the dashboard role is read-only and this constraint doesn't apply to it,
+  but there's currently no way to set numReplicas differently per service
+  from this shared config, so it stays at 1 everywhere).
+- **`worker`** (`SERVICE_ROLE=worker`, `engine papertrade`) reconciles/
+  watches the kill switch either way; set `PAPERTRADE_STRATEGY` (one of
+  `dumb_news`, `overnight_gap`, `momentum`, `mean_reversion`,
+  `multi_factor`) in Railway's environment variables to also actually
+  trade that strategy live -- no code change needed to switch strategies,
+  just the env var + redeploy. Leave it unset to run the reconcile-only
+  skeleton with no trading.
+- **`predict-loop`** (`SERVICE_ROLE=predict-loop`) is a second always-on
+  process (predict-news + act-on-predictions + resolve-predictions, on a
+  loop). Requires `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (see
+  `engine/prediction/factory.py`) -- refuses to start without one, rather
+  than silently doing nothing. Same `numReplicas = 1` rule applies -- it
+  submits real orders through the same broker account.
+- **`dashboard`** (`SERVICE_ROLE=dashboard`) serves the read-only reporting
+  UI (`engine.dashboard.app`) on Railway's injected `$PORT`. Requires
+  `DASHBOARD_PASSWORD` (HTTP Basic Auth) -- refuses to serve
+  unauthenticated. Needs a generated public domain (Railway dashboard:
+  service -> Settings -> Networking -> Generate Domain) to actually be
+  reachable; it isn't exposed by default.
+- `Procfile` mirrors the same process types for any Heroku-style buildpack
+  path as a fallback to the Dockerfile route.
 - The paper-only guard (`engine.config.guard`), remote kill switch
   (`HALT=true` env var or a `HALT` flag file, checked every loop iteration
   in `engine papertrade`), startup reconciliation

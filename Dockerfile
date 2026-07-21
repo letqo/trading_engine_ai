@@ -22,8 +22,12 @@ COPY universe.yaml ./
 RUN pip install --no-cache-dir .
 
 COPY Procfile ./
+COPY docker-entrypoint.sh ./
+RUN chmod +x docker-entrypoint.sh
 
-# No public port: this is a background worker (SPEC.md Deployment section).
+# One image, three possible Railway services (worker/predict-loop/
+# dashboard) selected at runtime by SERVICE_ROLE -- see docker-entrypoint.sh.
 # Railway's release step runs `alembic upgrade head` before this starts --
-# see Procfile / railway.toml.
-CMD ["python", "-m", "engine.cli.main", "papertrade"]
+# see Procfile / railway.toml. Only the dashboard role actually listens on
+# a port; the other two are background workers with none exposed.
+CMD ["./docker-entrypoint.sh"]

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Ticker suggestions{% endblock %}
+{% block content %}
+<h1>Ticker suggestions</h1>
+<div class="subtitle">Every symbol the model has named outside universe.yaml, with accumulated evidence. Nothing here ever adds a symbol automatically -- adding one is always a human decision.</div>
+
+{% if suggestions %}
+<table>
+  <tr><th>Symbol</th><th>Times named</th><th>Resolved</th><th>Accuracy</th><th>Avg confidence</th><th>Strong evidence</th><th>Most recent</th></tr>
+  {% for s in suggestions %}
+  <tr>
+    <td>{{ s.symbol }}</td>
+    <td>{{ s.times_named }}</td>
+    <td>{{ s.resolved_count }}</td>
+    <td>{{ "%.1f%%"|format(s.accuracy_pct) if s.accuracy_pct is not none else "n/a" }}</td>
+    <td>{{ "%.2f"|format(s.avg_confidence) }}</td>
+    <td>{{ "yes" if s.resolved_count >= min_resolved and s.accuracy_pct is not none and s.accuracy_pct >= min_accuracy_pct else "" }}</td>
+    <td class="headline">"{{ s.most_recent_headline }}" &rarr; {{ s.most_recent_rationale }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No off-universe suggestions yet.</div>
+{% endif %}
+{% endblock %}

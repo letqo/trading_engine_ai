@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Trade history{% endblock %}
+{% block content %}
+<h1>AI trade history</h1>
+<div class="subtitle">Every prediction acted on with a real (paper) order. Distinct from the full prediction log -- most predictions are logged and scored but never traded.</div>
+
+{% if trades %}
+<table>
+  <tr><th>Decision time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Confidence</th><th>State</th><th>Outcome</th><th>Move</th><th>MFE</th><th>MAE</th><th>Headline</th></tr>
+  {% for t in trades %}
+  <tr>
+    <td>{{ t.news_decision_timestamp.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td>{{ t.symbol }}</td>
+    <td><span class="tag {{ t.direction.value }}">{{ t.direction.value }}</span></td>
+    <td>{{ "%.4f"|format(t.traded_quantity) if t.traded_quantity is not none else "-" }}</td>
+    <td>{{ "%.2f"|format(t.confidence) }}</td>
+    <td>{{ "OPEN" if t.exit_order_id is none else "CLOSED" }}</td>
+    <td>
+      {% if t.status.value == "resolved" %}
+        <span class="tag {{ 'correct' if t.outcome_correct else 'incorrect' }}">{{ 'correct' if t.outcome_correct else 'incorrect' }}</span>
+      {% else %}
+        <span class="tag {{ t.status.value }}">{{ t.status.value }}</span>
+      {% endif %}
+    </td>
+    <td>{{ "%+.2f%%"|format(t.actual_return_pct) if t.actual_return_pct is not none else "-" }}</td>
+    <td>{{ "%.2f%%"|format(t.mfe_pct) if t.mfe_pct is not none else "-" }}</td>
+    <td>{{ "%.2f%%"|format(t.mae_pct) if t.mae_pct is not none else "-" }}</td>
+    <td class="headline">{{ t.news_headline }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No prediction-driven trades yet.</div>
+{% endif %}
+{% endblock %}

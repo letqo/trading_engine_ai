@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<h1>Overview</h1>
+<div class="subtitle">Read-only. Never places, modifies, or cancels an order.</div>
+
+<div class="cards">
+  <div class="card">
+    <div class="label">Account equity</div>
+    <div class="value">{{ equity_display }}</div>
+  </div>
+  <div class="card">
+    <div class="label">Open positions</div>
+    <div class="value">{{ open_positions_count }}</div>
+  </div>
+  <div class="card">
+    <div class="label">Prediction accuracy (forward-safe)</div>
+    <div class="value {{ 'good' if accuracy_pct is not none and accuracy_pct >= 50 else 'bad' if accuracy_pct is not none else '' }}">
+      {{ "%.1f%%"|format(accuracy_pct) if accuracy_pct is not none else "n/a" }}
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">Resolved predictions</div>
+    <div class="value">{{ resolved_count }}</div>
+  </div>
+  <div class="card">
+    <div class="label">Predictions traded</div>
+    <div class="value">{{ traded_count }}</div>
+  </div>
+  <div class="card">
+    <div class="label">Backtest runs logged</div>
+    <div class="value">{{ backtest_count }}</div>
+  </div>
+</div>
+
+{% if would_have_stopped %}
+<div class="note">{{ would_have_stopped }} of {{ correct_count }} "correct" predictions moved past the {{ stop_pct }}% stop-loss threshold before recovering -- see <a href="/predictions">predictions</a> for detail.</div>
+{% endif %}
+
+<h1>Open positions</h1>
+{% if positions %}
+<table>
+  <tr><th>Symbol</th><th>Quantity</th><th>Avg entry</th></tr>
+  {% for p in positions %}
+  <tr><td>{{ p.symbol }}</td><td>{{ "%.4f"|format(p.quantity) }}</td><td>{{ "%.2f"|format(p.avg_entry_price) }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">{{ positions_note }}</div>
+{% endif %}
+{% endblock %}

@@ -510,3 +510,17 @@ def load_prediction_trades(session: Session) -> list[Prediction]:
         .order_by(Prediction.news_decision_timestamp.desc())
     ).all()
     return list(rows)
+
+
+def load_recent_experiment_runs(session: Session, limit: int = 50) -> list[ExperimentRun]:
+    """Most recent backtest/live-session runs, newest first -- the
+    reproducible experiment registry (engine backtest / engine papertrade)."""
+    rows = session.exec(select(ExperimentRun).order_by(ExperimentRun.created_at.desc()).limit(limit)).all()
+    return list(rows)
+
+
+def load_recent_risk_halts(session: Session, limit: int = 100) -> list[RiskHaltEvent]:
+    """Most recent risk-gate halts/kill-switch triggers, newest first --
+    the audit trail independent of trade outcomes."""
+    rows = session.exec(select(RiskHaltEvent).order_by(RiskHaltEvent.timestamp.desc()).limit(limit)).all()
+    return list(rows)

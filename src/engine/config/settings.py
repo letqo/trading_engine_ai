@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     # pipeline refuses to run rather than silently doing nothing; see
     # engine/prediction/client.py.
     anthropic_api_key: str | None = None
+    # Alternative to anthropic_api_key: a long-lived token from `claude
+    # setup-token`, authenticating via a Claude subscription instead of
+    # metered API billing. If both are set, the OAuth token wins (see
+    # engine.prediction.factory). Authenticates the `claude` CLI, not the
+    # Python SDK -- see engine/prediction/cli_client.py.
+    claude_code_oauth_token: str | None = None
     anthropic_model: str = "claude-opus-4-8"
     # Deliberately an obvious placeholder, not a guessed real date -- see
     # engine/prediction/client.py. Must be set to the actual training-data
@@ -87,6 +93,11 @@ class Settings(BaseSettings):
     prediction_loop_poll_seconds: int = 3600
 
     alert_webhook_url: str | None = None
+
+    # Read-only reporting dashboard (engine.dashboard). HTTP Basic Auth,
+    # single shared password -- unset means the dashboard refuses to start
+    # rather than serving trade/prediction history with no auth at all.
+    dashboard_password: str | None = None
 
     # Remote kill switch (Railway-friendly: flip env var + redeploy).
     halt: bool = False

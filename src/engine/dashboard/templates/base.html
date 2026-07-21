@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Trading engine dashboard{% endblock %}</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+    nav { display: flex; gap: 1.5rem; padding: 1rem 1.5rem; background: #171a21; border-bottom: 1px solid #2a2e37; }
+    nav a { color: #9fb4ff; text-decoration: none; font-size: 0.95rem; }
+    nav a:hover { text-decoration: underline; }
+    nav .brand { color: #fff; font-weight: 600; margin-right: 1rem; }
+    main { padding: 1.5rem; max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #9098a8; margin-bottom: 1.5rem; font-size: 0.9rem; }
+    .cards { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }
+    .card { background: #171a21; border: 1px solid #2a2e37; border-radius: 8px; padding: 1rem 1.25rem; min-width: 160px; }
+    .card .label { color: #9098a8; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    .card .value { font-size: 1.6rem; font-weight: 600; margin-top: 0.25rem; }
+    .card .value.good { color: #6fd08c; }
+    .card .value.bad { color: #e8756c; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 2rem; font-size: 0.88rem; }
+    th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #22262f; }
+    th { color: #9098a8; font-weight: 500; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.03em; }
+    tr:hover { background: #171a21; }
+    .tag { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.78rem; font-weight: 600; }
+    .tag.correct, .tag.up, .tag.online { background: rgba(111,208,140,0.15); color: #6fd08c; }
+    .tag.incorrect, .tag.down { background: rgba(232,117,108,0.15); color: #e8756c; }
+    .tag.pending, .tag.invalid { background: rgba(144,152,168,0.15); color: #9098a8; }
+    .empty { color: #9098a8; font-style: italic; padding: 1rem 0; }
+    .note { color: #9098a8; font-size: 0.82rem; margin-top: -1rem; margin-bottom: 1.5rem; }
+    .headline { max-width: 340px; color: #cfd3db; }
+  </style>
+</head>
+<body>
+  <nav>
+    <span class="brand">trading engine</span>
+    <a href="/">overview</a>
+    <a href="/predictions">predictions</a>
+    <a href="/trades">trade history</a>
+    <a href="/ticker-suggestions">ticker suggestions</a>
+    <a href="/backtests">backtests</a>
+    <a href="/risk-events">risk events</a>
+  </nav>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
