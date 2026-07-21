@@ -112,3 +112,22 @@ def test_load_news_items_filters_by_published_at_range(db_session):
     assert results[0].headline == "in range"
     assert results[0].routed_symbols == ("SPY",)
     assert results[0].sentiment_score == 0.5
+
+
+def test_load_news_items_returns_tz_aware_timestamps(db_session):
+    from datetime import timedelta
+
+    # SQLite drops tzinfo on datetime round-trip regardless of what the
+    # column declares -- a naive published_at/ingested_at here would raise
+    # "can't compare offset-naive and offset-aware datetimes" the moment a
+    # backtest sorts these against tz-aware Bar timestamps in
+    # build_event_stream (only reproduces on a *second* read of an
+    # already-cached range, since a fresh in-memory backfill never
+    # round-trips through the DB before use).
+    record_news_item(
+        db_session, source="rss", published_at=NOW, headline="tz check",
+        raw_payload={}, routed_symbols=["SPY"],
+    )
+    results = load_news_items(db_session, start=NOW - timedelta(days=1), end=NOW + timedelta(days=1))
+    assert results[0].published_at.tzinfo is not None
+    assert results[0].ingested_at.tzinfo is not None

@@ -233,6 +233,19 @@ def record_reconciliation(
     return report
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """SQLite (used for local dev/backtests) silently drops tzinfo on
+    datetime round-trip through SQLAlchemy, regardless of the column's
+    declared type -- every datetime this codebase writes is UTC by
+    convention (see engine.data.alpaca_news, engine.data.bars), so a naive
+    read is always UTC, never local time. Re-attaching tzinfo here is what
+    keeps a DB-loaded NewsItem comparable to tz-aware Bar timestamps in
+    build_event_stream; without it, backtests that reuse an already-cached
+    news range (anything after the first strategy to warm the cache) raise
+    "can't compare offset-naive and offset-aware datetimes"."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def load_news_items(session: Session, start: datetime, end: datetime) -> list[NewsItem]:
     """Read back previously-ingested news for a date range (published_at
     within [start, end]) as domain NewsItem objects, for backtesting over a
@@ -256,8 +269,8 @@ def load_news_items(session: Session, start: datetime, end: datetime) -> list[Ne
         NewsItem(
             id=row.id,
             source=row.source,
-            published_at=row.published_at,
-            ingested_at=row.ingested_at,
+            published_at=_as_utc(row.published_at),
+            ingested_at=_as_utc(row.ingested_at),
             headline=row.headline,
             url=row.url,
             raw_payload=row.raw_payload,
