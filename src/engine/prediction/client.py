@@ -25,6 +25,41 @@ from engine.prediction.schema import ConsequenceAnalysis
 
 _PLACEHOLDER_CUTOFF = "1970-01-01"
 
+
+class PredictionConfigError(RuntimeError):
+    pass
+
+
+def parse_knowledge_cutoff(settings: Settings) -> date:
+    """Shared by every prediction-client backend (API key or CLI/OAuth) --
+    the cutoff-date validation is about the model, not the transport."""
+    cutoff_str = settings.anthropic_model_knowledge_cutoff
+    if not cutoff_str or cutoff_str == _PLACEHOLDER_CUTOFF:
+        raise PredictionConfigError(
+            f"ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF is unset or still the placeholder "
+            f"({_PLACEHOLDER_CUTOFF}). Set it to the actual training-data knowledge "
+            f"cutoff date for the model in ANTHROPIC_MODEL ({settings.anthropic_model!r}). "
+            f"This field is not guessable -- see engine/prediction/client.py docstring."
+        )
+    return datetime.strptime(cutoff_str, "%Y-%m-%d").date()
+
+
+def is_forward_safe(knowledge_cutoff: date, decision_timestamp: datetime) -> bool:
+    cutoff_dt = datetime.combine(knowledge_cutoff, datetime.min.time(), tzinfo=timezone.utc)
+    return decision_timestamp > cutoff_dt
+
+
+def build_prompt(headline: str, tracked_symbols: list[str], past_cases: list[str]) -> str:
+    lines = [
+        f"Headline: {headline}",
+        "",
+        f"Symbols we can currently trade on (context, not a limit -- see system prompt): "
+        f"{', '.join(tracked_symbols)}",
+    ]
+    if past_cases:
+        lines += ["", "Past cases:"] + [f"- {case}" for case in past_cases]
+    return "\n".join(lines)
+
 SYSTEM_PROMPT = """You analyze financial news for indirect, second-order market consequences \
 -- the kind of reasoning that connects "a pandemic starts in China" to "cruise line and \
 airline stocks are exposed" without either company being named in the headline.
@@ -49,32 +84,24 @@ rationale stating the causal mechanism. Be conservative with confidence -- most 
 effects are uncertain."""
 
 
-class PredictionConfigError(RuntimeError):
-    pass
-
-
 class ConsequencePredictionClient:
+    """Metered-API backend: authenticates with ANTHROPIC_API_KEY via the
+    Python SDK. See engine.prediction.cli_client.ClaudeCLIPredictionClient
+    for the subscription/OAuth-token alternative -- engine.prediction.factory
+    picks between the two; nothing else needs to know which is active."""
+
     def __init__(self, settings: Settings):
         if not settings.anthropic_api_key:
             raise PredictionConfigError(
                 "ANTHROPIC_API_KEY is not set -- refusing to construct a prediction client "
                 "rather than silently doing nothing."
             )
-        cutoff_str = settings.anthropic_model_knowledge_cutoff
-        if not cutoff_str or cutoff_str == _PLACEHOLDER_CUTOFF:
-            raise PredictionConfigError(
-                f"ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF is unset or still the placeholder "
-                f"({_PLACEHOLDER_CUTOFF}). Set it to the actual training-data knowledge "
-                f"cutoff date for the model in ANTHROPIC_MODEL ({settings.anthropic_model!r}). "
-                f"This field is not guessable -- see engine/prediction/client.py docstring."
-            )
         self.model = settings.anthropic_model
-        self.knowledge_cutoff: date = datetime.strptime(cutoff_str, "%Y-%m-%d").date()
+        self.knowledge_cutoff: date = parse_knowledge_cutoff(settings)
         self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
     def is_forward_safe(self, decision_timestamp: datetime) -> bool:
-        cutoff_dt = datetime.combine(self.knowledge_cutoff, datetime.min.time(), tzinfo=timezone.utc)
-        return decision_timestamp > cutoff_dt
+        return is_forward_safe(self.knowledge_cutoff, decision_timestamp)
 
     def analyze(
         self,
@@ -82,7 +109,7 @@ class ConsequencePredictionClient:
         tracked_symbols: list[str],
         past_cases: list[str] | None = None,
     ) -> ConsequenceAnalysis:
-        user_prompt = self._build_prompt(headline, tracked_symbols, past_cases or [])
+        user_prompt = build_prompt(headline, tracked_symbols, past_cases or [])
         response = self._client.messages.parse(
             model=self.model,
             max_tokens=4096,
@@ -93,15 +120,3 @@ class ConsequencePredictionClient:
             output_format=ConsequenceAnalysis,
         )
         return response.parsed_output
-
-    @staticmethod
-    def _build_prompt(headline: str, tracked_symbols: list[str], past_cases: list[str]) -> str:
-        lines = [
-            f"Headline: {headline}",
-            "",
-            f"Symbols we can currently trade on (context, not a limit -- see system prompt): "
-            f"{', '.join(tracked_symbols)}",
-        ]
-        if past_cases:
-            lines += ["", "Past cases:"] + [f"- {case}" for case in past_cases]
-        return "\n".join(lines)

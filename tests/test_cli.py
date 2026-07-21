@@ -166,7 +166,7 @@ def test_predict_loop_refuses_without_anthropic_key(monkeypatch, tmp_path):
 
 def test_predict_loop_runs_log_only_without_alpaca_key(monkeypatch, tmp_path):
     _isolated_env(monkeypatch, tmp_path)
-    monkeypatch.setattr("engine.cli.main.ConsequencePredictionClient", _FakePredictionClient)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
     monkeypatch.setattr("engine.cli.main.fetch_all_rss", lambda: [])
 
     result = runner.invoke(app, ["predict-loop", "--max-iterations", "2", "--poll-seconds", "0"])
@@ -177,7 +177,7 @@ def test_predict_loop_runs_log_only_without_alpaca_key(monkeypatch, tmp_path):
 def test_predict_loop_stops_immediately_when_kill_switch_engaged(monkeypatch, tmp_path):
     halt_path = _isolated_env(monkeypatch, tmp_path)
     halt_path.write_text("halted for test\n")
-    monkeypatch.setattr("engine.cli.main.ConsequencePredictionClient", _FakePredictionClient)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
     monkeypatch.setenv("ALPACA_API_KEY", "key")
     monkeypatch.setenv("ALPACA_API_SECRET", "secret")
     get_settings.cache_clear()
@@ -192,7 +192,7 @@ def test_predict_loop_stops_immediately_when_kill_switch_engaged(monkeypatch, tm
 
 def test_predict_loop_respects_max_iterations_in_log_only_mode(monkeypatch, tmp_path):
     _isolated_env(monkeypatch, tmp_path)
-    monkeypatch.setattr("engine.cli.main.ConsequencePredictionClient", _FakePredictionClient)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
     calls = []
     monkeypatch.setattr("engine.cli.main.fetch_all_rss", lambda: (calls.append(1), [])[1])
 

@@ -5,6 +5,66 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-21 -- Add: subscription-backed prediction client (CLAUDE_CODE_OAUTH_TOKEN), with an honest open problem
+
+**What changed.** `ConsequencePredictionClient` (metered API key, via the
+Python SDK) now has a sibling, `engine.prediction.cli_client.
+ClaudeCLIPredictionClient`, authenticating with a `claude setup-token`
+long-lived OAuth token against a Claude subscription instead of per-call
+billing -- matches the earlier decision (this session) that a
+subscription is fine for real usage once proven, not just local testing.
+`engine.prediction.factory.build_prediction_client` picks between the
+two based on which credential is set (OAuth token wins if both are
+present, since a deliberately-configured subscription shouldn't lose
+silently to a leftover test API key); both CLI call sites in
+`engine/cli/main.py` now go through the factory instead of constructing
+`ConsequencePredictionClient` directly.
+
+**This was actually verified live, not just unit-tested against
+assumptions** -- a real token became available this session. Two real
+bugs found and fixed in the process, both about the `claude` CLI
+specifically, neither obvious from its `--help` text:
+1. `subprocess.run(["claude", ...])` fails on Windows -- npm installs a
+   `.CMD` shim there, and Windows' `CreateProcess` doesn't do the
+   PATHEXT-aware resolution a shell would. Fixed with `shutil.which`,
+   resolved once at construction so a missing CLI fails fast.
+2. Running with `cwd` inside this repo lets Claude Code auto-discover
+   `CLAUDE.md`/`.env` and the model responds *about this codebase*
+   instead of analyzing the headline it was asked about. Fixed by
+   running with `cwd` set to a neutral temp directory.
+
+**One real problem remains open, and matters more than the two above.**
+Even with a neutral cwd and a completely ordinary, unambiguous headline
+("Fed raises rates 0.25pp -- ordinary financial news, not evocative or
+sensitive in any way), `claude -p` responds with a clarifying question
+about user intent instead of following the system prompt and
+`--json-schema` constraint. This reproduced identically on an evocative
+headline (disease-outbreak framing) and a mundane one, ruling out "the
+model is being cautious about sensitive content" as the explanation --
+it looks structural: Claude Code's own intent-classification layer (see
+`claude auto-mode`) appears to intercept short, non-coding-task-shaped
+prompts before the system prompt gets to drive behavior the way the raw
+Messages API does. `--bare` mode (which disables extra harness behavior)
+was tried as a fix and made things worse -- it also strictly disables
+OAuth/keychain auth, so it's incompatible with this credential entirely.
+
+**Net effect, left as-is deliberately rather than half-fixed:** this
+backend will likely raise `ClaudeCLIError` on most real headlines right
+now. That's a safe failure mode, not a dangerous one -- `predict-loop`'s
+per-cycle exception handling logs it and moves to the next headline
+rather than crashing, so nothing breaks, but no real predictions get
+produced either. Shipped anyway because (a) it's the credential path
+actually available tonight, (b) the failure is loud and logged, not
+silent, and (c) the fallback (`ANTHROPIC_API_KEY`, unaffected by any of
+this since it calls the Messages API directly, no CLI harness involved)
+remains a one-env-var swap away with zero code changes. Needs either a
+different invocation approach or accepting the API-key path as primary.
+Do not read "the predict-loop service is running" as "this backend
+works" until this is resolved -- check the dashboard/logs for actual
+predictions being produced, not just service uptime.
+
+---
+
 ## 2026-07-21 -- Fix: migrations weren't applied on Railway; root cause still open
 
 **What happened.** Deploying the dashboard service surfaced `relation

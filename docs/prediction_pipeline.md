@@ -180,6 +180,28 @@ instead of it sitting unexamined in the `Prediction` table.
   outcome once resolved. Distinct from `predictions-report`, which is
   about the accuracy of the whole log; most predictions are never traded.
 
+## Two interchangeable backends (2026-07-21)
+
+`engine.prediction.factory.build_prediction_client` picks between
+`ConsequencePredictionClient` (`ANTHROPIC_API_KEY`, metered, calls the
+Messages API directly) and `ClaudeCLIPredictionClient`
+(`CLAUDE_CODE_OAUTH_TOKEN`, subscription, shells out to the `claude` CLI)
+based on which credential is set -- OAuth wins if both are present.
+Nothing downstream (`run_prediction_for_news_item`, `predict-loop`) knows
+or cares which one is active; both implement the same `analyze()`
+contract.
+
+**The OAuth/CLI backend has a known, unresolved problem as of this
+writing** -- see JOURNAL.md 2026-07-21 for the full investigation. Short
+version: `claude -p` intercepts ordinary, unambiguous prompts with a
+clarifying question instead of following the system prompt, for reasons
+that don't look content-related (reproduced on both a mundane and an
+evocative headline). This backend fails safely (logged, per-cycle,
+non-crashing) but likely produces few or no real predictions until fixed.
+If accuracy tracking in `predictions-report` looks suspiciously empty
+despite `predict-loop` showing as running, check which backend is active
+before assuming the pipeline itself is broken.
+
 ## What this pipeline is not
 
 - Not a general trading strategy wired into `engine papertrade`'s main

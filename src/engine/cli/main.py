@@ -39,7 +39,8 @@ from engine.journal.registry import (
 )
 from engine.logging_setup import configure_logging, get_logger
 from engine.observability import alert_kill_switch, alert_risk_halt, alert_service_restart
-from engine.prediction.client import ConsequencePredictionClient, PredictionConfigError
+from engine.prediction.client import PredictionConfigError
+from engine.prediction.factory import build_prediction_client
 from engine.prediction.pipeline import resolve_pending_predictions, run_prediction_for_news_item
 from engine.prediction.trading import act_on_pending_predictions, close_expired_prediction_trades
 from engine.risk.gate import RiskGate
@@ -375,7 +376,7 @@ def predict_news(
     ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF (see engine/prediction/client.py)."""
     settings = get_settings()
     try:
-        client = ConsequencePredictionClient(settings)
+        client = build_prediction_client(settings)
     except PredictionConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1)
@@ -732,7 +733,7 @@ def predict_loop(
     settings = get_settings()
     poll_seconds = poll_seconds if poll_seconds is not None else settings.prediction_loop_poll_seconds
     try:
-        client = ConsequencePredictionClient(settings)
+        client = build_prediction_client(settings)
     except PredictionConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1)
