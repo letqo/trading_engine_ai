@@ -5,33 +5,46 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
-## 2026-07-21 -- Fix: migrations were never actually running on Railway, at all
+## 2026-07-21 -- Fix: migrations weren't applied on Railway; root cause still open
 
 **What happened.** Deploying the dashboard service surfaced `relation
 "prediction" does not exist` against the real production Postgres --
 discovered by actually hitting the live dashboard with curl and reading
-its logs, not by assuming a clean deploy meant a working one.
-`railway.toml`'s `[deploy]` block used `releaseCommand = "alembic upgrade
-head"`, which was the correct key at some earlier point but Railway has
-since renamed it to `preDeployCommand` (array syntax). The old key isn't
-rejected, isn't validated, isn't warned about -- it's just silently
-ignored. This meant the pre-deploy migration step never ran, on any
-deploy, on any service, since this project's Railway config was written.
-The `worker` service's earlier clean startup logs never caught this
-because startup reconciliation only touches broker/account state, never
-the `prediction`/`experiment_run`/etc. tables.
+its logs, not by assuming a clean deploy meant a working one. The
+`worker` service's earlier clean startup logs never caught this because
+startup reconciliation only touches broker/account state, never the
+`prediction`/`experiment_run`/etc. tables.
 
-**Fix.** Corrected the key to `preDeployCommand = ["alembic", "upgrade",
-"head"]`, and ran the migration once by hand directly against the real
-Railway Postgres (via its public proxy URL) to bring production schema
-up to date immediately rather than waiting on the next deploy cycle to
-self-heal.
+**Immediate fix, not in question:** ran the migration once by hand
+directly against the real Railway Postgres (via its public proxy URL).
+Production schema is correct as of this entry.
+
+**The root-cause investigation went sideways and is worth recording
+honestly.** First hypothesis: Railway renamed `releaseCommand` to
+`preDeployCommand` (array syntax) and silently ignores the old key. Acted
+on that immediately -- changed `railway.toml` to `preDeployCommand =
+["alembic", "upgrade", "head"]`, pushed, and it made things *worse*: all
+three services' configs failed to parse entirely
+(`fileServiceManifest.deploy` came back null from Railway's own API),
+blocking every future deploy, not just the migration step. Caught by
+inspecting `railway status --json` after the push rather than assuming
+the fix worked. Reverted to `releaseCommand` and confirmed via
+`propertyFileMapping` in that same JSON output that Railway's TOML
+schema *does* still recognize `releaseCommand` -- so the rename claim
+(from a web-docs fetch) was either JSON-config-only, describes a schema
+not yet live for TOML, or was simply wrong. Reverting restored the
+ability to deploy at all. Why `releaseCommand` didn't execute the
+migration in the first place remains unresolved -- possibly specific to
+how the two newly-added services (`dashboard`, `predict-loop`) inherited
+config versus `worker`'s original connection, possibly something else.
+Not blocking (schema is correct by hand, and future schema changes will
+surface the same way if it recurs), but flagged rather than quietly
+assumed fixed.
 
 **Lesson applied going forward:** verifying a deploy means checking that
 the *data path* actually works (hit a real endpoint that queries a real
-table), not just that the container starts and logs look clean -- a
-service can report healthy while silently running against a schema that
-was never created.
+table) and that the *next* deploy still succeeds after a config change --
+not just that the current container starts and logs look clean.
 
 ---
 

@@ -10,15 +10,17 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# NOTE: this key was `releaseCommand` until 2026-07-21 -- Railway renamed
-# it to `preDeployCommand` (array syntax) and silently ignored the old
-# key, which meant migrations were never actually applied automatically
-# on any deploy, on any service, the whole time. Discovered when the
-# dashboard service hit "relation does not exist" against tables that
-# genuinely never existed in the real Postgres. Fixed by both correcting
-# this key AND running the migration manually once against production --
-# see JOURNAL.md 2026-07-21.
-preDeployCommand = ["alembic", "upgrade", "head"]
+# `releaseCommand` (string) is the key this TOML schema actually parses --
+# confirmed directly from Railway's own deployment metadata
+# (propertyFileMapping lists "deploy.releaseCommand" as recognized).
+# `preDeployCommand` (array syntax) from Railway's web docs caused every
+# service's config to fail parsing outright (fileServiceManifest.deploy
+# came back null) -- either JSON-config-only, a doc/schema mismatch, or a
+# TOML-parser gap; reverted rather than keep guessing. The earlier "why
+# didn't migrations run with this same key" mystery (JOURNAL.md
+# 2026-07-21) is still open -- the migration was applied by hand against
+# production either way, so this isn't blocking, just unresolved.
+releaseCommand = "alembic upgrade head"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 # Exactly one replica, always. Two live instances would both reconcile
