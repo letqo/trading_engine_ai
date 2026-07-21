@@ -10,7 +10,15 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-releaseCommand = "alembic upgrade head"
+# NOTE: this key was `releaseCommand` until 2026-07-21 -- Railway renamed
+# it to `preDeployCommand` (array syntax) and silently ignored the old
+# key, which meant migrations were never actually applied automatically
+# on any deploy, on any service, the whole time. Discovered when the
+# dashboard service hit "relation does not exist" against tables that
+# genuinely never existed in the real Postgres. Fixed by both correcting
+# this key AND running the migration manually once against production --
+# see JOURNAL.md 2026-07-21.
+preDeployCommand = ["alembic", "upgrade", "head"]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 # Exactly one replica, always. Two live instances would both reconcile

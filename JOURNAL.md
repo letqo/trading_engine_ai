@@ -5,6 +5,36 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-21 -- Fix: migrations were never actually running on Railway, at all
+
+**What happened.** Deploying the dashboard service surfaced `relation
+"prediction" does not exist` against the real production Postgres --
+discovered by actually hitting the live dashboard with curl and reading
+its logs, not by assuming a clean deploy meant a working one.
+`railway.toml`'s `[deploy]` block used `releaseCommand = "alembic upgrade
+head"`, which was the correct key at some earlier point but Railway has
+since renamed it to `preDeployCommand` (array syntax). The old key isn't
+rejected, isn't validated, isn't warned about -- it's just silently
+ignored. This meant the pre-deploy migration step never ran, on any
+deploy, on any service, since this project's Railway config was written.
+The `worker` service's earlier clean startup logs never caught this
+because startup reconciliation only touches broker/account state, never
+the `prediction`/`experiment_run`/etc. tables.
+
+**Fix.** Corrected the key to `preDeployCommand = ["alembic", "upgrade",
+"head"]`, and ran the migration once by hand directly against the real
+Railway Postgres (via its public proxy URL) to bring production schema
+up to date immediately rather than waiting on the next deploy cycle to
+self-heal.
+
+**Lesson applied going forward:** verifying a deploy means checking that
+the *data path* actually works (hit a real endpoint that queries a real
+table), not just that the container starts and logs look clean -- a
+service can report healthy while silently running against a schema that
+was never created.
+
+---
+
 ## 2026-07-21 -- Add: read-only reporting dashboard (engine.dashboard) + role-aware deploy image
 
 **What changed.** New FastAPI service (`engine.dashboard.app`) serving six
