@@ -699,3 +699,75 @@ Per SPEC.md, the validation period is now considered touched and should
 not be re-run casually -- any future re-validation needs its own
 deliberate `--validation-reason` and should be treated as a rare event,
 not a tuning loop.
+
+---
+
+## 2026-07-21 (later) -- Fix: predict-loop had been crash-looping in
+production since deploy; "CLI intent-classifier problem" was a red herring
+
+**What happened.** Checked the live `predict-loop` Railway service's logs
+directly (not just its "Online" status, which only reflects the container
+staying up under `restartPolicyType = ON_FAILURE`) and found it had been
+restarting every ~5 seconds since deploy, never once reaching a real
+`analyze()` call:
+
+```
+ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF is unset or still the placeholder
+(1970-01-01). Set it to the actual training-data knowledge cutoff date...
+```
+
+**Root cause, part 1:** `ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF` was never set
+on the deployed service -- an oversight from when `predict-loop` was
+first created, not something either backend's code was doing wrong. Fixed
+by looking up the actual value (not guessing, per this field's whole
+reason for existing): Anthropic's docs
+(platform.claude.com/docs/en/about-claude/models/overview, checked
+2026-07-21) list claude-opus-4-8's training data cutoff and reliable
+knowledge cutoff both as "Jan 2026" -- no exact day given, so used
+2026-01-31 (the conservative end of that range, consistent with SPEC.md's
+"start pessimistic" default). Set via `railway variables --service
+predict-loop --set ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF=2026-01-31` and
+documented in `.env.example`.
+
+**Root cause, part 2, found immediately after fixing part 1:** the
+service then failed a different way -- `ClaudeCLIError: claude CLI not
+found on PATH`. The production image is `python:3.12-slim`; it never had
+Node.js/npm installed, so `@anthropic-ai/claude-code` could never have
+been present, regardless of `CLAUDE_CODE_OAUTH_TOKEN` being set correctly.
+This means the entire OAuth/CLI backend had never actually run in
+production -- every earlier "live" test of `ClaudeCLIPredictionClient`
+(2026-07-21 morning entry, transport verified working, intent-classifier
+problem discovered) was run locally on the user's Windows machine, never
+inside the actual deployed container. Fixed by adding `nodejs`, `npm`, and
+`npm install -g @anthropic-ai/claude-code` to the Dockerfile.
+
+**Result: after both fixes, the first real production cycle ran clean.**
+10 headlines in, 28 predictions out, correct causal reasoning across a
+genuinely diverse set of stories (mortgage-rate news -> RKT/DHI, Julius
+Baer earnings -> MS/UBS wealth managers, Mideast de-escalation ->
+JETS/DAL/ITA travel & defense names, a chip-stock rally -> SOXX/AVGO/TSM,
+the Reformation IPO -> RVLV). Cycle completed with no errors except one
+harmless `yfinance` rate-limit on a single symbol (USO), which was caught
+and logged as a skipped trade-sizing rather than crashing the cycle.
+
+**Anti-self-deception note.** The "clarifying question instead of a
+direct answer" problem documented earlier this same day
+(`engine/prediction/cli_client.py` docstring, `docs/prediction_pipeline.md`)
+never actually reproduced in production -- it's not clear yet whether
+that was an artifact of local/Windows testing conditions or something
+that could still resurface. Left the original investigation notes in
+place rather than deleting them, with a note pointing to this entry as
+the current status, per this project's own rule about not quietly erasing
+a documented negative result just because a later test looked better.
+**One clean cycle is not a track record.** Whether this pipeline has real
+skill is still an open question to be answered by `predictions-report`
+accumulating forward-safe resolved predictions over time, exactly as
+`docs/prediction_pipeline.md`'s "What 'skill' would actually look like"
+section already says -- nothing about this fix changes that bar.
+
+**Process note:** this was only caught because "Online" status was
+treated as necessary but not sufficient -- a service can restart-loop
+indefinitely under `ON_FAILURE` and still show green. Checking actual
+service logs (`railway logs --service <name>`), not just deployment
+status, should be the standard way to verify anything deployed in this
+project actually works, not just that it's technically running.

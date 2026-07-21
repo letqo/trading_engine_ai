@@ -191,16 +191,37 @@ Nothing downstream (`run_prediction_for_news_item`, `predict-loop`) knows
 or cares which one is active; both implement the same `analyze()`
 contract.
 
-**The OAuth/CLI backend has a known, unresolved problem as of this
-writing** -- see JOURNAL.md 2026-07-21 for the full investigation. Short
-version: `claude -p` intercepts ordinary, unambiguous prompts with a
-clarifying question instead of following the system prompt, for reasons
-that don't look content-related (reproduced on both a mundane and an
-evocative headline). This backend fails safely (logged, per-cycle,
-non-crashing) but likely produces few or no real predictions until fixed.
-If accuracy tracking in `predictions-report` looks suspiciously empty
-despite `predict-loop` showing as running, check which backend is active
-before assuming the pipeline itself is broken.
+**Update, 2026-07-21 (later the same day): the "unresolved" CLI problem
+below was actually two deployment gaps, not a model behavior problem.**
+`predict-loop` in production had never gotten past initialization: (1)
+`ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF` was never set on the deployed service,
+so it crash-looped on the placeholder guard before ever constructing a
+client, and (2) the production image (`python:3.12-slim`) never had
+Node.js/npm, so the `claude` CLI could never have been present even if it
+had gotten that far. Fixed both (real cutoff from Anthropic's docs:
+claude-opus-4-8's training data cutoff is Jan 2026, used 2026-01-31
+conservatively; Dockerfile now installs Node.js + `@anthropic-ai/claude-code`).
+The first real production cycle after the fix analyzed 10 headlines,
+produced 28 predictions with correct causal reasoning (e.g. mortgage-rate
+news -> RKT/DHI, Julius Baer earnings -> MS/UBS, Mideast de-escalation ->
+JETS/DAL/ITA), and completed cleanly. The clarifying-question behavior
+described below was reproduced during local/manual testing earlier and
+that investigation is left in place for the record, but it is not what
+was actually blocking production -- worth re-checking if it resurfaces,
+but treat the paragraph below as historical, not current status. One
+cycle of clean output is not a track record; judge this the same way as
+any other forward-test evidence, via `predictions-report` over time.
+
+**Original entry, superseded above:** the OAuth/CLI backend had a known,
+unresolved problem as of 2026-07-21 morning -- see JOURNAL.md 2026-07-21
+for the full investigation. Short version: `claude -p` intercepted
+ordinary, unambiguous prompts with a clarifying question instead of
+following the system prompt, for reasons that didn't look
+content-related (reproduced on both a mundane and an evocative headline
+in local testing). If accuracy tracking in `predictions-report` looks
+suspiciously empty despite `predict-loop` showing as running, check which
+backend is active and check the deployed service's logs directly before
+assuming the pipeline itself is broken.
 
 ## What this pipeline is not
 
