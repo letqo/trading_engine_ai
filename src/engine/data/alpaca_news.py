@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import requests
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from engine.config.settings import Settings
 from engine.domain import NewsItem
@@ -39,6 +40,29 @@ ALPACA_NEWS_BASE_URL = "https://data.alpaca.markets"
 _NEWS_PATH = "/v1beta1/news"
 _PAGE_LIMIT = 50  # API max per page
 _MAX_PAGES = 500  # safety cap against a runaway pagination loop
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, requests.exceptions.HTTPError)
+        and exc.response is not None
+        and exc.response.status_code == 429
+    )
+
+
+@retry(
+    stop=stop_after_attempt(6),
+    # A multi-year, multi-symbol backfill can legitimately need real wait
+    # time to clear a rate-limit window -- longer/more attempts than the
+    # broker client's connection-error retry (engine.execution.alpaca).
+    wait=wait_exponential(multiplier=2, min=2, max=60),
+    retry=retry_if_exception(_is_rate_limit_error),
+    reraise=True,
+)
+def _get_page(session: requests.Session, params: dict) -> requests.Response:
+    response = session.get(f"{ALPACA_NEWS_BASE_URL}{_NEWS_PATH}", params=params, timeout=15)
+    response.raise_for_status()
+    return response
 
 
 class AlpacaNewsAuthError(RuntimeError):
@@ -104,10 +128,13 @@ def fetch_alpaca_news(
         if page_token:
             page_params["page_token"] = page_token
 
-        response = session.get(f"{ALPACA_NEWS_BASE_URL}{_NEWS_PATH}", params=page_params, timeout=15)
-        if response.status_code == 401 or response.status_code == 403:
-            raise AlpacaNewsAuthError(f"Alpaca news auth failed: {response.status_code} {response.text}")
-        response.raise_for_status()
+        try:
+            response = _get_page(session, page_params)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (401, 403):
+                raise AlpacaNewsAuthError(f"Alpaca news auth failed: {status} {exc.response.text}") from exc
+            raise
         payload = response.json()
 
         for article in payload.get("news", []):

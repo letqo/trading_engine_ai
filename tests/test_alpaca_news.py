@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from engine.config.settings import Settings
 from engine.data.alpaca_news import AlpacaNewsAuthError, fetch_alpaca_news
@@ -76,6 +77,20 @@ def test_paginates_until_next_page_token_is_empty():
 def test_raises_auth_error_on_401():
     settings = _settings(alpaca_api_key="bad", alpaca_api_secret="bad")
     fake_response = MagicMock(status_code=401, text="unauthorized")
+    fake_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=fake_response)
     with patch("requests.Session.get", return_value=fake_response):
         with pytest.raises(AlpacaNewsAuthError):
             fetch_alpaca_news(START, END, settings)
+
+
+def test_retries_on_429_then_succeeds():
+    settings = _settings(alpaca_api_key="key", alpaca_api_secret="secret")
+    rate_limited = MagicMock(status_code=429)
+    rate_limited.raise_for_status.side_effect = requests.exceptions.HTTPError(response=rate_limited)
+    ok = MagicMock(status_code=200)
+    ok.json.return_value = {"news": [_article()], "next_page_token": None}
+    # One real retry, minimum backoff (2s) -- not worth mocking tenacity's
+    # internals just to shave two seconds off this one test.
+    with patch("requests.Session.get", side_effect=[rate_limited, ok]):
+        items = fetch_alpaca_news(START, END, settings)
+    assert len(items) == 1
