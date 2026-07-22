@@ -327,6 +327,46 @@ def test_predict_loop_pause_skips_cycle_body_but_keeps_looping(monkeypatch, tmp_
         assert get_predict_loop_config(session).last_cycle_at is not None
 
 
+def test_predict_loop_daily_drawdown_still_halts_while_paused(monkeypatch, tmp_path):
+    # The daily-drawdown breach check must not be skipped just because
+    # PredictLoopConfig.enabled=False -- an already-open position still
+    # needs this account-wide protection while the loop is paused
+    # (see JOURNAL.md 2026-07-22).
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+
+    class _DrawdownBroker(_FakeAlpacaClient):
+        def __init__(self, settings):
+            super().__init__(settings)
+            self._calls = 0
+
+        def get_account_equity(self):
+            self._calls += 1
+            return 10_000.0 if self._calls == 1 else 9_000.0  # 10% drop, breaches the 3% default limit
+
+    fake_broker = _DrawdownBroker(get_settings())
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+
+    from engine.journal.db import get_session
+    from engine.journal.registry import load_recent_risk_halts, update_predict_loop_config
+
+    with get_session(get_settings()) as session:
+        update_predict_loop_config(session, enabled=False)
+
+    result = runner.invoke(app, ["predict-loop", "--max-iterations", "5", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert fake_broker.canceled is True
+    assert fake_broker.closed is True
+
+    with get_session(get_settings()) as session:
+        halts = load_recent_risk_halts(session)
+    assert len(halts) == 1
+    assert halts[0].triggered_by == "daily_drawdown"
+
+
 def test_predict_loop_respects_headlines_per_source_quota(monkeypatch, tmp_path):
     from datetime import datetime, timezone
 
@@ -550,6 +590,46 @@ def test_anticipatory_loop_pause_skips_cycle_body_but_keeps_looping(monkeypatch,
 
     with get_session(get_settings()) as session:
         assert get_anticipatory_loop_config(session).last_cycle_at is not None
+
+
+def test_anticipatory_loop_daily_drawdown_still_halts_while_paused(monkeypatch, tmp_path):
+    # Mirrors test_predict_loop_daily_drawdown_still_halts_while_paused --
+    # same fix, same reasoning, applied to the other loop.
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_candidate_markets", lambda limit: [])
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_market_price", lambda market_id: None)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+
+    class _DrawdownBroker(_FakeAlpacaClient):
+        def __init__(self, settings):
+            super().__init__(settings)
+            self._calls = 0
+
+        def get_account_equity(self):
+            self._calls += 1
+            return 10_000.0 if self._calls == 1 else 9_000.0  # 10% drop, breaches the 3% default limit
+
+    fake_broker = _DrawdownBroker(get_settings())
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+
+    from engine.journal.db import get_session
+    from engine.journal.registry import load_recent_risk_halts, update_anticipatory_loop_config
+
+    with get_session(get_settings()) as session:
+        update_anticipatory_loop_config(session, enabled=False)
+
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "5", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert fake_broker.canceled is True
+    assert fake_broker.closed is True
+
+    with get_session(get_settings()) as session:
+        halts = load_recent_risk_halts(session)
+    assert len(halts) == 1
+    assert halts[0].triggered_by == "daily_drawdown"
 
 
 def test_anticipatory_loop_discovers_and_scores_a_relevant_hypothesis(monkeypatch, tmp_path):

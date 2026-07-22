@@ -530,6 +530,21 @@ def mark_prediction_exited(session: Session, prediction: Prediction, *, order_id
     return prediction
 
 
+def load_open_traded_predictions(session: Session) -> list[Prediction]:
+    """Every traded prediction whose linked paper position hasn't been
+    closed yet, regardless of resolution-window status -- what a
+    stop-loss sweep checks every cycle (engine.prediction.trading
+    .close_stopped_prediction_trades), unlike load_expired_open_trades'
+    window-expiry filter below."""
+    rows = session.exec(
+        select(Prediction).where(
+            Prediction.traded_order_id.is_not(None),
+            Prediction.exit_order_id.is_(None),
+        )
+    ).all()
+    return list(rows)
+
+
 def load_expired_open_trades(session: Session, as_of: datetime) -> list[Prediction]:
     """Traded predictions whose resolution window has closed but whose
     linked paper position hasn't been closed yet -- what closes real

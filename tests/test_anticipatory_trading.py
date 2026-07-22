@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from engine.anticipatory.trading import act_on_hypothesis_beliefs, flatten_resolved_hypotheses
+from engine.anticipatory.trading import act_on_hypothesis_beliefs, flatten_resolved_hypotheses, flatten_stopped_hypotheses
 from engine.config.settings import RiskLimits
 from engine.data.universe import Instrument, Universe
 from engine.execution.broker import BrokerOrder
@@ -198,5 +198,52 @@ def test_flatten_resolved_hypotheses_skips_already_flat(db_session):
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
     flattened = flatten_resolved_hypotheses(db_session, broker, risk_gate, account, make_universe(), [hyp])
+    assert flattened == 0
+    assert broker.submitted == []
+
+
+def test_flatten_stopped_hypotheses_closes_when_stop_triggered(db_session):
+    hyp = create_hypothesis(db_session, market_id="m1", question="Q?", symbol="XLE", direction_if_yes=PredictionDirection.UP)
+    mark_hypothesis_traded(db_session, hyp, order_id="o1", quantity=50.0, side="long")
+
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0, stop_loss_pct=0.02))
+    account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
+    account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)
+
+    # 2% stop on a 100.0 long entry triggers at/below 98.0.
+    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(97.0)):
+        flattened = flatten_stopped_hypotheses(db_session, broker, risk_gate, account, make_universe())
+
+    assert flattened == 1
+    assert "XLE" not in account.positions
+
+
+def test_flatten_stopped_hypotheses_leaves_position_open_within_stop(db_session):
+    hyp = create_hypothesis(db_session, market_id="m1", question="Q?", symbol="XLE", direction_if_yes=PredictionDirection.UP)
+    mark_hypothesis_traded(db_session, hyp, order_id="o1", quantity=50.0, side="long")
+
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0, stop_loss_pct=0.02))
+    account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
+    account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)
+
+    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(99.0)):
+        flattened = flatten_stopped_hypotheses(db_session, broker, risk_gate, account, make_universe())
+
+    assert flattened == 0
+    assert broker.submitted == []
+    assert "XLE" in account.positions
+
+
+def test_flatten_stopped_hypotheses_ignores_untraded_hypotheses(db_session):
+    create_hypothesis(db_session, market_id="m1", question="Q?", symbol="XLE", direction_if_yes=PredictionDirection.UP)
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(stop_loss_pct=0.02))
+    account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
+
+    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(1.0)):
+        flattened = flatten_stopped_hypotheses(db_session, broker, risk_gate, account, make_universe())
+
     assert flattened == 0
     assert broker.submitted == []

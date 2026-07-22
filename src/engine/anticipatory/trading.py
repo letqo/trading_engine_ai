@@ -13,7 +13,7 @@ from engine.data.universe import Universe
 from engine.execution.broker import Broker
 from engine.execution.position_bookkeeping import apply_closing_fill, apply_opening_fill
 from engine.journal.models import Hypothesis, HypothesisAction, HypothesisBelief, PredictionDirection
-from engine.journal.registry import mark_hypothesis_flat, mark_hypothesis_traded
+from engine.journal.registry import load_open_hypotheses, mark_hypothesis_flat, mark_hypothesis_traded
 from engine.logging_setup import get_logger
 from engine.risk.gate import RiskGate
 from engine.risk.models import AccountState, OrderRequest, Side
@@ -76,6 +76,39 @@ def flatten_resolved_hypotheses(
     for hyp in resolved:
         if hyp.position_side is None:
             continue
+        if _close_position(session, broker, risk_gate, account, tradable, hyp):
+            flattened += 1
+    return flattened
+
+
+def flatten_stopped_hypotheses(
+    session, broker: Broker, risk_gate: RiskGate, account: AccountState, universe: Universe,
+) -> int:
+    """Close the real position on every open, currently-positioned
+    Hypothesis whose current price has crossed RiskGate's stop-loss
+    threshold -- independent of gap-based EXITED beliefs and Polymarket
+    resolution. Hypotheses traded by this pipeline otherwise have no
+    per-position stop protection at all (mirrors
+    engine.prediction.trading.close_stopped_prediction_trades). Meant to
+    be called every cycle regardless of anticipatory-loop's pause state,
+    same as the daily-drawdown check -- see
+    engine.cli.main.anticipatory_loop's docstring."""
+    tradable = universe.tradable_symbols()
+    flattened = 0
+    for hyp in load_open_hypotheses(session):
+        if hyp.position_side is None:
+            continue
+        existing = account.positions.get(hyp.symbol)
+        if existing is None or existing.quantity == 0:
+            continue  # already flat -- something else (e.g. a kill-switch flatten) closed it first
+
+        price = _latest_price(hyp.symbol)
+        if price is None or not risk_gate.is_stop_triggered(existing, current_price=price):
+            continue
+
+        logger.warning(
+            "hypothesis stop-loss triggered", extra={"extra_fields": {"symbol": hyp.symbol, "price": price}},
+        )
         if _close_position(session, broker, risk_gate, account, tradable, hyp):
             flattened += 1
     return flattened

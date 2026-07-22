@@ -1073,4 +1073,70 @@ so existing Postgres rows backfill cleanly) and creates `risk_gate_config`
 Verified by running `alembic upgrade head` against the local dev SQLite DB
 (several revisions behind) and confirming both the new column and table
 exist with the right shape before deploying.
+
+## 2026-07-22 (later still) -- Fix: pause was silently disabling the daily-drawdown halt, and neither research loop ever had a per-position stop-loss
+
+User asked why pausing predict-loop/anticipatory-loop from the dashboard
+felt like it paused "the whole system," given they had a real open
+position at the time. Checking the actual loop code in `cli/main.py`
+turned up two real problems, not just a documentation gap:
+
+**Problem 1: pausing silently disabled the daily-drawdown halt.**
+`risk_gate.check_daily_drawdown(account)` lived *inside* the block that
+`if not config.enabled: continue` skips entirely. The kill switch is
+checked earlier in the loop, unconditionally, so it still worked while
+paused -- but the account-wide daily-drawdown protection did not, despite
+the `predict_loop`/`anticipatory_loop` docstrings claiming pausing was
+"gentler" and implying only decision-making was skipped. In practice: a
+paused loop holding an open position that had a genuinely bad day would
+not auto-halt-and-flatten until someone remembered to re-enable it.
+
+**Problem 2 (found while investigating problem 1): neither loop ever had
+per-position stop-loss protection, paused or not.** `RiskGate
+.is_stop_triggered` -- the mechanism that already protects
+`papertrade --strategy`'s positions every bar via
+`engine.execution.live_loop._check_and_submit_stop` -- was never called
+anywhere in `engine.prediction.trading` or `engine.anticipatory.trading`.
+Positions opened by predict-loop/anticipatory-loop only ever closed via
+time-window expiry, Polymarket resolution, or an account-wide kill-switch/
+drawdown flatten -- never an adverse price move on that one position
+alone.
+
+**Fix, both loops:** restructured `predict_loop`/`anticipatory_loop` in
+`cli/main.py` so the account-wide risk block (RiskGateConfig refresh,
+account refresh, daily-drawdown check, and now a per-position stop-loss
+sweep) runs every cycle whenever `can_trade`, unconditionally -- the
+`config.enabled` pause gate now only wraps the paid-LLM decision-making
+part (headline fetch/predict/act/close/resolve for predict-loop;
+discover/revise/act for anticipatory-loop), never the risk checks.
+
+**New stop-loss sweeps**, mirroring each pipeline's existing shape:
+`engine.prediction.trading.close_stopped_prediction_trades` (new
+`load_open_traded_predictions` registry query -- every traded, not-yet-
+exited prediction regardless of window-expiry, unlike the existing
+`load_expired_open_trades`) and `engine.anticipatory.trading
+.flatten_stopped_hypotheses` (filters `load_open_hypotheses` to
+`position_side is not None`). Both reuse each module's own `_close_position`
+helper -- extracted from `close_expired_prediction_trades`'s previously-
+inlined closing logic in the prediction module (anticipatory's `_close_position`
+already existed, shared with `flatten_resolved_hypotheses`). Both check
+`risk_gate.is_stop_triggered` against the same daily-bar closing price
+`_latest_price` already fetches elsewhere in each module -- no new price
+source, no change to `Position`/broker client code.
+
+Updated both CLI docstrings and the `/predict-loop-config`/
+`/anticipatory-loop-config` dashboard subtitles to state the corrected
+pause semantics precisely instead of the previous (inaccurate) "skips the
+cycle body" framing.
+
+New tests: `close_stopped_prediction_trades`/`flatten_stopped_hypotheses`
+unit tests (triggers/doesn't-trigger/never-traded/no-open-position cases)
+in their respective trading test files, `load_open_traded_predictions` in
+`test_prediction_registry.py`, and -- the most direct proof of the actual
+fix -- two new CLI-level integration tests
+(`test_predict_loop_daily_drawdown_still_halts_while_paused`,
+`test_anticipatory_loop_daily_drawdown_still_halts_while_paused`) that set
+`enabled=False`, simulate a 10% equity drop via a broker fake, and assert
+the loop still halts, flattens, and records the halt -- proving the old
+bug would have failed these tests before the restructure.
 project actually works, not just that it's technically running.

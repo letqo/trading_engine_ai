@@ -9,7 +9,7 @@ from engine.data.universe import Instrument, Universe
 from engine.execution.broker import BrokerOrder
 from engine.journal.models import PredictionDirection
 from engine.journal.registry import record_prediction
-from engine.prediction.trading import act_on_pending_predictions, close_expired_prediction_trades
+from engine.prediction.trading import act_on_pending_predictions, close_expired_prediction_trades, close_stopped_prediction_trades
 from engine.risk.gate import RiskGate
 from engine.risk.models import AccountState, Position, Side
 
@@ -190,6 +190,82 @@ def test_close_expired_prediction_trades_skips_when_no_open_position(db_session)
     assert len(closed) == 1
     assert closed[0].exit_order_id == "none:no_open_position"
     assert broker.submitted == []
+
+
+def test_close_stopped_prediction_trades_closes_long_when_stop_triggered(db_session):
+    pred = make_prediction(db_session, direction=PredictionDirection.UP, decision_ts=NOW - timedelta(hours=1))
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0, stop_loss_pct=0.02))
+    account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
+    account.positions["EWJ"] = Position(symbol="EWJ", quantity=50.0, avg_entry_price=100.0)
+    pred.traded_order_id = "order-1"
+    pred.traded_quantity = 50.0
+    db_session.add(pred)
+    db_session.commit()
+
+    # 2% stop on a 100.0 long entry triggers at/below 98.0.
+    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(97.0)):
+        stopped = close_stopped_prediction_trades(db_session, broker, risk_gate, account, make_universe())
+
+    assert len(stopped) == 1
+    assert stopped[0].exit_order_id == "order-1"
+    assert broker.submitted[0].side == Side.SELL
+    assert "EWJ" not in account.positions
+    assert account.consecutive_losses_today == 1
+
+
+def test_close_stopped_prediction_trades_leaves_position_open_within_stop(db_session):
+    pred = make_prediction(db_session, direction=PredictionDirection.UP, decision_ts=NOW - timedelta(hours=1))
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0, stop_loss_pct=0.02))
+    account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
+    account.positions["EWJ"] = Position(symbol="EWJ", quantity=50.0, avg_entry_price=100.0)
+    pred.traded_order_id = "order-1"
+    pred.traded_quantity = 50.0
+    db_session.add(pred)
+    db_session.commit()
+
+    # 99.0 is above the 98.0 stop -- must not close, even though this
+    # cycle runs regardless of predict-loop's pause state.
+    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(99.0)):
+        stopped = close_stopped_prediction_trades(db_session, broker, risk_gate, account, make_universe())
+
+    assert stopped == []
+    assert broker.submitted == []
+    assert "EWJ" in account.positions
+
+
+def test_close_stopped_prediction_trades_ignores_predictions_never_traded(db_session):
+    make_prediction(db_session, direction=PredictionDirection.UP, decision_ts=NOW - timedelta(hours=1))
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(stop_loss_pct=0.02))
+    account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
+
+    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(1.0)):
+        stopped = close_stopped_prediction_trades(db_session, broker, risk_gate, account, make_universe())
+
+    assert stopped == []
+    assert broker.submitted == []
+
+
+def test_close_stopped_prediction_trades_skips_when_no_open_position(db_session):
+    pred = make_prediction(db_session, direction=PredictionDirection.UP, decision_ts=NOW - timedelta(hours=1))
+    pred.traded_order_id = "order-1"
+    pred.traded_quantity = 50.0
+    db_session.add(pred)
+    db_session.commit()
+
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(stop_loss_pct=0.02))
+    account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)  # no open EWJ position
+
+    stopped = close_stopped_prediction_trades(db_session, broker, risk_gate, account, make_universe())
+
+    # No open position to stop out of -- must NOT be marked exited (that
+    # would be a false audit trail; a real exit never happened here).
+    assert stopped == []
+    assert broker.submitted == []
+    assert pred.exit_order_id is None
 
 
 def test_close_expired_prediction_trades_ignores_trades_still_within_window(db_session):

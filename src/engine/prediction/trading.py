@@ -26,6 +26,7 @@ from engine.journal.models import Prediction, PredictionDirection
 from engine.journal.registry import (
     load_actionable_predictions,
     load_expired_open_trades,
+    load_open_traded_predictions,
     mark_prediction_exited,
     mark_prediction_traded,
 )
@@ -106,39 +107,79 @@ def close_expired_prediction_trades(
     tradable = universe.tradable_symbols()
     closed: list[Prediction] = []
     for prediction in load_expired_open_trades(session, as_of):
+        if _close_position(session, broker, risk_gate, account, tradable, prediction, timestamp=as_of):
+            closed.append(prediction)
+    return closed
+
+
+def close_stopped_prediction_trades(
+    session, broker: Broker, risk_gate: RiskGate, account: AccountState, universe: Universe,
+) -> list[Prediction]:
+    """Close the real position linked to every traded, still-open
+    prediction whose current price has crossed RiskGate's stop-loss
+    threshold -- independent of close_expired_prediction_trades' window-
+    expiry trigger. Predictions traded by this pipeline otherwise have no
+    per-position stop protection at all: the only other things that ever
+    close a position early are the daily-drawdown halt and the kill
+    switch, both account-wide. Meant to be called every cycle regardless
+    of predict-loop's pause state, same as the daily-drawdown check --
+    see engine.cli.main.predict_loop's docstring."""
+    tradable = universe.tradable_symbols()
+    stopped: list[Prediction] = []
+    for prediction in load_open_traded_predictions(session):
         existing = account.positions.get(prediction.symbol)
         if existing is None or existing.quantity == 0:
-            logger.warning(
-                "no open broker position found for a traded prediction -- marking exited without an order "
-                "(likely already closed by something else, e.g. a kill-switch flatten)",
-                extra={"extra_fields": {"symbol": prediction.symbol, "prediction_id": prediction.id}},
-            )
-            closed.append(mark_prediction_exited(session, prediction, order_id="none:no_open_position"))
+            continue  # already flat -- something else (e.g. a kill-switch flatten) closed it first
+
+        price = _latest_price(prediction.symbol)
+        if price is None or not risk_gate.is_stop_triggered(existing, current_price=price):
             continue
 
-        exit_side = Side.SELL if existing.quantity > 0 else Side.BUY
-        qty = prediction.traded_quantity or abs(existing.quantity)
-        price = _latest_price(prediction.symbol) or existing.avg_entry_price
-
-        order = OrderRequest(
-            symbol=prediction.symbol, side=exit_side, quantity=qty, price=price,
-            timestamp=as_of, strategy_id="consequence_prediction",
+        logger.warning(
+            "prediction stop-loss triggered", extra={"extra_fields": {"symbol": prediction.symbol, "price": price}},
         )
-        decision = risk_gate.evaluate(order, account, tradable)
-        if not decision.approved:
-            logger.warning(
-                "prediction exit rejected by RiskGate -- position stays open, will retry next run",
-                extra={"extra_fields": {"symbol": prediction.symbol, "reason": decision.reason.value}},
-            )
-            continue
+        if _close_position(session, broker, risk_gate, account, tradable, prediction):
+            stopped.append(prediction)
+    return stopped
 
-        broker_order = broker.submit_order(
-            OrderRequest(
-                symbol=prediction.symbol, side=exit_side, quantity=decision.approved_quantity, price=price,
-                timestamp=as_of, strategy_id="consequence_prediction",
-            )
+
+def _close_position(
+    session, broker: Broker, risk_gate: RiskGate, account: AccountState, tradable: set[str],
+    prediction: Prediction, *, timestamp: datetime | None = None,
+) -> bool:
+    timestamp = timestamp or datetime.now(timezone.utc)
+    existing = account.positions.get(prediction.symbol)
+    if existing is None or existing.quantity == 0:
+        logger.warning(
+            "no open broker position found for a traded prediction -- marking exited without an order "
+            "(likely already closed by something else, e.g. a kill-switch flatten)",
+            extra={"extra_fields": {"symbol": prediction.symbol, "prediction_id": prediction.id}},
         )
-        apply_closing_fill(account, risk_gate, prediction.symbol, existing, decision.approved_quantity, price)
-        mark_prediction_exited(session, prediction, order_id=broker_order.broker_order_id)
-        closed.append(prediction)
-    return closed
+        mark_prediction_exited(session, prediction, order_id="none:no_open_position")
+        return True
+
+    exit_side = Side.SELL if existing.quantity > 0 else Side.BUY
+    qty = prediction.traded_quantity or abs(existing.quantity)
+    price = _latest_price(prediction.symbol) or existing.avg_entry_price
+
+    order = OrderRequest(
+        symbol=prediction.symbol, side=exit_side, quantity=qty, price=price,
+        timestamp=timestamp, strategy_id="consequence_prediction",
+    )
+    decision = risk_gate.evaluate(order, account, tradable)
+    if not decision.approved:
+        logger.warning(
+            "prediction exit rejected by RiskGate -- position stays open, will retry next run",
+            extra={"extra_fields": {"symbol": prediction.symbol, "reason": decision.reason.value}},
+        )
+        return False
+
+    broker_order = broker.submit_order(
+        OrderRequest(
+            symbol=prediction.symbol, side=exit_side, quantity=decision.approved_quantity, price=price,
+            timestamp=order.timestamp, strategy_id="consequence_prediction",
+        )
+    )
+    apply_closing_fill(account, risk_gate, prediction.symbol, existing, decision.approved_quantity, price)
+    mark_prediction_exited(session, prediction, order_id=broker_order.broker_order_id)
+    return True

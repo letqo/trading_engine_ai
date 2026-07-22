@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import typer
 
 from engine.anticipatory.pipeline import discover_hypotheses, revise_open_hypotheses
-from engine.anticipatory.trading import act_on_hypothesis_beliefs, flatten_resolved_hypotheses
+from engine.anticipatory.trading import act_on_hypothesis_beliefs, flatten_resolved_hypotheses, flatten_stopped_hypotheses
 from engine.backtest.engine import BacktestEngine
 from engine.backtest.perturbation import run_perturbation_analysis
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
@@ -55,7 +55,7 @@ from engine.observability import alert_kill_switch, alert_risk_halt, alert_servi
 from engine.prediction.client import PredictionConfigError
 from engine.prediction.factory import build_prediction_client
 from engine.prediction.pipeline import resolve_pending_predictions, run_prediction_for_news_item
-from engine.prediction.trading import act_on_pending_predictions, close_expired_prediction_trades
+from engine.prediction.trading import act_on_pending_predictions, close_expired_prediction_trades, close_stopped_prediction_trades
 from engine.risk.gate import RiskGate
 from engine.risk.kill_switch import disengage_kill_switch, engage_kill_switch, is_kill_switch_engaged
 from engine.risk.resolve import resolve_risk_limits
@@ -769,9 +769,14 @@ def predict_loop(
     guardian process. A daily-drawdown breach or the kill switch still
     stops it and flattens everything, same as papertrade. Pausing from the
     dashboard (PredictLoopConfig.enabled=False) is deliberately much
-    gentler than either of those -- it only skips the cycle body; positions
-    are left alone and the loop keeps polling so it resumes the instant
-    it's re-enabled, no redeploy either way.
+    gentler than either of those -- it only skips fetching headlines and
+    making new prediction/act/close/resolve decisions; it never skips the
+    daily-drawdown check or the per-position stop-loss sweep
+    (close_stopped_prediction_trades), both of which keep running every
+    cycle regardless of pause state, since an already-open position needs
+    the same protection whether or not the loop is currently deciding
+    anything new. The loop keeps polling while paused so it resumes the
+    instant it's re-enabled, no redeploy either way.
     """
     settings = get_settings()
     try:
@@ -829,52 +834,15 @@ def predict_loop(
         with get_session(settings) as session:
             config = mark_predict_loop_cycle(session)
 
-        if not config.enabled:
-            logger.info("predict-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds}})
-            iteration += 1
-            if max_iterations is not None and iteration >= max_iterations:
-                break
-            time.sleep(config.poll_seconds)
-            continue
-
-        acted = closed = 0
+        acted = closed = stopped = 0
         try:
-            active_source = active_rss_source(config.rotation_anchor, datetime.now(timezone.utc), config.rotation_hours)
-            raw_items = fetch_rss_feed(active_source, RSS_FEEDS[active_source])
-            predicted = 0
-            skipped_duplicate = 0
-            skipped_near_duplicate = 0
-            fresh_items = []
-            with get_session(settings) as session:
-                # Filter duplicates across the whole feed before capping to
-                # headlines_per_source -- otherwise a quiet-news hour where
-                # the top results happen to repeat would waste the cycle's
-                # entire budget on nothing, even if genuinely new headlines
-                # exist further down the same feed. See
-                # headline_already_predicted / headline_near_duplicate.
-                for raw in raw_items:
-                    if headline_already_predicted(session, raw.headline):
-                        skipped_duplicate += 1
-                        continue
-                    if headline_near_duplicate(
-                        session, raw.headline,
-                        window_hours=config.near_dup_window_hours, threshold=config.near_dup_threshold,
-                    ):
-                        skipped_near_duplicate += 1
-                        continue
-                    fresh_items.append(raw)
-                    if len(fresh_items) >= config.headlines_per_source:
-                        break
-
-                for raw in fresh_items:
-                    tagged = tag_and_route(raw, universe)
-                    predicted += len(run_prediction_for_news_item(
-                        session, client, tagged, universe,
-                        resolution_window_hours=settings.prediction_resolution_hours,
-                        retrieval_limit=settings.prediction_retrieval_limit,
-                    ))
-
             if can_trade:
+                # Account-wide risk protection (limits refresh, daily-
+                # drawdown halt, per-position stop-loss) runs every cycle
+                # regardless of config.enabled -- pausing only skips the
+                # news/prediction/act decision-making below, never the
+                # things that protect an already-open position. Positions
+                # opened by this pipeline have no other stop-loss check.
                 with get_session(settings) as session:
                     risk_gate.limits = resolve_risk_limits(settings, get_risk_gate_config(session))
 
@@ -899,25 +867,67 @@ def predict_loop(
                     break
 
                 with get_session(settings) as session:
-                    acted = len(act_on_pending_predictions(
-                        session, broker, risk_gate, account, universe,
-                        settings.prediction_action_confidence_threshold,
-                    ))
+                    stopped = len(close_stopped_prediction_trades(session, broker, risk_gate, account, universe))
+
+            if not config.enabled:
+                logger.info("predict-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds, "stopped": stopped}})
+            else:
+                active_source = active_rss_source(config.rotation_anchor, datetime.now(timezone.utc), config.rotation_hours)
+                raw_items = fetch_rss_feed(active_source, RSS_FEEDS[active_source])
+                predicted = 0
+                skipped_duplicate = 0
+                skipped_near_duplicate = 0
+                fresh_items = []
                 with get_session(settings) as session:
-                    closed = len(close_expired_prediction_trades(session, broker, risk_gate, account, universe))
+                    # Filter duplicates across the whole feed before capping to
+                    # headlines_per_source -- otherwise a quiet-news hour where
+                    # the top results happen to repeat would waste the cycle's
+                    # entire budget on nothing, even if genuinely new headlines
+                    # exist further down the same feed. See
+                    # headline_already_predicted / headline_near_duplicate.
+                    for raw in raw_items:
+                        if headline_already_predicted(session, raw.headline):
+                            skipped_duplicate += 1
+                            continue
+                        if headline_near_duplicate(
+                            session, raw.headline,
+                            window_hours=config.near_dup_window_hours, threshold=config.near_dup_threshold,
+                        ):
+                            skipped_near_duplicate += 1
+                            continue
+                        fresh_items.append(raw)
+                        if len(fresh_items) >= config.headlines_per_source:
+                            break
 
-            with get_session(settings) as session:
-                resolved = len(resolve_pending_predictions(session))
+                    for raw in fresh_items:
+                        tagged = tag_and_route(raw, universe)
+                        predicted += len(run_prediction_for_news_item(
+                            session, client, tagged, universe,
+                            resolution_window_hours=settings.prediction_resolution_hours,
+                            retrieval_limit=settings.prediction_retrieval_limit,
+                        ))
 
-            logger.info(
-                "predict-loop cycle complete",
-                extra={"extra_fields": {
-                    "active_source": active_source,
-                    "headlines_fetched": len(raw_items), "headlines_new": len(fresh_items),
-                    "skipped_duplicate": skipped_duplicate, "skipped_near_duplicate": skipped_near_duplicate,
-                    "predicted": predicted, "acted": acted, "closed": closed, "resolved": resolved,
-                }},
-            )
+                if can_trade:
+                    with get_session(settings) as session:
+                        acted = len(act_on_pending_predictions(
+                            session, broker, risk_gate, account, universe,
+                            settings.prediction_action_confidence_threshold,
+                        ))
+                    with get_session(settings) as session:
+                        closed = len(close_expired_prediction_trades(session, broker, risk_gate, account, universe))
+
+                with get_session(settings) as session:
+                    resolved = len(resolve_pending_predictions(session))
+
+                logger.info(
+                    "predict-loop cycle complete",
+                    extra={"extra_fields": {
+                        "active_source": active_source,
+                        "headlines_fetched": len(raw_items), "headlines_new": len(fresh_items),
+                        "skipped_duplicate": skipped_duplicate, "skipped_near_duplicate": skipped_near_duplicate,
+                        "predicted": predicted, "acted": acted, "closed": closed, "stopped": stopped, "resolved": resolved,
+                    }},
+                )
         except Exception:
             logger.exception("unhandled exception in predict-loop cycle -- continuing to next cycle")
 
@@ -955,7 +965,11 @@ def anticipatory_loop(
     Same crash-safety split as predict-loop: an unhandled exception inside
     one cycle is logged and the loop continues to the next cycle; the
     kill switch or a daily-drawdown breach stops it and flattens
-    everything, including any open anticipatory positions.
+    everything, including any open anticipatory positions. Pausing
+    (AnticipatoryLoopConfig.enabled=False) only skips discovery/revision/
+    acting (the paid LLM calls) -- the daily-drawdown check and the
+    per-position stop-loss sweep (flatten_stopped_hypotheses) keep running
+    every cycle regardless, same reasoning as predict-loop's docstring.
     """
     settings = get_settings()
     try:
@@ -1009,31 +1023,17 @@ def anticipatory_loop(
         with get_session(settings) as session:
             config = mark_anticipatory_loop_cycle(session)
 
-        if not config.enabled:
-            logger.info("anticipatory-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds}})
-            iteration += 1
-            if max_iterations is not None and iteration >= max_iterations:
-                break
-            time.sleep(config.poll_seconds)
-            continue
-
-        discovered = acted_open = acted_closed = flattened = 0
+        discovered = acted_open = acted_closed = flattened = stopped = 0
         beliefs, resolved = [], []
         try:
-            with get_session(settings) as session:
-                discovered = len(discover_hypotheses(
-                    session, client,
-                    discovery_limit=config.discovery_limit,
-                    max_open_hypotheses=config.max_open_hypotheses,
-                    min_gap_threshold=config.min_gap_threshold,
-                    max_open_hypotheses_per_symbol=config.max_open_hypotheses_per_symbol,
-                ))
-
-            with get_session(settings) as session:
-                open_before = {h.id: h for h in load_open_hypotheses(session)}
-                beliefs, resolved = revise_open_hypotheses(session, client, min_gap_threshold=config.min_gap_threshold)
-
             if can_trade:
+                # Account-wide risk protection (limits refresh, daily-
+                # drawdown halt, per-position stop-loss) runs every cycle
+                # regardless of config.enabled -- pausing only skips
+                # discovery/revision/acting below (the paid LLM calls),
+                # never the things that protect an already-open position.
+                # Hypotheses traded by this pipeline have no other
+                # stop-loss check.
                 with get_session(settings) as session:
                     risk_gate.limits = resolve_risk_limits(settings, get_risk_gate_config(session))
 
@@ -1058,19 +1058,39 @@ def anticipatory_loop(
                     break
 
                 with get_session(settings) as session:
-                    acted_open, acted_closed = act_on_hypothesis_beliefs(
-                        session, broker, risk_gate, account, universe, open_before, beliefs, config.min_gap_threshold,
-                    )
-                with get_session(settings) as session:
-                    flattened = flatten_resolved_hypotheses(session, broker, risk_gate, account, universe, resolved)
+                    stopped = flatten_stopped_hypotheses(session, broker, risk_gate, account, universe)
 
-            logger.info(
-                "anticipatory-loop cycle complete",
-                extra={"extra_fields": {
-                    "discovered": discovered, "revised": len(beliefs), "resolved": len(resolved),
-                    "opened": acted_open, "closed": acted_closed, "flattened": flattened,
-                }},
-            )
+            if not config.enabled:
+                logger.info("anticipatory-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds, "stopped": stopped}})
+            else:
+                with get_session(settings) as session:
+                    discovered = len(discover_hypotheses(
+                        session, client,
+                        discovery_limit=config.discovery_limit,
+                        max_open_hypotheses=config.max_open_hypotheses,
+                        min_gap_threshold=config.min_gap_threshold,
+                        max_open_hypotheses_per_symbol=config.max_open_hypotheses_per_symbol,
+                    ))
+
+                with get_session(settings) as session:
+                    open_before = {h.id: h for h in load_open_hypotheses(session)}
+                    beliefs, resolved = revise_open_hypotheses(session, client, min_gap_threshold=config.min_gap_threshold)
+
+                if can_trade:
+                    with get_session(settings) as session:
+                        acted_open, acted_closed = act_on_hypothesis_beliefs(
+                            session, broker, risk_gate, account, universe, open_before, beliefs, config.min_gap_threshold,
+                        )
+                    with get_session(settings) as session:
+                        flattened = flatten_resolved_hypotheses(session, broker, risk_gate, account, universe, resolved)
+
+                logger.info(
+                    "anticipatory-loop cycle complete",
+                    extra={"extra_fields": {
+                        "discovered": discovered, "revised": len(beliefs), "resolved": len(resolved),
+                        "opened": acted_open, "closed": acted_closed, "flattened": flattened, "stopped": stopped,
+                    }},
+                )
         except Exception:
             logger.exception("unhandled exception in anticipatory-loop cycle -- continuing to next cycle")
 

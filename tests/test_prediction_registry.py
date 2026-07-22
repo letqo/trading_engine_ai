@@ -10,6 +10,7 @@ from engine.journal.registry import (
     load_actionable_predictions,
     load_expired_open_trades,
     load_off_universe_symbol_stats,
+    load_open_traded_predictions,
     load_pending_predictions_past_window,
     load_prediction_trades,
     load_resolved_predictions_by_topics,
@@ -218,6 +219,25 @@ def test_load_expired_open_trades_filters_window_and_exit_state(db_session):
     results = load_expired_open_trades(db_session, as_of=NOW)
     ids = {p.id for p in results}
     assert ids == {expired_open.id}
+
+
+def test_load_open_traded_predictions_ignores_window_expiry(db_session):
+    # Unlike load_expired_open_trades, this must include a traded position
+    # that's still well within its resolution window -- a stop-loss sweep
+    # needs to check every open position every cycle, not just ones whose
+    # window has closed.
+    still_within_window = _make(db_session, decision_ts=NOW - timedelta(hours=1), resolution_hours=24.0)
+    mark_prediction_traded(db_session, still_within_window, order_id="order-1", quantity=10.0)
+
+    _make(db_session, decision_ts=NOW - timedelta(hours=1), resolution_hours=24.0)  # never traded -- not in scope
+
+    already_exited = _make(db_session, decision_ts=NOW - timedelta(hours=1), resolution_hours=24.0)
+    mark_prediction_traded(db_session, already_exited, order_id="order-2", quantity=10.0)
+    mark_prediction_exited(db_session, already_exited, order_id="order-3")
+
+    results = load_open_traded_predictions(db_session)
+    ids = {p.id for p in results}
+    assert ids == {still_within_window.id}
 
 
 def test_mark_prediction_exited_sets_field(db_session):

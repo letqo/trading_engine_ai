@@ -2,7 +2,7 @@
 {% block title %}Predict-loop config{% endblock %}
 {% block content %}
 <h1>Predict-loop config</h1>
-<div class="subtitle">Live-tunable -- takes effect next cycle, no redeploy needed. Pausing skips the cycle body only: it does not flatten positions or touch the kill switch.</div>
+<div class="subtitle">Live-tunable -- takes effect next cycle, no redeploy needed. Pausing only skips fetching headlines and making new predict/act/close/resolve decisions -- it does not touch the kill switch, and the daily-drawdown halt and per-position stop-loss protection keep running every cycle regardless of pause state.</div>
 {% if saved %}<div class="note">Saved.</div>{% endif %}
 <form method="post" action="/predict-loop-config">
   <label>
