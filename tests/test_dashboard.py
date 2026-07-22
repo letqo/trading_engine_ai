@@ -1,12 +1,15 @@
 import base64
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine
 
 import engine.journal.models  # noqa: F401  registers tables on SQLModel.metadata
 from engine.config.settings import Settings, get_settings
 from engine.dashboard.app import app
+from engine.journal.models import PredictionStatus
+from engine.journal.registry import record_prediction
 
 
 def _auth_header(username: str, password: str) -> dict:
@@ -102,6 +105,56 @@ def test_health_check_requires_no_auth(client):
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+def test_prediction_stats_match_hand_computed_values_and_rationale_renders(tmp_path):
+    # Proves the SQL-aggregate rewrite of _prediction_stats produces the
+    # same numbers the old full-table Python scan would have -- not just
+    # that it doesn't crash -- and that rationale (previously never
+    # rendered) shows up on /predictions.
+    db_path = tmp_path / "dashboard_stats_test.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    now = datetime.now(timezone.utc)
+
+    def seed(session, *, outcome_correct, mfe, mae, forward_safe=True, status=PredictionStatus.RESOLVED):
+        pred = record_prediction(
+            session,
+            news_headline="h", news_source="rss", news_published_at=now, news_decision_timestamp=now,
+            topics=[], symbol="EWJ", direction="up", confidence=0.5,
+            rationale="rate hike strengthens yen, hurts exporters",
+            model_name="test", model_knowledge_cutoff=now, forward_safe=forward_safe,
+            resolution_window_hours=24.0, in_tracked_universe=True,
+        )
+        pred.status = status
+        pred.outcome_correct = outcome_correct
+        pred.mfe_pct = mfe
+        pred.mae_pct = mae
+        session.add(pred)
+        session.commit()
+
+    with Session(engine_) as session:
+        seed(session, outcome_correct=True, mfe=5.0, mae=1.0)
+        seed(session, outcome_correct=False, mfe=2.0, mae=6.0)
+        seed(session, outcome_correct=True, mfe=3.0, mae=3.0)
+        seed(session, outcome_correct=True, mfe=1.0, mae=1.0, forward_safe=False)  # excluded
+
+    test_settings = Settings(database_url=db_url, dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        client = TestClient(app)
+        resp = client.get("/", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "66.7%" in resp.text  # accuracy: 2 of 3 forward_safe+resolved correct
+
+        resp2 = client.get("/predictions", headers=_auth_header("admin", "testpass"))
+        assert resp2.status_code == 200
+        assert "66.7%" in resp2.text
+        assert "rate hike strengthens yen, hurts exporters" in resp2.text
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_refuses_to_serve_when_password_unset(tmp_path):

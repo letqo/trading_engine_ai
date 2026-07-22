@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
-from engine.journal.models import PredictionDirection, PredictionStatus
+from sqlmodel import select
+
+from engine.journal.models import PredictionDirection, PredictionStatus, PredictionTopic
 from engine.journal.registry import (
     get_predict_loop_config,
     headline_near_duplicate,
@@ -74,6 +76,24 @@ def test_load_resolved_predictions_respects_limit(db_session):
         _make(db_session, topics=("boj",), status=PredictionStatus.RESOLVED)
     results = load_resolved_predictions_by_topics(db_session, {"boj"}, limit=2)
     assert len(results) == 2
+
+
+def test_record_prediction_writes_a_prediction_topic_row_per_topic(db_session):
+    # load_resolved_predictions_by_topics queries this table instead of
+    # loading every resolved Prediction into Python -- record_prediction
+    # must keep it populated, one row per topic, for that to work.
+    pred = _make(db_session, topics=("boj", "rates"))
+    rows = db_session.exec(select(PredictionTopic).where(PredictionTopic.prediction_id == pred.id)).all()
+    assert {r.topic for r in rows} == {"boj", "rates"}
+
+
+def test_load_resolved_predictions_by_topics_matches_only_once_with_multiple_shared_topics(db_session):
+    # A prediction matching more than one requested topic must still only
+    # appear once -- the query uses Prediction.id.in_(subquery) rather than
+    # a JOIN specifically to avoid per-topic row duplication.
+    pred = _make(db_session, topics=("boj", "rates"), status=PredictionStatus.RESOLVED)
+    results = load_resolved_predictions_by_topics(db_session, {"boj", "rates"})
+    assert [r.id for r in results] == [pred.id]
 
 
 def test_load_pending_predictions_past_window(db_session):

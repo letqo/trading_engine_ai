@@ -21,6 +21,7 @@ from engine.journal.models import (
     Prediction,
     PredictionDirection,
     PredictionStatus,
+    PredictionTopic,
     ReconciliationReport,
     RiskHaltEvent,
     RunMode,
@@ -360,7 +361,12 @@ def record_prediction(
 ) -> Prediction:
     """Write one prediction row. Called before the outcome is known --
     nothing here ever gets edited except by resolve_prediction(), once, when
-    the resolution window closes. See engine.journal.models.Prediction."""
+    the resolution window closes. See engine.journal.models.Prediction.
+
+    Also writes one PredictionTopic row per topic -- a derived index over
+    Prediction.topics (which stays the source of truth) so
+    load_resolved_predictions_by_topics can query by topic without loading
+    every resolved prediction into Python. See PredictionTopic's docstring."""
     prediction = Prediction(
         news_headline=news_headline,
         news_source=news_source,
@@ -381,6 +387,9 @@ def record_prediction(
     session.add(prediction)
     session.commit()
     session.refresh(prediction)
+    for topic in topics:
+        session.add(PredictionTopic(prediction_id=prediction.id, topic=topic))
+    session.commit()
     return prediction
 
 
@@ -390,20 +399,25 @@ def load_resolved_predictions_by_topics(
     """Retrieval for the prediction pipeline's few-shot context: past
     resolved cases sharing at least one topic tag, most recent first.
 
-    Filters in Python rather than with a JSON-containment SQL query so the
-    same code works identically against SQLite (local dev) and Postgres
-    (prod) -- deliberate simplicity over query-side optimization while this
-    table stays small. Revisit if/when it doesn't.
+    Queries via the PredictionTopic index (populated by record_prediction)
+    rather than loading every resolved Prediction into Python to filter
+    Prediction.topics (a JSON blob) in memory -- this call runs on every
+    single headline predict-loop analyzes, so an unbounded full-table scan
+    here gets slower every day the prediction log grows. Matching by
+    Prediction.id.in_(subquery) rather than a JOIN avoids duplicate rows
+    when a prediction matches more than one requested topic, so ORDER BY +
+    LIMIT stay correct entirely at the DB level, on both SQLite (dev) and
+    Postgres (prod) -- no query-syntax divergence between the two.
     """
     if not topics:
         return []
-    rows = session.exec(
+    matching_ids = select(PredictionTopic.prediction_id).where(PredictionTopic.topic.in_(topics)).distinct()
+    return session.exec(
         select(Prediction)
-        .where(Prediction.status == PredictionStatus.RESOLVED)
+        .where(Prediction.status == PredictionStatus.RESOLVED, Prediction.id.in_(matching_ids))
         .order_by(Prediction.resolved_at.desc())
+        .limit(limit)
     ).all()
-    matched = [row for row in rows if set(row.topics) & topics]
-    return matched[:limit]
 
 
 def load_pending_predictions_past_window(session: Session, as_of: datetime) -> list[Prediction]:

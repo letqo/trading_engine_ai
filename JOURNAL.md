@@ -5,6 +5,79 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-22 -- Fix: Sharpe annualization bug; walk-forward suite rerun confirms the 2026-07-21 finding; a reproducibility gap found along the way
+
+**The bug.** `engine.backtest.metrics.sharpe_ratio` hardcoded
+`periods_per_year=252` (one point per trading day) and nothing ever
+overrode it. But `BacktestEngine` appends one `EquityPoint` per `BAR`
+event, and a full-universe backtest emits one `BAR` event per `(symbol,
+timestamp)` pair -- a 27-symbol universe produces ~27 equity points per
+calendar day, not 1, and `overnight_gap`'s runs used hourly bars on top of
+that. `sqrt(252)` was the wrong annualization factor either way. Found
+while verifying the 2026-07-21 walk-forward result before trusting it for
+anything downstream -- `sharpe_ratio` was, tellingly, the one function in
+`metrics.py` with zero test coverage.
+
+**The fix.** `sharpe_ratio` now (a) collapses same-timestamp
+`EquityPoint`s to the last one seen, so a multi-symbol universe's
+per-symbol bar events don't inflate the return series, and (b) derives
+`periods_per_year` from the curve's own elapsed wall-clock time (365.25
+calendar days/year) instead of a hardcoded constant, so daily and hourly
+runs are each annualized correctly with no call site needing to remember
+which constant to pass. Added hand-computed test coverage that didn't
+exist before (`tests/test_metrics.py`). See `docs/bias_review.md`'s new
+2026-07-22 section for the full writeup.
+
+**Reran the full dev+validation walk-forward suite (14 runs) with the
+corrected metric to check whether the fix changes the 2026-07-21
+conclusion.**
+
+Validation period (2025-07-21..2026-07-20), corrected Sharpe:
+
+| Strategy | Return | Sharpe |
+|---|---|---|
+| buy_and_hold | 5.28% | 1.55 |
+| random_entry | 3.46% | 0.91 |
+| momentum | 2.72% | 0.78 |
+| multi_factor | 1.05% | 0.32 |
+| dumb_news | 0.28% | 0.10 |
+| mean_reversion | -1.92% | -0.49 |
+| overnight_gap | -0.74% | -1.18 |
+
+**Conclusion unchanged: no strategy beats both baselines on validation
+Sharpe.** Both baselines still outrank every real strategy. The bug did
+not flip the ranking.
+
+**A second, separate issue surfaced by the rerun, not caused by the
+Sharpe fix.** A few strategies' *return and trade-count* numbers shifted
+between the original 2026-07-21 run and this rerun, one day later --
+most strikingly `random_entry` (dev-period return +1.15% -> -6.51%) and
+`multi_factor` (8,311 -> 8,327 trades). Neither total_return_pct nor the
+strategies' own logic changed. Root cause: `engine backtest` re-fetches
+live data from yfinance on every invocation with no pinned snapshot --
+the `DataSnapshot`/`engine ingest` mechanism that's supposed to guarantee
+reproducibility exists but `backtest` doesn't actually use it. A single
+day's data drift from Yahoo was enough to cascade into different outcomes,
+especially for `random_entry` (threshold-random per bar -- any tiny data
+shift reshuffles which bars trigger entries). **Backtest runs are not
+currently perfectly reproducible run-to-run.** Decision: document as a
+known limitation for now rather than fix immediately -- it didn't change
+the validation conclusion this time, and wiring `backtest` to reuse a
+`DataSnapshot` is a separate, real piece of work for later.
+
+**One broken sub-run.** `overnight_gap`'s dev-period backtest
+(2024-07-22..2025-07-20, `--interval 1h`) returned 0 bars, 0 trades --
+yfinance's hourly-data cap is a rolling "last 730 days from *today*," and
+the one day that passed since the original run pushed that same fixed
+window just outside the limit. Its validation-period run was unaffected
+and matches the original run exactly (return -0.74%, 264 trades). This
+will recur for any fixed past hourly window as time passes -- a
+structural ceiling of the free data source, not a one-off glitch; not
+re-run here since the dev period doesn't bear on the validation
+conclusion above.
+
+---
+
 ## 2026-07-21 -- Add: subscription-backed prediction client (CLAUDE_CODE_OAUTH_TOKEN), with an honest open problem
 
 **What changed.** `ConsequencePredictionClient` (metered API key, via the

@@ -19,6 +19,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import case, func
 from sqlmodel import select
 
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
@@ -40,31 +41,53 @@ _templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
 def _prediction_stats(settings: Settings) -> dict:
+    """Aggregate stats computed SQL-side (COUNT/AVG/conditional SUM), not by
+    loading every resolved prediction into Python and summing over it --
+    this runs on every dashboard page load, and a full-table Python scan
+    gets slower every day the prediction log grows (months of predict-loop
+    running easily reaches tens of thousands of rows). `recent` is already
+    bounded (limit 100), left as-is."""
+    stop_pct = settings.risk.stop_loss_pct * 100.0
+
     with get_session(settings) as session:
-        rows = session.exec(
-            select(Prediction).where(Prediction.status == PredictionStatus.RESOLVED, Prediction.forward_safe == True)  # noqa: E712
-        ).all()
+        resolved_filter = (Prediction.status == PredictionStatus.RESOLVED, Prediction.forward_safe == True)  # noqa: E712
+
+        resolved_count, correct_count = session.exec(
+            select(
+                func.count(),
+                func.sum(case((Prediction.outcome_correct == True, 1), else_=0)),  # noqa: E712
+            ).where(*resolved_filter)
+        ).one()
+
+        avg_mfe, avg_mae, would_have_stopped = session.exec(
+            select(
+                func.avg(Prediction.mfe_pct),
+                func.avg(Prediction.mae_pct),
+                func.sum(
+                    case(
+                        (
+                            (Prediction.outcome_correct == True) & (Prediction.mae_pct >= stop_pct),  # noqa: E712
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+            ).where(*resolved_filter, Prediction.mae_pct.is_not(None))
+        ).one()
+
         traded_count = len(load_prediction_trades(session))
         recent = session.exec(select(Prediction).order_by(Prediction.news_decision_timestamp.desc()).limit(100)).all()
 
-    resolved_count = len(rows)
-    correct_count = sum(1 for r in rows if r.outcome_correct)
     accuracy_pct = (correct_count / resolved_count * 100.0) if resolved_count else None
-
-    with_excursion = [r for r in rows if r.mae_pct is not None]
-    avg_mfe = sum(r.mfe_pct for r in with_excursion) / len(with_excursion) if with_excursion else None
-    avg_mae = sum(r.mae_pct for r in with_excursion) / len(with_excursion) if with_excursion else None
-    stop_pct = settings.risk.stop_loss_pct * 100.0
-    would_have_stopped = sum(1 for r in with_excursion if r.outcome_correct and r.mae_pct >= stop_pct)
 
     return {
         "resolved_count": resolved_count,
-        "correct_count": correct_count,
+        "correct_count": correct_count or 0,
         "accuracy_pct": accuracy_pct,
         "avg_mfe": avg_mfe,
         "avg_mae": avg_mae,
         "stop_pct": stop_pct,
-        "would_have_stopped": would_have_stopped,
+        "would_have_stopped": would_have_stopped or 0,
         "traded_count": traded_count,
         "recent_predictions": recent,
     }

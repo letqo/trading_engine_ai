@@ -251,6 +251,22 @@ class Prediction(SQLModel, table=True):
     exit_order_id: str | None = None
 
 
+class PredictionTopic(SQLModel, table=True):
+    """One row per (prediction, topic) pair -- lets
+    registry.load_resolved_predictions_by_topics query by topic with a real
+    index instead of loading every resolved Prediction into Python to
+    filter Prediction.topics (a JSON blob) in memory. Prediction.topics
+    itself is unchanged and stays the source of truth for display/audit
+    ("never discard source data") -- this table is a derived index over it,
+    populated alongside every record_prediction() call, not a replacement."""
+
+    __tablename__ = "prediction_topic"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    prediction_id: str = Field(foreign_key="prediction.id", index=True)
+    topic: str = Field(index=True)
+
+
 class PredictLoopConfig(SQLModel, table=True):
     """Single-row live-tunable config for `engine predict-loop`, polled once
     per cycle so an operator can change strategy from the dashboard without
