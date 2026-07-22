@@ -14,8 +14,13 @@ from sqlmodel import Session, select
 
 from engine.domain import NewsItem
 from engine.journal.models import (
+    AnticipatoryLoopConfig,
     DataSnapshot,
     ExperimentRun,
+    Hypothesis,
+    HypothesisAction,
+    HypothesisBelief,
+    HypothesisStatus,
     NewsItemRecord,
     PredictLoopConfig,
     Prediction,
@@ -626,3 +631,146 @@ def load_recent_risk_halts(session: Session, limit: int = 100) -> list[RiskHaltE
     the audit trail independent of trade outcomes."""
     rows = session.exec(select(RiskHaltEvent).order_by(RiskHaltEvent.timestamp.desc()).limit(limit)).all()
     return list(rows)
+
+
+def get_anticipatory_loop_config(session: Session) -> AnticipatoryLoopConfig:
+    """Live-tunable anticipatory-loop config, polled fresh every cycle (see
+    engine.cli.main.anticipatory_loop) -- same get-or-create singleton
+    pattern as get_predict_loop_config, see its docstring."""
+    row = session.get(AnticipatoryLoopConfig, AnticipatoryLoopConfig.SINGLETON_ID)
+    if row is None:
+        row = AnticipatoryLoopConfig(id=AnticipatoryLoopConfig.SINGLETON_ID)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row
+
+
+def update_anticipatory_loop_config(session: Session, **fields) -> AnticipatoryLoopConfig:
+    row = get_anticipatory_loop_config(session)
+    for key, value in fields.items():
+        setattr(row, key, value)
+    row.updated_at = datetime.now(timezone.utc)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def hypothesis_exists_for_market(session: Session, market_id: str) -> bool:
+    """True if any Hypothesis (open or closed) already tracks this
+    Polymarket market -- discovery's dedup check. A closed hypothesis is
+    never re-created even if the same market_id somehow reappears as an
+    open candidate (shouldn't happen -- Polymarket markets don't reopen --
+    but this is the cheap, unconditional guard either way)."""
+    return session.exec(select(Hypothesis.id).where(Hypothesis.market_id == market_id)).first() is not None
+
+
+def create_hypothesis(
+    session: Session, *, market_id: str, question: str, symbol: str, direction_if_yes: PredictionDirection
+) -> Hypothesis:
+    hyp = Hypothesis(market_id=market_id, question=question, symbol=symbol, direction_if_yes=direction_if_yes)
+    session.add(hyp)
+    session.commit()
+    session.refresh(hyp)
+    return hyp
+
+
+def load_open_hypotheses(session: Session) -> list[Hypothesis]:
+    rows = session.exec(select(Hypothesis).where(Hypothesis.status == HypothesisStatus.OPEN)).all()
+    return list(rows)
+
+
+def record_hypothesis_belief(
+    session: Session,
+    hypothesis: Hypothesis,
+    *,
+    p_model: float,
+    p_market: float,
+    confidence: float,
+    rationale: str,
+    action: HypothesisAction,
+    order_id: str | None = None,
+    order_quantity: float | None = None,
+) -> HypothesisBelief:
+    """Append-only -- never edit a HypothesisBelief row after writing it,
+    same anti-hindsight principle as Prediction (see the model's
+    docstring)."""
+    belief = HypothesisBelief(
+        hypothesis_id=hypothesis.id,
+        p_model=p_model,
+        p_market=p_market,
+        gap=p_model - p_market,
+        confidence=confidence,
+        rationale=rationale,
+        action=action,
+        order_id=order_id,
+        order_quantity=order_quantity,
+    )
+    session.add(belief)
+    session.commit()
+    session.refresh(belief)
+    return belief
+
+
+def mark_hypothesis_traded(
+    session: Session, hypothesis: Hypothesis, *, order_id: str, quantity: float, side: str
+) -> Hypothesis:
+    hypothesis.traded_order_id = order_id
+    hypothesis.traded_quantity = quantity
+    hypothesis.position_side = side
+    session.add(hypothesis)
+    session.commit()
+    session.refresh(hypothesis)
+    return hypothesis
+
+
+def mark_hypothesis_flat(session: Session, hypothesis: Hypothesis, *, exit_order_id: str) -> Hypothesis:
+    """A trim/exit closed the whole open position (not a partial add) --
+    clears the position fields so the revision loop treats this hypothesis
+    as flat again (a subsequent "opened"-shaped belief can re-establish a
+    position without looking like a stale add)."""
+    hypothesis.exit_order_id = exit_order_id
+    hypothesis.position_side = None
+    hypothesis.traded_order_id = None
+    hypothesis.traded_quantity = None
+    session.add(hypothesis)
+    session.commit()
+    session.refresh(hypothesis)
+    return hypothesis
+
+
+def load_recent_hypotheses(session: Session, limit: int = 200) -> list[Hypothesis]:
+    rows = session.exec(select(Hypothesis).order_by(Hypothesis.created_at.desc()).limit(limit)).all()
+    return list(rows)
+
+
+def load_latest_beliefs_by_hypothesis(session: Session, hypothesis_ids: list[str]) -> dict[str, HypothesisBelief]:
+    """One hypothesis_id -> its single most recent HypothesisBelief, for
+    the dashboard's hypotheses list. One query for all requested ids
+    (ordered newest-first, first-seen-per-id kept), not one query per
+    hypothesis -- same reasoning as _prediction_stats' SQL-aggregate
+    rewrite: this runs on every dashboard page load."""
+    if not hypothesis_ids:
+        return {}
+    rows = session.exec(
+        select(HypothesisBelief)
+        .where(HypothesisBelief.hypothesis_id.in_(hypothesis_ids))
+        .order_by(HypothesisBelief.created_at.desc())
+    ).all()
+    latest: dict[str, HypothesisBelief] = {}
+    for row in rows:
+        latest.setdefault(row.hypothesis_id, row)
+    return latest
+
+
+def close_hypothesis(
+    session: Session, hypothesis: Hypothesis, *, resolution_outcome: bool, closed_at: datetime | None = None
+) -> Hypothesis:
+    hypothesis.status = HypothesisStatus.CLOSED
+    hypothesis.resolution_outcome = resolution_outcome
+    hypothesis.closed_at = closed_at or datetime.now(timezone.utc)
+    session.add(hypothesis)
+    session.commit()
+    session.refresh(hypothesis)
+    return hypothesis

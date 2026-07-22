@@ -99,6 +99,10 @@ class _FakePredictionClient:
         from engine.prediction.schema import ConsequenceAnalysis
         return ConsequenceAnalysis(impacts=[], overall_reasoning="none")
 
+    def estimate_hypothesis(self, question, description=""):
+        from engine.prediction.schema import HypothesisEstimate
+        return HypothesisEstimate(p_model=0.5, relevant=False, confidence=0.5, rationale="none")
+
 
 class _FakeAlpacaClient:
     def __init__(self, settings):
@@ -450,3 +454,123 @@ def test_predict_loop_cli_flag_seeds_config_only_on_first_run(monkeypatch, tmp_p
     assert result2.exit_code == 0, result2.stdout
     with get_session(get_settings()) as session:
         assert get_predict_loop_config(session).headlines_per_source == 3
+
+
+def test_anticipatory_loop_refuses_without_anthropic_key(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "1"])
+    assert result.exit_code == 1
+
+
+def test_anticipatory_loop_runs_log_only_without_alpaca_key(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_candidate_markets", lambda limit: [])
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_market_price", lambda market_id: None)
+
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "2", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert "anticipatory-loop stopped" in result.stdout
+
+
+def test_anticipatory_loop_stops_immediately_when_kill_switch_engaged(monkeypatch, tmp_path):
+    halt_path = _isolated_env(monkeypatch, tmp_path)
+    halt_path.write_text("halted for test\n")
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+    fake_broker = _FakeAlpacaClient(get_settings())
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "5", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert fake_broker.canceled is True
+    assert fake_broker.closed is True
+
+
+def test_anticipatory_loop_respects_max_iterations_in_log_only_mode(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    calls = []
+    monkeypatch.setattr(
+        "engine.anticipatory.pipeline.fetch_candidate_markets", lambda limit: (calls.append(1), [])[1]
+    )
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_market_price", lambda market_id: None)
+
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "3", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert len(calls) == 3
+
+
+def test_anticipatory_loop_pause_skips_cycle_body_but_keeps_looping(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    calls = []
+    monkeypatch.setattr(
+        "engine.anticipatory.pipeline.fetch_candidate_markets", lambda limit: (calls.append(1), [])[1]
+    )
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_market_price", lambda market_id: None)
+
+    from engine.journal.db import get_session
+    from engine.journal.registry import update_anticipatory_loop_config
+
+    with get_session(get_settings()) as session:
+        update_anticipatory_loop_config(session, enabled=False)
+
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "3", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    assert calls == []  # cycle body never ran while paused
+
+
+def test_anticipatory_loop_discovers_and_scores_a_relevant_hypothesis(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+
+    class _FakeClientWithEstimate(_FakePredictionClient):
+        def estimate_hypothesis(self, question, description=""):
+            from engine.prediction.schema import HypothesisEstimate
+            return HypothesisEstimate(
+                p_model=0.7, relevant=True, symbol="XLE", direction_if_yes="up", confidence=0.6, rationale="r",
+            )
+
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakeClientWithEstimate)
+
+    from engine.data.polymarket import PolymarketMarket
+
+    market = PolymarketMarket(market_id="m1", question="Q?", description="d", price_yes=0.5, closed=False, tags=())
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_candidate_markets", lambda limit: [market])
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_market_price", lambda market_id: market)
+
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "1", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+
+    from engine.journal.db import get_session
+    from engine.journal.registry import load_open_hypotheses
+
+    with get_session(get_settings()) as session:
+        open_hyps = load_open_hypotheses(session)
+    assert len(open_hyps) == 1
+    assert open_hyps[0].symbol == "XLE"
+
+
+def test_anticipatory_loop_cli_flag_seeds_config_only_on_first_run(monkeypatch, tmp_path):
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_candidate_markets", lambda limit: [])
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_market_price", lambda market_id: None)
+
+    result = runner.invoke(
+        app, ["anticipatory-loop", "--max-iterations", "1", "--poll-seconds", "1800"]
+    )
+    assert result.exit_code == 0, result.stdout
+
+    from engine.journal.db import get_session
+    from engine.journal.registry import get_anticipatory_loop_config
+
+    with get_session(get_settings()) as session:
+        assert get_anticipatory_loop_config(session).poll_seconds == 1800
+
+    result2 = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "1"])
+    assert result2.exit_code == 0, result2.stdout
+    with get_session(get_settings()) as session:
+        assert get_anticipatory_loop_config(session).poll_seconds == 1800

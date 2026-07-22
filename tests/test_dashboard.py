@@ -8,8 +8,8 @@ from sqlmodel import Session, SQLModel, create_engine
 import engine.journal.models  # noqa: F401  registers tables on SQLModel.metadata
 from engine.config.settings import Settings, get_settings
 from engine.dashboard.app import app
-from engine.journal.models import PredictionStatus
-from engine.journal.registry import record_prediction
+from engine.journal.models import HypothesisAction, PredictionDirection, PredictionStatus
+from engine.journal.registry import create_hypothesis, record_hypothesis_belief, record_prediction
 
 
 def _auth_header(username: str, password: str) -> dict:
@@ -44,7 +44,7 @@ def test_rejects_wrong_password(client):
 def test_all_routes_render_with_empty_database(client):
     for path in (
         "/", "/predictions", "/trades", "/ticker-suggestions", "/backtests", "/risk-events",
-        "/predict-loop-config",
+        "/predict-loop-config", "/hypotheses", "/anticipatory-loop-config",
     ):
         resp = client.get(path, headers=_auth_header("admin", "testpass"))
         assert resp.status_code == 200, f"{path} returned {resp.status_code}: {resp.text[:300]}"
@@ -210,6 +210,87 @@ def test_predictions_page_filters_by_symbol_outcome_and_date(tmp_path):
         assert "spy headline recent" in resp.text
         assert '<option value="EWJ"' in resp.text
         assert '<option value="SPY"' in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_hypotheses_page_requires_auth(tmp_path):
+    db_path = tmp_path / "dashboard_hyp_auth.db"
+    engine_ = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+    test_settings = Settings(database_url=f"sqlite:///{db_path}", dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        resp = TestClient(app).get("/hypotheses")
+        assert resp.status_code == 401
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_hypotheses_page_renders_symbol_and_latest_belief(tmp_path):
+    db_path = tmp_path / "dashboard_hyp_test.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    with Session(engine_) as session:
+        hyp = create_hypothesis(
+            session, market_id="m1", question="Will the Fed cut rates?", symbol="XLE",
+            direction_if_yes=PredictionDirection.UP,
+        )
+        record_hypothesis_belief(
+            session, hyp, p_model=0.7, p_market=0.5, confidence=0.6,
+            rationale="fed cut would boost energy demand", action=HypothesisAction.OPENED,
+        )
+
+    test_settings = Settings(database_url=db_url, dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        resp = TestClient(app).get("/hypotheses", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "Will the Fed cut rates?" in resp.text
+        assert "XLE" in resp.text
+        assert "fed cut would boost energy demand" in resp.text
+        assert "opened" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_anticipatory_loop_config_get_requires_auth(tmp_path):
+    db_path = tmp_path / "dashboard_ant_auth.db"
+    engine_ = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+    test_settings = Settings(database_url=f"sqlite:///{db_path}", dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        resp = TestClient(app).get("/anticipatory-loop-config")
+        assert resp.status_code == 401
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_anticipatory_loop_config_post_updates_the_row(tmp_path):
+    db_path = tmp_path / "dashboard_ant_test.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    test_settings = Settings(database_url=db_url, dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        client = TestClient(app)
+        auth = _auth_header("admin", "testpass")
+        resp = client.post(
+            "/anticipatory-loop-config", headers=auth,
+            data={"poll_seconds": "1800", "min_gap_threshold": "0.1", "max_open_hypotheses": "5", "discovery_limit": "15"},
+        )
+        assert resp.status_code == 200
+        assert "1800" in resp.text
+        assert "checked" not in resp.text.split('name="enabled"')[1].split(">")[0]  # omitted -> disabled
+
+        resp2 = client.get("/anticipatory-loop-config", headers=auth)
+        assert 'value="1800"' in resp2.text
+        assert 'value="5"' in resp2.text
     finally:
         app.dependency_overrides.clear()
 

@@ -21,7 +21,7 @@ from datetime import date, datetime, timezone
 import anthropic
 
 from engine.config.settings import Settings
-from engine.prediction.schema import ConsequenceAnalysis
+from engine.prediction.schema import ConsequenceAnalysis, HypothesisEstimate
 
 _PLACEHOLDER_CUTOFF = "1970-01-01"
 
@@ -84,6 +84,32 @@ rationale stating the causal mechanism. Be conservative with confidence -- most 
 effects are uncertain."""
 
 
+def build_hypothesis_prompt(question: str, description: str) -> str:
+    lines = [f"Question: {question}"]
+    if description:
+        lines += ["", f"Resolution criteria: {description}"]
+    return "\n".join(lines)
+
+
+HYPOTHESIS_SYSTEM_PROMPT = """You estimate probabilities for real-world events and identify which \
+publicly-traded companies or ETFs would be affected if the event resolves YES.
+
+You are given a yes/no prediction-market question and its resolution criteria. Two independent \
+judgments are required:
+
+1. Your own probability that this event resolves YES, using your own knowledge and reasoning. \
+You are not told any market price for this event, and must not try to guess or anchor to one -- \
+a well-calibrated estimate is the goal, not a confident-sounding number.
+2. Whether a real, exchange-listed equity or ETF has genuine, tradable second-order exposure to \
+this event's outcome, and if so, which direction it would move if the event resolves YES. Most \
+events have no such clean exposure -- relevant=false is a valid and often correct answer. Do not \
+force a connection that isn't there, and do not guess at a ticker you're not confident actually \
+exists.
+
+Be conservative with confidence -- most probability estimates and most claimed equity exposures \
+are more uncertain than they first appear."""
+
+
 class ConsequencePredictionClient:
     """Metered-API backend: authenticates with ANTHROPIC_API_KEY via the
     Python SDK. See engine.prediction.cli_client.ClaudeCLIPredictionClient
@@ -118,5 +144,20 @@ class ConsequencePredictionClient:
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
             output_format=ConsequenceAnalysis,
+        )
+        return response.parsed_output
+
+    def estimate_hypothesis(self, question: str, description: str = "") -> HypothesisEstimate:
+        """Anticipatory-mode probability call (see engine.anticipatory.pipeline).
+        Deliberately never shown a market price -- see HYPOTHESIS_SYSTEM_PROMPT."""
+        user_prompt = build_hypothesis_prompt(question, description)
+        response = self._client.messages.parse(
+            model=self.model,
+            max_tokens=4096,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high"},
+            system=HYPOTHESIS_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+            output_format=HypothesisEstimate,
         )
         return response.parsed_output

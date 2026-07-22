@@ -48,15 +48,19 @@ import shutil
 import subprocess
 from datetime import date, datetime
 
+from pydantic import BaseModel
+
 from engine.config.settings import Settings
 from engine.prediction.client import (
+    HYPOTHESIS_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     PredictionConfigError,
+    build_hypothesis_prompt,
     build_prompt,
     is_forward_safe,
     parse_knowledge_cutoff,
 )
-from engine.prediction.schema import ConsequenceAnalysis
+from engine.prediction.schema import ConsequenceAnalysis, HypothesisEstimate
 
 _CLAUDE_TIMEOUT_SECONDS = 180
 
@@ -65,12 +69,15 @@ class ClaudeCLIError(RuntimeError):
     pass
 
 
-def _parse_cli_output(stdout: str) -> ConsequenceAnalysis:
+def _parse_cli_output(stdout: str, schema_cls: type[BaseModel]) -> BaseModel:
     """`claude -p --output-format json` wraps the model's final text in an
     envelope (`{"result": "...", ...}`); with --json-schema that text is
     itself the schema-validated JSON. Handles both a JSON-string result
     (documented shape) and an already-parsed dict (defensive, in case
-    --json-schema changes the envelope to embed structured data directly)."""
+    --json-schema changes the envelope to embed structured data directly).
+    Generic over schema_cls since both the reactive (ConsequenceAnalysis)
+    and anticipatory (HypothesisEstimate) calls share this same envelope
+    shape -- only the payload schema differs."""
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -96,7 +103,7 @@ def _parse_cli_output(stdout: str) -> ConsequenceAnalysis:
             ) from exc
     else:
         payload = result
-    return ConsequenceAnalysis.model_validate(payload)
+    return schema_cls.model_validate(payload)
 
 
 class ClaudeCLIPredictionClient:
@@ -161,4 +168,35 @@ class ClaudeCLIPredictionClient:
             raise ClaudeCLIError(
                 f"claude CLI exited {result.returncode}: {result.stderr[:2000]}"
             )
-        return _parse_cli_output(result.stdout)
+        return _parse_cli_output(result.stdout, ConsequenceAnalysis)
+
+    def estimate_hypothesis(self, question: str, description: str = "") -> HypothesisEstimate:
+        user_prompt = build_hypothesis_prompt(question, description)
+        schema = HypothesisEstimate.model_json_schema()
+        result = subprocess.run(
+            [
+                self._claude_path,
+                "-p",
+                user_prompt,
+                "--append-system-prompt",
+                HYPOTHESIS_SYSTEM_PROMPT,
+                "--model",
+                self.model,
+                "--output-format",
+                "json",
+                "--json-schema",
+                json.dumps(schema),
+                "--no-session-persistence",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_CLAUDE_TIMEOUT_SECONDS,
+            env=self._env,
+            check=False,
+            cwd=tempfile.gettempdir(),
+        )
+        if result.returncode != 0:
+            raise ClaudeCLIError(
+                f"claude CLI exited {result.returncode}: {result.stderr[:2000]}"
+            )
+        return _parse_cli_output(result.stdout, HypothesisEstimate)

@@ -6,8 +6,8 @@ import pytest
 
 from engine.config.settings import Settings
 from engine.prediction.cli_client import ClaudeCLIError, ClaudeCLIPredictionClient, _parse_cli_output
-from engine.prediction.client import PredictionConfigError
-from engine.prediction.schema import ConsequenceAnalysis, PredictedImpact
+from engine.prediction.client import HYPOTHESIS_SYSTEM_PROMPT, PredictionConfigError
+from engine.prediction.schema import ConsequenceAnalysis, HypothesisEstimate, PredictedImpact
 
 
 def _settings(**overrides) -> Settings:
@@ -53,26 +53,32 @@ class TestParseCliOutput:
     def test_parses_documented_envelope_with_json_string_result(self):
         analysis = _fake_analysis()
         envelope = json.dumps({"type": "result", "subtype": "success", "result": analysis.model_dump_json()})
-        parsed = _parse_cli_output(envelope)
+        parsed = _parse_cli_output(envelope, ConsequenceAnalysis)
         assert parsed == analysis
 
     def test_parses_envelope_with_dict_result_defensively(self):
         analysis = _fake_analysis()
         envelope = json.dumps({"result": analysis.model_dump(mode="json")})
-        parsed = _parse_cli_output(envelope)
+        parsed = _parse_cli_output(envelope, ConsequenceAnalysis)
         assert parsed == analysis
 
     def test_raises_on_invalid_top_level_json(self):
         with pytest.raises(ClaudeCLIError, match="did not return valid JSON"):
-            _parse_cli_output("not json at all")
+            _parse_cli_output("not json at all", ConsequenceAnalysis)
 
     def test_raises_when_result_field_missing(self):
         with pytest.raises(ClaudeCLIError, match="no 'result' field"):
-            _parse_cli_output(json.dumps({"type": "result", "subtype": "success"}))
+            _parse_cli_output(json.dumps({"type": "result", "subtype": "success"}), ConsequenceAnalysis)
 
     def test_raises_when_result_is_not_schema_valid(self):
         with pytest.raises(Exception):  # pydantic ValidationError
-            _parse_cli_output(json.dumps({"result": json.dumps({"unrelated": "shape"})}))
+            _parse_cli_output(json.dumps({"result": json.dumps({"unrelated": "shape"})}), ConsequenceAnalysis)
+
+    def test_parses_a_different_schema_generically(self):
+        estimate = HypothesisEstimate(p_model=0.7, relevant=True, symbol="XLE", direction_if_yes="up", confidence=0.6, rationale="r")
+        envelope = json.dumps({"result": estimate.model_dump_json()})
+        parsed = _parse_cli_output(envelope, HypothesisEstimate)
+        assert parsed == estimate
 
 
 def test_analyze_invokes_subprocess_and_returns_parsed_analysis():
@@ -121,3 +127,21 @@ def test_analyze_includes_past_cases_in_prompt():
     args = mock_run.call_args.args[0]
     prompt = args[args.index("-p") + 1]
     assert "past case: BOJ hike" in prompt
+
+
+def test_estimate_hypothesis_invokes_subprocess_and_returns_parsed_estimate():
+    client = ClaudeCLIPredictionClient(
+        _settings(claude_code_oauth_token="tok-test", anthropic_model_knowledge_cutoff="2026-01-31")
+    )
+    estimate = HypothesisEstimate(p_model=0.7, relevant=True, symbol="XLE", direction_if_yes="up", confidence=0.6, rationale="r")
+    envelope = json.dumps({"result": estimate.model_dump_json()})
+    fake_completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=envelope, stderr="")
+
+    with patch("engine.prediction.cli_client.subprocess.run", return_value=fake_completed) as mock_run:
+        result = client.estimate_hypothesis("Will X happen?", "resolution criteria")
+
+    assert result == estimate
+    args = mock_run.call_args.args[0]
+    assert "Will X happen?" in args[args.index("-p") + 1]
+    assert "resolution criteria" in args[args.index("-p") + 1]
+    assert args[args.index("--append-system-prompt") + 1] == HYPOTHESIS_SYSTEM_PROMPT

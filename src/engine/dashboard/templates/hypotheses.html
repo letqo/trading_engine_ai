@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Hypotheses{% endblock %}
+{% block content %}
+<h1>Anticipatory hypotheses</h1>
+<div class="subtitle">Polymarket-anchored beliefs, revised over their life -- see docs/anticipatory_prediction_mode.md.</div>
+
+{% if hypotheses %}
+<table>
+  <tr><th>Opened</th><th>Symbol</th><th>If YES</th><th>Status</th><th>Position</th><th>P_model</th><th>P_market</th><th>Gap</th><th>Last action</th><th>Question</th><th>Rationale</th></tr>
+  {% for h in hypotheses %}
+  {% set belief = latest_beliefs.get(h.id) %}
+  <tr>
+    <td>{{ h.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td>{{ h.symbol }}</td>
+    <td><span class="tag {{ h.direction_if_yes.value }}">{{ h.direction_if_yes.value }}</span></td>
+    <td>
+      {% if h.status.value == "closed" %}
+        <span class="tag {{ 'correct' if h.resolution_outcome else 'incorrect' }}">{{ "yes" if h.resolution_outcome else "no" }}</span>
+      {% else %}
+        <span class="tag pending">open</span>
+      {% endif %}
+    </td>
+    <td>{{ h.position_side or "flat" }}</td>
+    <td>{{ "%.2f"|format(belief.p_model) if belief else "-" }}</td>
+    <td>{{ "%.2f"|format(belief.p_market) if belief else "-" }}</td>
+    <td>{{ "%+.2f"|format(belief.gap) if belief else "-" }}</td>
+    <td>{{ belief.action.value if belief else "-" }}</td>
+    <td class="headline">{{ h.question }}</td>
+    <td class="rationale">{{ belief.rationale if belief else "" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No hypotheses tracked yet.</div>
+{% endif %}
+{% endblock %}

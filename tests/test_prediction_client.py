@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from engine.config.settings import Settings
-from engine.prediction.client import ConsequencePredictionClient, PredictionConfigError
-from engine.prediction.schema import ConsequenceAnalysis, PredictedImpact
+from engine.prediction.client import HYPOTHESIS_SYSTEM_PROMPT, ConsequencePredictionClient, PredictionConfigError
+from engine.prediction.schema import ConsequenceAnalysis, HypothesisEstimate, PredictedImpact
 
 
 def _settings(**overrides) -> Settings:
@@ -62,3 +62,22 @@ def test_analyze_includes_past_cases_in_prompt():
         client.analyze("ECB cuts rates", ["VGK"], past_cases=["past case: BOJ hike -> EWJ fell 2%"])
     prompt = mock_parse.call_args.kwargs["messages"][0]["content"]
     assert "past case: BOJ hike" in prompt
+
+
+def test_estimate_hypothesis_calls_messages_parse_with_expected_params():
+    client = ConsequencePredictionClient(
+        _settings(anthropic_api_key="sk-test", anthropic_model_knowledge_cutoff="2026-01-31")
+    )
+    fake_estimate = HypothesisEstimate(
+        p_model=0.7, relevant=True, symbol="XLE", direction_if_yes="up", confidence=0.6, rationale="test"
+    )
+    fake_response = MagicMock(parsed_output=fake_estimate)
+    with patch.object(client._client.messages, "parse", return_value=fake_response) as mock_parse:
+        result = client.estimate_hypothesis("Will X happen?", "resolution criteria")
+
+    assert result == fake_estimate
+    kwargs = mock_parse.call_args.kwargs
+    assert kwargs["output_format"] is HypothesisEstimate
+    assert kwargs["system"] == HYPOTHESIS_SYSTEM_PROMPT
+    prompt = kwargs["messages"][0]["content"]
+    assert prompt == "Question: Will X happen?\n\nResolution criteria: resolution criteria"

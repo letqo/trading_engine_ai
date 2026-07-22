@@ -294,3 +294,95 @@ class PredictLoopConfig(SQLModel, table=True):
     headlines_per_source: int = Field(default=10)
     near_dup_window_hours: float = Field(default=48.0)
     near_dup_threshold: float = Field(default=90.0)
+
+
+class HypothesisStatus(str, Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class Hypothesis(SQLModel, table=True):
+    """One row per tracked Polymarket market -- see
+    docs/anticipatory_prediction_mode.md. Deliberately NOT an extension of
+    Prediction: a Prediction is written once and resolved exactly once,
+    which is the wrong shape for a belief that gets revised repeatedly
+    over an event's life (see HypothesisBelief). `market_id` is
+    Polymarket's conditionId and is the dedup key -- one Hypothesis per
+    market, never re-created once tracked (even after it closes).
+
+    Position tracking is fields directly on this row (traded_order_id/
+    traded_quantity/position_side), mirroring how Prediction tracks its
+    own trade lifecycle -- NOT TradeRecord. TradeRecord.run_id is a
+    required FK to experiment_run and is currently backtest-only; no
+    live/paper trading path in this codebase writes TradeRecord rows, so
+    reusing it here would be a new integration, not an extension of an
+    existing one."""
+
+    __tablename__ = "hypothesis"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    created_at: datetime = Field(default_factory=_now)
+    market_id: str = Field(index=True, unique=True)
+    question: str
+    symbol: str = Field(index=True)
+    direction_if_yes: PredictionDirection  # fixed at creation from the initial LLM estimate --
+    # only probability gets re-estimated on revision, not exposure/direction (see engine.anticipatory.pipeline)
+    status: HypothesisStatus = Field(default=HypothesisStatus.OPEN, index=True)
+    closed_at: datetime | None = None
+    resolution_outcome: bool | None = None  # True=YES, False=NO -- set once, on close
+
+    position_side: str | None = None  # "long" / "short", None if currently flat
+    traded_order_id: str | None = Field(default=None, index=True)
+    traded_quantity: float | None = None
+    exit_order_id: str | None = None
+
+
+class HypothesisAction(str, Enum):
+    OPENED = "opened"
+    ADDED = "added"
+    TRIMMED = "trimmed"
+    EXITED = "exited"
+    HELD = "held"
+    NO_GAP = "no_gap"
+
+
+class HypothesisBelief(SQLModel, table=True):
+    """Append-only, one row per re-estimation of a Hypothesis -- never
+    edited after written, same anti-hindsight principle that makes
+    Prediction trustworthy today, just shaped for a persisting belief
+    instead of a single call. `gap = p_model - p_market`, stored
+    (rather than only derived) so the audit trail doesn't depend on
+    recomputing it correctly later."""
+
+    __tablename__ = "hypothesis_belief"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    hypothesis_id: str = Field(foreign_key="hypothesis.id", index=True)
+    created_at: datetime = Field(default_factory=_now, index=True)
+
+    p_model: float
+    p_market: float
+    gap: float
+    confidence: float
+    rationale: str
+    action: HypothesisAction
+    order_id: str | None = None
+    order_quantity: float | None = None
+
+
+class AnticipatoryLoopConfig(SQLModel, table=True):
+    """Single-row live-tunable config for `engine anticipatory-loop`,
+    mirroring PredictLoopConfig exactly (see its docstring for why this
+    isn't engine.config.settings.Settings)."""
+
+    __tablename__ = "anticipatory_loop_config"
+    SINGLETON_ID: ClassVar[str] = "singleton"
+
+    id: str = Field(default="singleton", primary_key=True)
+    updated_at: datetime = Field(default_factory=_now)
+
+    enabled: bool = Field(default=True)
+    poll_seconds: int = Field(default=3600)
+    min_gap_threshold: float = Field(default=0.05)  # |p_model - p_market| below this: no trade
+    max_open_hypotheses: int = Field(default=10)  # discovery stops creating new ones above this
+    discovery_limit: int = Field(default=20)  # candidate events considered per discovery sweep

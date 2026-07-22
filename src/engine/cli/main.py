@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 
 import typer
 
+from engine.anticipatory.pipeline import discover_hypotheses, revise_open_hypotheses
+from engine.anticipatory.trading import act_on_hypothesis_beliefs, flatten_resolved_hypotheses
 from engine.backtest.engine import BacktestEngine
 from engine.backtest.perturbation import run_perturbation_analysis
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
@@ -28,17 +30,20 @@ from engine.journal.db import get_session
 from engine.journal.models import RunMode, TradeSide
 from engine.journal.registry import (
     current_git_hash,
+    get_anticipatory_loop_config,
     get_predict_loop_config,
     headline_already_predicted,
     headline_near_duplicate,
     load_news_items,
     load_off_universe_symbol_stats,
+    load_open_hypotheses,
     load_prediction_trades,
     record_metrics,
     record_news_item,
     record_reconciliation,
     record_trade,
     register_run,
+    update_anticipatory_loop_config,
     update_predict_loop_config,
 )
 from engine.logging_setup import configure_logging, get_logger
@@ -899,6 +904,150 @@ def predict_loop(
         time.sleep(config.poll_seconds)
 
     logger.info("predict-loop stopped")
+
+
+@app.command(name="anticipatory-loop")
+def anticipatory_loop(
+    poll_seconds: int = typer.Option(None, help="seed the dashboard-tunable poll interval on first run"),
+    max_iterations: int = typer.Option(None, help="stop after N iterations (testing only; omit to run forever)"),
+) -> None:
+    """Anticipatory-mode counterpart to predict-loop -- see
+    docs/anticipatory_prediction_mode.md. Each cycle: discover new
+    Polymarket-anchored hypotheses (one paid LLM relevance call per
+    not-yet-tracked candidate market), re-estimate every open hypothesis's
+    probability fresh, trade the gap against Polymarket's price through
+    the same RiskGate as everywhere else, and close out any hypothesis
+    Polymarket itself now reports resolved.
+
+    Poll interval, minimum gap threshold, max concurrent hypotheses, and
+    pause/resume are read fresh from AnticipatoryLoopConfig every cycle --
+    live-tunable from the dashboard with no redeploy, same mechanism as
+    PredictLoopConfig (see predict_loop's docstring for why this isn't
+    engine.config.settings.Settings).
+
+    Requires ANTHROPIC_API_KEY (+ ANTHROPIC_MODEL_KNOWLEDGE_CUTOFF), same
+    as predict-loop. If ALPACA_API_KEY isn't set, hypotheses are still
+    discovered and revised but never traded (log-only forward test).
+
+    Same crash-safety split as predict-loop: an unhandled exception inside
+    one cycle is logged and the loop continues to the next cycle; the
+    kill switch or a daily-drawdown breach stops it and flattens
+    everything, including any open anticipatory positions.
+    """
+    settings = get_settings()
+    try:
+        client = build_prediction_client(settings)
+    except PredictionConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+
+    universe = load_universe(settings.universe_path)
+    can_trade = bool(settings.alpaca_api_key and settings.alpaca_api_secret)
+    broker = risk_gate = account = current_date = None
+    if can_trade:
+        try:
+            enforce_paper_only(settings)
+        except PaperOnlyViolation as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1)
+        broker = AlpacaPaperClient(settings)
+        risk_gate = RiskGate(settings.risk)
+        account = reconcile_account_state(broker)
+        risk_gate.start_new_session(account)
+        current_date = datetime.now(timezone.utc).date()
+    else:
+        typer.echo("ALPACA_API_KEY not set -- running log-only (hypotheses will be scored but never traded).", err=True)
+
+    seed_fields = {}
+    if poll_seconds is not None:
+        seed_fields["poll_seconds"] = poll_seconds
+    with get_session(settings) as session:
+        if seed_fields:
+            config = update_anticipatory_loop_config(session, **seed_fields)
+        else:
+            config = get_anticipatory_loop_config(session)
+
+    logger.info("anticipatory-loop started", extra={"extra_fields": {"poll_seconds": config.poll_seconds, "can_trade": can_trade}})
+
+    iteration = 0
+    while max_iterations is None or iteration < max_iterations:
+        if is_kill_switch_engaged(settings):
+            logger.warning("kill switch engaged -- stopping anticipatory-loop")
+            alert_kill_switch(settings)
+            if can_trade:
+                risk_gate.trigger_kill_switch(account, reason="kill switch engaged")
+                broker.cancel_all_orders()
+                broker.close_all_positions()
+            break
+
+        with get_session(settings) as session:
+            config = get_anticipatory_loop_config(session)
+
+        if not config.enabled:
+            logger.info("anticipatory-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds}})
+            iteration += 1
+            if max_iterations is not None and iteration >= max_iterations:
+                break
+            time.sleep(config.poll_seconds)
+            continue
+
+        discovered = acted_open = acted_closed = flattened = 0
+        beliefs, resolved = [], []
+        try:
+            with get_session(settings) as session:
+                discovered = len(discover_hypotheses(
+                    session, client,
+                    discovery_limit=config.discovery_limit,
+                    max_open_hypotheses=config.max_open_hypotheses,
+                    min_gap_threshold=config.min_gap_threshold,
+                ))
+
+            with get_session(settings) as session:
+                open_before = {h.id: h for h in load_open_hypotheses(session)}
+                beliefs, resolved = revise_open_hypotheses(session, client, min_gap_threshold=config.min_gap_threshold)
+
+            if can_trade:
+                today = datetime.now(timezone.utc).date()
+                if today != current_date:
+                    account = reconcile_account_state(broker)
+                    risk_gate.start_new_session(account)
+                    current_date = today
+                else:
+                    refresh_account_state(broker, account)
+
+                if risk_gate.check_daily_drawdown(account):
+                    logger.error(
+                        "daily drawdown breached -- flattening and stopping anticipatory-loop",
+                        extra={"extra_fields": {"reason": account.halt_reason}},
+                    )
+                    alert_risk_halt(settings, account.halt_reason)
+                    broker.cancel_all_orders()
+                    broker.close_all_positions()
+                    break
+
+                with get_session(settings) as session:
+                    acted_open, acted_closed = act_on_hypothesis_beliefs(
+                        session, broker, risk_gate, account, universe, open_before, beliefs, config.min_gap_threshold,
+                    )
+                with get_session(settings) as session:
+                    flattened = flatten_resolved_hypotheses(session, broker, risk_gate, account, universe, resolved)
+
+            logger.info(
+                "anticipatory-loop cycle complete",
+                extra={"extra_fields": {
+                    "discovered": discovered, "revised": len(beliefs), "resolved": len(resolved),
+                    "opened": acted_open, "closed": acted_closed, "flattened": flattened,
+                }},
+            )
+        except Exception:
+            logger.exception("unhandled exception in anticipatory-loop cycle -- continuing to next cycle")
+
+        iteration += 1
+        if max_iterations is not None and iteration >= max_iterations:
+            break
+        time.sleep(config.poll_seconds)
+
+    logger.info("anticipatory-loop stopped")
 
 
 if __name__ == "__main__":

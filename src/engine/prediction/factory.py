@@ -10,7 +10,7 @@ from typing import Protocol, runtime_checkable
 from engine.config.settings import Settings
 from engine.prediction.client import ConsequencePredictionClient, PredictionConfigError
 from engine.prediction.cli_client import ClaudeCLIPredictionClient
-from engine.prediction.schema import ConsequenceAnalysis
+from engine.prediction.schema import ConsequenceAnalysis, HypothesisEstimate
 
 
 @runtime_checkable
@@ -22,6 +22,8 @@ class PredictionClient(Protocol):
     def analyze(
         self, headline: str, tracked_symbols: list[str], past_cases: list[str] | None = None
     ) -> ConsequenceAnalysis: ...
+
+    def estimate_hypothesis(self, question: str, description: str = "") -> HypothesisEstimate: ...
 
 
 def build_prediction_client(settings: Settings) -> PredictionClient:

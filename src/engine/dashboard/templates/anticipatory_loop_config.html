@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Anticipatory-loop config{% endblock %}
+{% block content %}
+<h1>Anticipatory-loop config</h1>
+<div class="subtitle">Live-tunable -- takes effect next cycle, no redeploy needed. Pausing skips the cycle body only: it does not flatten positions or touch the kill switch.</div>
+{% if saved %}<div class="note">Saved.</div>{% endif %}
+<form method="post" action="/anticipatory-loop-config">
+  <label>
+    <input type="checkbox" name="enabled" {% if config.enabled %}checked{% endif %}>
+    Enabled (unchecked = pause the cycle body; the loop keeps polling and resumes automatically once re-enabled)
+  </label>
+  <label>
+    Poll seconds (time between cycles)
+    <input type="number" name="poll_seconds" value="{{ config.poll_seconds }}" min="1" required>
+  </label>
+  <label>
+    Minimum gap threshold (|P_model - P_market| below this: no trade, and an existing position gets exited)
+    <input type="number" step="0.01" name="min_gap_threshold" value="{{ config.min_gap_threshold }}" min="0" max="1" required>
+  </label>
+  <label>
+    Max open hypotheses (caps concurrent tracked markets -- each new candidate costs one paid LLM call)
+    <input type="number" name="max_open_hypotheses" value="{{ config.max_open_hypotheses }}" min="1" required>
+  </label>
+  <label>
+    Discovery limit (candidate Polymarket events considered per discovery sweep)
+    <input type="number" name="discovery_limit" value="{{ config.discovery_limit }}" min="1" required>
+  </label>
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

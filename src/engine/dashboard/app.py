@@ -4,12 +4,12 @@ not imported here. The only broker calls made are AlpacaPaperClient's read
 methods (get_account_equity, get_positions), same as any other dashboard
 consumer of a paper account's public state.
 
-The one exception is /predict-loop-config: a GET/POST pair that reads and
-writes PredictLoopConfig (poll interval, RSS rotation, headline quotas,
-near-duplicate thresholds, pause/resume). It can pause or retune the
-predict-loop research loop, but it cannot place or cancel an order -- same
-trust boundary as everything else here, just no longer read-only for that
-one setting.
+The exceptions are /predict-loop-config and /anticipatory-loop-config:
+GET/POST pairs that read and write PredictLoopConfig/AnticipatoryLoopConfig
+(poll interval, thresholds, pause/resume). Either can pause or retune its
+respective research loop, but neither can place or cancel an order -- same
+trust boundary as everything else here, just no longer read-only for those
+two settings.
 """
 
 from __future__ import annotations
@@ -29,11 +29,15 @@ from engine.dashboard.auth import require_auth
 from engine.journal.db import get_session
 from engine.journal.models import Prediction, PredictionStatus
 from engine.journal.registry import (
+    get_anticipatory_loop_config,
     get_predict_loop_config,
+    load_latest_beliefs_by_hypothesis,
     load_off_universe_symbol_stats,
     load_prediction_trades,
     load_recent_experiment_runs,
+    load_recent_hypotheses,
     load_recent_risk_halts,
+    update_anticipatory_loop_config,
     update_predict_loop_config,
 )
 
@@ -271,6 +275,46 @@ def predict_loop_config_update(
             near_dup_threshold=near_dup_threshold,
         )
     return _templates.TemplateResponse(request, "predict_loop_config.html", {"config": config, "saved": True})
+
+
+@app.get("/hypotheses", response_class=HTMLResponse)
+def hypotheses(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    with get_session(settings) as session:
+        rows = load_recent_hypotheses(session, limit=200)
+        latest_beliefs = load_latest_beliefs_by_hypothesis(session, [h.id for h in rows])
+    return _templates.TemplateResponse(
+        request, "hypotheses.html", {"hypotheses": rows, "latest_beliefs": latest_beliefs}
+    )
+
+
+@app.get("/anticipatory-loop-config", response_class=HTMLResponse)
+def anticipatory_loop_config_view(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    with get_session(settings) as session:
+        config = get_anticipatory_loop_config(session)
+    return _templates.TemplateResponse(request, "anticipatory_loop_config.html", {"config": config, "saved": False})
+
+
+@app.post("/anticipatory-loop-config", response_class=HTMLResponse)
+def anticipatory_loop_config_update(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    enabled: bool = Form(False),
+    poll_seconds: int = Form(...),
+    min_gap_threshold: float = Form(...),
+    max_open_hypotheses: int = Form(...),
+    discovery_limit: int = Form(...),
+):
+    with get_session(settings) as session:
+        config = update_anticipatory_loop_config(
+            session,
+            enabled=enabled,
+            poll_seconds=poll_seconds,
+            min_gap_threshold=min_gap_threshold,
+            max_open_hypotheses=max_open_hypotheses,
+            discovery_limit=discovery_limit,
+        )
+    return _templates.TemplateResponse(request, "anticipatory_loop_config.html", {"config": config, "saved": True})
 
 
 @app.get("/health")
