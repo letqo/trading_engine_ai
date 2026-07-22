@@ -345,6 +345,27 @@ def update_predict_loop_config(session: Session, **fields) -> PredictLoopConfig:
     return row
 
 
+def mark_predict_loop_cycle(session: Session) -> PredictLoopConfig:
+    """Stamp last_cycle_at -- called once per loop iteration, paused or
+    not, distinct from updated_at (which only changes when a setting is
+    edited). Lets the dashboard tell "the process is alive and iterating"
+    apart from "Railway says Online but it's actually crash-looping" (the
+    ON_FAILURE restart policy masks that distinction otherwise).
+
+    Returns the refreshed row so callers can use it directly instead of a
+    separate get_predict_loop_config call -- commit() here expires all of
+    the session's tracked objects' attributes (SQLAlchemy's default), so
+    a config fetched *before* this call would raise DetachedInstanceError
+    on any attribute access after the session closes, which every loop's
+    cycle body does many lines later."""
+    row = get_predict_loop_config(session)
+    row.last_cycle_at = datetime.now(timezone.utc)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
 def record_prediction(
     session: Session,
     *,
@@ -651,6 +672,17 @@ def update_anticipatory_loop_config(session: Session, **fields) -> AnticipatoryL
     for key, value in fields.items():
         setattr(row, key, value)
     row.updated_at = datetime.now(timezone.utc)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def mark_anticipatory_loop_cycle(session: Session) -> AnticipatoryLoopConfig:
+    """See mark_predict_loop_cycle's docstring -- same heartbeat purpose
+    and same reason it returns the refreshed row instead of None."""
+    row = get_anticipatory_loop_config(session)
+    row.last_cycle_at = datetime.now(timezone.utc)
     session.add(row)
     session.commit()
     session.refresh(row)

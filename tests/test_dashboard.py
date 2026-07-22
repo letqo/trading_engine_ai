@@ -9,7 +9,14 @@ import engine.journal.models  # noqa: F401  registers tables on SQLModel.metadat
 from engine.config.settings import Settings, get_settings
 from engine.dashboard.app import app
 from engine.journal.models import HypothesisAction, PredictionDirection, PredictionStatus
-from engine.journal.registry import create_hypothesis, record_hypothesis_belief, record_prediction
+from engine.journal.registry import (
+    create_hypothesis,
+    get_anticipatory_loop_config,
+    get_predict_loop_config,
+    record_halt,
+    record_hypothesis_belief,
+    record_prediction,
+)
 
 
 def _auth_header(username: str, password: str) -> dict:
@@ -291,6 +298,154 @@ def test_anticipatory_loop_config_post_updates_the_row(tmp_path):
         resp2 = client.get("/anticipatory-loop-config", headers=auth)
         assert 'value="1800"' in resp2.text
         assert 'value="5"' in resp2.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _status_settings(tmp_path, db_url, halted=False):
+    # _env_file=None: this machine's local .env (real ALPACA_API_KEY etc.)
+    # must not leak into these tests -- Settings otherwise reads it by
+    # default, same isolation pattern as tests/test_prediction_client.py.
+    halt_file = tmp_path / "HALT"
+    if halted:
+        halt_file.write_text("halted for test\n")
+    return Settings(_env_file=None, database_url=db_url, dashboard_password="testpass", halt_file=halt_file)
+
+
+def test_overview_shows_kill_switch_engaged(tmp_path):
+    db_path = tmp_path / "status_kill_switch.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    app.dependency_overrides[get_settings] = lambda: _status_settings(tmp_path, db_url, halted=True)
+    try:
+        resp = TestClient(app).get("/", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "ENGAGED" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overview_shows_kill_switch_clear_by_default(tmp_path):
+    db_path = tmp_path / "status_clear.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    app.dependency_overrides[get_settings] = lambda: _status_settings(tmp_path, db_url, halted=False)
+    try:
+        resp = TestClient(app).get("/", headers=_auth_header("admin", "testpass"))
+        assert "ENGAGED" not in resp.text
+        assert "clear" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overview_shows_predict_loop_paused(tmp_path):
+    db_path = tmp_path / "status_paused.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    with Session(engine_) as session:
+        # A paused loop still heartbeats every iteration in production
+        # (mark_predict_loop_cycle runs before the enabled check) -- so a
+        # realistic "paused but alive" row needs a fresh heartbeat too,
+        # not just enabled=False. Without one, last_cycle_at is None and
+        # correctly reads as STALE ("we don't know if this ever ran"),
+        # not "paused" -- that's the code's actual, defensible behavior.
+        config = get_predict_loop_config(session)
+        config.enabled = False
+        config.last_cycle_at = datetime.now(timezone.utc)
+        session.add(config)
+        session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: _status_settings(tmp_path, db_url)
+    try:
+        resp = TestClient(app).get("/", headers=_auth_header("admin", "testpass"))
+        assert "paused" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overview_shows_stale_when_heartbeat_is_old(tmp_path):
+    db_path = tmp_path / "status_stale.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    with Session(engine_) as session:
+        config = get_predict_loop_config(session)
+        config.enabled = True
+        # Default poll_seconds is 3600 -- 5 hours old is well past the 2x threshold.
+        config.last_cycle_at = datetime.now(timezone.utc) - timedelta(hours=5)
+        session.add(config)
+        session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: _status_settings(tmp_path, db_url)
+    try:
+        resp = TestClient(app).get("/", headers=_auth_header("admin", "testpass"))
+        assert "STALE" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overview_shows_running_when_heartbeat_is_fresh(tmp_path):
+    db_path = tmp_path / "status_running.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    with Session(engine_) as session:
+        # Both loops seeded fresh -- predict-loop defaults to enabled=True
+        # with no heartbeat yet, which is legitimately STALE, so it must
+        # also be given a fresh heartbeat here or it'd contaminate the
+        # "nothing stale" assertion below with an unrelated true STALE.
+        get_predict_loop_config(session).last_cycle_at = datetime.now(timezone.utc)
+        config = get_anticipatory_loop_config(session)
+        config.enabled = True
+        config.last_cycle_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        session.add(config)
+        session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: _status_settings(tmp_path, db_url)
+    try:
+        resp = TestClient(app).get("/", headers=_auth_header("admin", "testpass"))
+        assert "running" in resp.text
+        assert "STALE" not in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overview_shows_alpaca_not_configured(tmp_path):
+    db_path = tmp_path / "status_no_alpaca.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    app.dependency_overrides[get_settings] = lambda: _status_settings(tmp_path, db_url)
+    try:
+        resp = TestClient(app).get("/", headers=_auth_header("admin", "testpass"))
+        assert "not set" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_overview_shows_recent_halts(tmp_path):
+    db_path = tmp_path / "status_halts.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    with Session(engine_) as session:
+        record_halt(session, reason="daily drawdown breached", account_equity=9000.0, triggered_by="daily_drawdown")
+
+    app.dependency_overrides[get_settings] = lambda: _status_settings(tmp_path, db_url)
+    try:
+        resp = TestClient(app).get("/", headers=_auth_header("admin", "testpass"))
+        assert "Recent halts" in resp.text
+        assert "daily_drawdown" in resp.text
     finally:
         app.dependency_overrides.clear()
 

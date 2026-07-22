@@ -4,6 +4,42 @@
 <h1>Overview</h1>
 <div class="subtitle">Read-only. Never places, modifies, or cancels an order.</div>
 
+<h1>System status</h1>
+<div class="cards">
+  <div class="card">
+    <div class="label">Kill switch</div>
+    <div class="value {{ 'bad' if status.kill_switch_engaged else 'good' }}">{{ "ENGAGED" if status.kill_switch_engaged else "clear" }}</div>
+  </div>
+  <div class="card">
+    <div class="label">predict-loop</div>
+    <div class="value {{ 'bad' if status.predict_loop.stale else ('good' if status.predict_loop.enabled else '') }}">
+      {{ "STALE" if status.predict_loop.stale else ("running" if status.predict_loop.enabled else "paused") }}
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">anticipatory-loop</div>
+    <div class="value {{ 'bad' if status.anticipatory_loop.stale else ('good' if status.anticipatory_loop.enabled else '') }}">
+      {{ "STALE" if status.anticipatory_loop.stale else ("running" if status.anticipatory_loop.enabled else "paused") }}
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">Alpaca credentials</div>
+    <div class="value {{ 'good' if status.alpaca_configured else 'bad' }}">{{ "configured" if status.alpaca_configured else "not set" }}</div>
+  </div>
+</div>
+<div class="note">
+  predict-loop last check-in: {{ status.predict_loop.last_cycle_display }}
+  &middot; anticipatory-loop last check-in: {{ status.anticipatory_loop.last_cycle_display }}
+</div>
+{% if status.recent_halts %}
+<div class="note" style="color:#e8756c;">
+  Recent halts:
+  {% for h in status.recent_halts %}{{ h.triggered_by }} ({{ h.timestamp.strftime("%Y-%m-%d %H:%M") }}){% if not loop.last %}, {% endif %}{% endfor %}
+  &mdash; see <a href="/risk-events">risk events</a>
+</div>
+{% endif %}
+
+<h1>Account</h1>
 <div class="cards">
   <div class="card">
     <div class="label">Account equity</div>

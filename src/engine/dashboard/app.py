@@ -14,7 +14,7 @@ two settings.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, Request
@@ -40,6 +40,7 @@ from engine.journal.registry import (
     update_anticipatory_loop_config,
     update_predict_loop_config,
 )
+from engine.risk.kill_switch import is_kill_switch_engaged
 
 app = FastAPI(title="Trading engine dashboard")
 _templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -140,9 +141,62 @@ def _prediction_stats(
     }
 
 
+def _format_ago(dt: datetime | None, now: datetime) -> str:
+    if dt is None:
+        return "never"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    seconds = max((now - dt).total_seconds(), 0)
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h ago"
+    return f"{seconds / 86400:.1f}d ago"
+
+
+def _loop_status(config, now: datetime) -> dict:
+    """A loop is "stale" if it hasn't heartbeated within 2x its own poll
+    interval -- generous enough to absorb a slow cycle or a redeploy, but
+    catches a real crash-loop that Railway's ON_FAILURE restart policy
+    would otherwise mask as still "Online"."""
+    last_cycle_at = config.last_cycle_at
+    if last_cycle_at is not None and last_cycle_at.tzinfo is None:
+        last_cycle_at = last_cycle_at.replace(tzinfo=timezone.utc)
+    stale = last_cycle_at is None or (now - last_cycle_at).total_seconds() > 2 * config.poll_seconds
+    return {
+        "enabled": config.enabled,
+        "stale": stale,
+        "last_cycle_display": _format_ago(config.last_cycle_at, now),
+    }
+
+
+def _system_status(settings: Settings) -> dict:
+    """Answers "is everything green for trading to happen right now" --
+    the dashboard's own visibility into the two long-running loops and
+    the kill switch, not just the read-only account snapshot below."""
+    now = datetime.now(timezone.utc)
+    with get_session(settings) as session:
+        # Computed while still inside the session -- the config rows'
+        # attributes expire once the session closes (DetachedInstanceError
+        # on access), so _loop_status must run before that, not after.
+        predict_loop_status = _loop_status(get_predict_loop_config(session), now)
+        anticipatory_loop_status = _loop_status(get_anticipatory_loop_config(session), now)
+        recent_halts = list(load_recent_risk_halts(session, limit=5))
+    return {
+        "kill_switch_engaged": is_kill_switch_engaged(settings),
+        "alpaca_configured": bool(settings.alpaca_api_key and settings.alpaca_api_secret),
+        "predict_loop": predict_loop_status,
+        "anticipatory_loop": anticipatory_loop_status,
+        "recent_halts": recent_halts,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def overview(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
     stats = _prediction_stats(settings)
+    status = _system_status(settings)
 
     equity_display = "n/a"
     open_positions_count = 0
@@ -172,6 +226,7 @@ def overview(request: Request, _user: str = Depends(require_auth), settings: Set
         request,
         "index.html",
         {
+            "status": status,
             "equity_display": equity_display,
             "open_positions_count": open_positions_count,
             "positions": positions,

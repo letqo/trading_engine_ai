@@ -5,6 +5,60 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-22 -- Add: dashboard System Status panel, loop heartbeats, and fixed a genuinely dead audit trail
+
+**Why.** User's own words: "I need to see what's happening, that's the role
+of a dashboard." Also found while diagnosing a real confusion (dashboard
+showed `ALPACA_API_KEY not set` after the user had already set it): the
+`dashboard` Railway service had never actually been given
+`ALPACA_API_KEY`/`ALPACA_API_SECRET` at all -- copied over from
+`predict-loop`, redeployed, confirmed fixed. Worth restating clearly since
+it caused real confusion: the dashboard is read-only and never places
+trades itself, so this only ever broke *display*, never trading capability
+-- predict-loop/worker/anticipatory-loop each hold their own separate
+credential and were unaffected the whole time.
+
+**Two real gaps found while checking what a status panel could honestly
+show, both fixed, not just displayed around:**
+1. **No heartbeat existed.** Nothing recorded "predict-loop last actually
+   ran a cycle at X" -- Railway's `ON_FAILURE` restart policy can show
+   "Online" for a service that's actually crash-looping. Added
+   `last_cycle_at` to `PredictLoopConfig`/`AnticipatoryLoopConfig`
+   (migration `a722f3ec8a05`), stamped once per loop iteration --
+   deliberately *before* the pause check, so a paused-but-alive loop still
+   heartbeats and reads as "paused," not "STALE" (no heartbeat at all
+   correctly still reads as unknown/stale -- a real, defensible distinction
+   surfaced while writing the tests for this).
+2. **`record_halt` was dead code.** Defined, rendered by `/risk-events`,
+   never once called. A real kill-switch or daily-drawdown halt in
+   `papertrade`/`predict-loop`/`anticipatory-loop` would flatten positions
+   and log to Railway's own logs, but the dashboard's audit trail would
+   stay empty forever. Wired up at all six halt points (kill-switch +
+   drawdown breach, x3 loops).
+
+**Dashboard:** new "System status" section on `/` (overview) -- kill
+switch (engaged/clear), each loop's enabled/paused + last-heartbeat with a
+staleness check (no heartbeat within 2x its own poll interval = STALE),
+Alpaca credential presence, and recent halts (now actually populated).
+
+**One bug caught before it shipped, same class as the enum migration
+bug earlier this session:** `_system_status()` initially returned
+`PredictLoopConfig`/`AnticipatoryLoopConfig` ORM objects fetched inside a
+`with get_session(...)` block, for use in the template *after* that block
+closed -- SQLAlchemy expires all of a session's tracked objects on
+`commit()`, so any attribute access after the session closes raises
+`DetachedInstanceError`. Same bug independently resurfaced in
+`mark_predict_loop_cycle`/`mark_anticipatory_loop_cycle`'s own commit
+expiring the `config` object the CLI loops keep reading for many lines
+after the session block closes (`config.enabled`, `config.poll_seconds`,
+etc.) -- 13 CLI tests caught this immediately. Fixed by having both mark_*
+functions `session.refresh()` and return the row directly, so callers get
+one already-fresh object instead of a separate, now-stale one.
+
+**Full test suite: 301 passed** (up from 292), `ruff check` clean.
+
+---
+
 ## 2026-07-22 -- Add: Anticipatory Prediction Mode (Polymarket-calibrated), first implementation
 
 **What changed.** Built the full design in `docs/anticipatory_prediction_mode.md`

@@ -193,6 +193,14 @@ def test_predict_loop_stops_immediately_when_kill_switch_engaged(monkeypatch, tm
     assert fake_broker.canceled is True
     assert fake_broker.closed is True
 
+    from engine.journal.db import get_session
+    from engine.journal.registry import load_recent_risk_halts
+
+    with get_session(get_settings()) as session:
+        halts = load_recent_risk_halts(session)
+    assert len(halts) == 1
+    assert halts[0].triggered_by == "kill_switch"
+
 
 def test_predict_loop_respects_max_iterations_in_log_only_mode(monkeypatch, tmp_path):
     _isolated_env(monkeypatch, tmp_path)
@@ -309,6 +317,14 @@ def test_predict_loop_pause_skips_cycle_body_but_keeps_looping(monkeypatch, tmp_
     assert result.exit_code == 0, result.stdout
     assert "predict-loop stopped" in result.stdout
     assert calls == []
+
+    from engine.journal.registry import get_predict_loop_config
+
+    with get_session(get_settings()) as session:
+        # Heartbeat must still update while paused -- it's the dashboard's
+        # only way to distinguish "paused on purpose" from "crashed and
+        # Railway's restart policy is masking it."
+        assert get_predict_loop_config(session).last_cycle_at is not None
 
 
 def test_predict_loop_respects_headlines_per_source_quota(monkeypatch, tmp_path):
@@ -488,6 +504,14 @@ def test_anticipatory_loop_stops_immediately_when_kill_switch_engaged(monkeypatc
     assert fake_broker.canceled is True
     assert fake_broker.closed is True
 
+    from engine.journal.db import get_session
+    from engine.journal.registry import load_recent_risk_halts
+
+    with get_session(get_settings()) as session:
+        halts = load_recent_risk_halts(session)
+    assert len(halts) == 1
+    assert halts[0].triggered_by == "kill_switch"
+
 
 def test_anticipatory_loop_respects_max_iterations_in_log_only_mode(monkeypatch, tmp_path):
     _isolated_env(monkeypatch, tmp_path)
@@ -521,6 +545,11 @@ def test_anticipatory_loop_pause_skips_cycle_body_but_keeps_looping(monkeypatch,
     result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "3", "--poll-seconds", "0"])
     assert result.exit_code == 0, result.stdout
     assert calls == []  # cycle body never ran while paused
+
+    from engine.journal.registry import get_anticipatory_loop_config
+
+    with get_session(get_settings()) as session:
+        assert get_anticipatory_loop_config(session).last_cycle_at is not None
 
 
 def test_anticipatory_loop_discovers_and_scores_a_relevant_hypothesis(monkeypatch, tmp_path):

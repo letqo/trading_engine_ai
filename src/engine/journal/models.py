@@ -286,6 +286,12 @@ class PredictLoopConfig(SQLModel, table=True):
 
     id: str = Field(default="singleton", primary_key=True)
     updated_at: datetime = Field(default_factory=_now)
+    # Stamped once per loop iteration (paused or not) -- distinct from
+    # updated_at, which only changes when a setting is edited. This is the
+    # dashboard's only way to tell "the process is alive and iterating"
+    # from "Railway says Online but it's actually crash-looping" (the
+    # ON_FAILURE restart policy masks that distinction otherwise).
+    last_cycle_at: datetime | None = Field(default=None)
 
     enabled: bool = Field(default=True)  # False = pause cycle body only, loop keeps polling
     poll_seconds: int = Field(default=3600)
@@ -380,6 +386,7 @@ class AnticipatoryLoopConfig(SQLModel, table=True):
 
     id: str = Field(default="singleton", primary_key=True)
     updated_at: datetime = Field(default_factory=_now)
+    last_cycle_at: datetime | None = Field(default=None)  # see PredictLoopConfig's docstring
 
     enabled: bool = Field(default=True)
     poll_seconds: int = Field(default=3600)

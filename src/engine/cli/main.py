@@ -38,6 +38,9 @@ from engine.journal.registry import (
     load_off_universe_symbol_stats,
     load_open_hypotheses,
     load_prediction_trades,
+    mark_anticipatory_loop_cycle,
+    mark_predict_loop_cycle,
+    record_halt,
     record_metrics,
     record_news_item,
     record_reconciliation,
@@ -673,6 +676,8 @@ def papertrade(
             alert_kill_switch(settings)
             client.cancel_all_orders()
             client.close_all_positions()
+            with get_session(settings) as session:
+                record_halt(session, reason="kill switch engaged", account_equity=account.equity, triggered_by="kill_switch")
             break
 
         try:
@@ -693,6 +698,8 @@ def papertrade(
                 alert_risk_halt(settings, account.halt_reason)
                 client.cancel_all_orders()
                 client.close_all_positions()
+                with get_session(settings) as session:
+                    record_halt(session, reason=account.halt_reason or "daily drawdown breached", account_equity=account.equity, triggered_by="daily_drawdown")
                 break
 
             if strategy_obj is not None:
@@ -806,10 +813,12 @@ def predict_loop(
                 risk_gate.trigger_kill_switch(account, reason="kill switch engaged")
                 broker.cancel_all_orders()
                 broker.close_all_positions()
+                with get_session(settings) as session:
+                    record_halt(session, reason="kill switch engaged", account_equity=account.equity, triggered_by="kill_switch")
             break
 
         with get_session(settings) as session:
-            config = get_predict_loop_config(session)
+            config = mark_predict_loop_cycle(session)
 
         if not config.enabled:
             logger.info("predict-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds}})
@@ -873,6 +882,8 @@ def predict_loop(
                     alert_risk_halt(settings, account.halt_reason)
                     broker.cancel_all_orders()
                     broker.close_all_positions()
+                    with get_session(settings) as session:
+                        record_halt(session, reason=account.halt_reason or "daily drawdown breached", account_equity=account.equity, triggered_by="daily_drawdown")
                     break
 
                 with get_session(settings) as session:
@@ -978,10 +989,12 @@ def anticipatory_loop(
                 risk_gate.trigger_kill_switch(account, reason="kill switch engaged")
                 broker.cancel_all_orders()
                 broker.close_all_positions()
+                with get_session(settings) as session:
+                    record_halt(session, reason="kill switch engaged", account_equity=account.equity, triggered_by="kill_switch")
             break
 
         with get_session(settings) as session:
-            config = get_anticipatory_loop_config(session)
+            config = mark_anticipatory_loop_cycle(session)
 
         if not config.enabled:
             logger.info("anticipatory-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds}})
@@ -1023,6 +1036,8 @@ def anticipatory_loop(
                     alert_risk_halt(settings, account.halt_reason)
                     broker.cancel_all_orders()
                     broker.close_all_positions()
+                    with get_session(settings) as session:
+                        record_halt(session, reason=account.halt_reason or "daily drawdown breached", account_equity=account.equity, triggered_by="daily_drawdown")
                     break
 
                 with get_session(settings) as session:

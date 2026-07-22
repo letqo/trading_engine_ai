@@ -7,6 +7,7 @@ from engine.journal.registry import (
     load_latest_beliefs_by_hypothesis,
     load_open_hypotheses,
     load_recent_hypotheses,
+    mark_anticipatory_loop_cycle,
     mark_hypothesis_flat,
     mark_hypothesis_traded,
     record_hypothesis_belief,
@@ -37,6 +38,18 @@ def test_update_anticipatory_loop_config_persists_partial_changes(db_session):
     reloaded = get_anticipatory_loop_config(db_session)
     assert reloaded.enabled is False
     assert reloaded.min_gap_threshold == 0.1
+
+
+def test_mark_anticipatory_loop_cycle_stamps_last_cycle_at_without_touching_updated_at(db_session):
+    original = get_anticipatory_loop_config(db_session)
+    assert original.last_cycle_at is None
+    original_updated_at = original.updated_at
+
+    mark_anticipatory_loop_cycle(db_session)
+
+    refreshed = get_anticipatory_loop_config(db_session)
+    assert refreshed.last_cycle_at is not None
+    assert refreshed.updated_at == original_updated_at
 
 
 def test_hypothesis_exists_for_market_dedup(db_session):

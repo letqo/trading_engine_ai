@@ -12,6 +12,7 @@ from engine.journal.registry import (
     load_pending_predictions_past_window,
     load_prediction_trades,
     load_resolved_predictions_by_topics,
+    mark_predict_loop_cycle,
     mark_prediction_exited,
     mark_prediction_traded,
     record_prediction,
@@ -296,6 +297,20 @@ def test_update_predict_loop_config_updates_given_fields_and_bumps_updated_at(db
     # Fields not passed must be left untouched.
     assert updated.poll_seconds == original.poll_seconds
     assert updated.updated_at >= original_updated_at
+
+
+def test_mark_predict_loop_cycle_stamps_last_cycle_at_without_touching_updated_at(db_session):
+    original = get_predict_loop_config(db_session)
+    assert original.last_cycle_at is None
+    original_updated_at = original.updated_at
+
+    mark_predict_loop_cycle(db_session)
+
+    refreshed = get_predict_loop_config(db_session)
+    assert refreshed.last_cycle_at is not None
+    # Heartbeat is a distinct signal from "a setting was edited" -- must
+    # not bump updated_at, or the dashboard couldn't tell the two apart.
+    assert refreshed.updated_at == original_updated_at
 
 
 def _record_with_headline(session, headline, symbol="SPY", decision_ts=NOW):
