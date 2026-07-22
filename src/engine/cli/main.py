@@ -83,6 +83,16 @@ NEWS_DRIVEN_STRATEGIES = {"dumb_news", "overnight_gap"}
 # -- backtest-only by design, not eligible for `papertrade --strategy`.
 LIVE_ELIGIBLE_STRATEGIES = {"dumb_news", "overnight_gap", "momentum", "mean_reversion", "multi_factor"}
 
+# How often a *paused* predict-loop/anticipatory-loop re-checks
+# PredictLoopConfig/AnticipatoryLoopConfig.enabled, instead of sleeping the
+# full poll_seconds -- poll_seconds is the cost-control gap between real
+# (paid) cycles, not how long it should take to notice you re-enabled the
+# loop. Without this, re-enabling mid-sleep could wait out nearly an
+# entire poll_seconds (up to hours) before the next enabled check. Capped
+# at poll_seconds itself (via min()) so a short poll_seconds -- e.g. 0 in
+# tests -- never makes the paused case slower than the enabled case.
+PAUSED_RECHECK_SECONDS = 30
+
 def _int_cast(kw: dict, *keys: str) -> dict:
     return {k: (int(v) if k in keys else v) for k, v in kw.items()}
 
@@ -775,8 +785,12 @@ def predict_loop(
     (close_stopped_prediction_trades), both of which keep running every
     cycle regardless of pause state, since an already-open position needs
     the same protection whether or not the loop is currently deciding
-    anything new. The loop keeps polling while paused so it resumes the
-    instant it's re-enabled, no redeploy either way.
+    anything new. While paused, the loop re-checks `enabled` every
+    PAUSED_RECHECK_SECONDS (30s) instead of sleeping the full
+    poll_seconds -- poll_seconds is the cost-control gap between real
+    (paid) cycles, not how long re-enabling should take to notice. Once
+    actually running, the full poll_seconds applies between cycles as
+    normal.
     """
     settings = get_settings()
     try:
@@ -934,7 +948,7 @@ def predict_loop(
         iteration += 1
         if max_iterations is not None and iteration >= max_iterations:
             break
-        time.sleep(config.poll_seconds)
+        time.sleep(config.poll_seconds if config.enabled else min(config.poll_seconds, PAUSED_RECHECK_SECONDS))
 
     logger.info("predict-loop stopped")
 
@@ -970,6 +984,8 @@ def anticipatory_loop(
     acting (the paid LLM calls) -- the daily-drawdown check and the
     per-position stop-loss sweep (flatten_stopped_hypotheses) keep running
     every cycle regardless, same reasoning as predict-loop's docstring.
+    Also mirrors predict-loop's PAUSED_RECHECK_SECONDS behavior: re-enabling
+    takes effect within ~30s, not up to a full poll_seconds later.
     """
     settings = get_settings()
     try:
@@ -1097,7 +1113,7 @@ def anticipatory_loop(
         iteration += 1
         if max_iterations is not None and iteration >= max_iterations:
             break
-        time.sleep(config.poll_seconds)
+        time.sleep(config.poll_seconds if config.enabled else min(config.poll_seconds, PAUSED_RECHECK_SECONDS))
 
     logger.info("anticipatory-loop stopped")
 

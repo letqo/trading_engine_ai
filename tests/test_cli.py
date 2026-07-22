@@ -327,6 +327,30 @@ def test_predict_loop_pause_skips_cycle_body_but_keeps_looping(monkeypatch, tmp_
         assert get_predict_loop_config(session).last_cycle_at is not None
 
 
+def test_predict_loop_paused_rechecks_frequently_instead_of_full_poll_interval(monkeypatch, tmp_path):
+    # A paused loop must not wait out a full (possibly hours-long)
+    # poll_seconds before noticing it's been re-enabled from the
+    # dashboard -- sleep while paused must be capped at
+    # PAUSED_RECHECK_SECONDS regardless of how large poll_seconds is.
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+
+    from engine.journal.db import get_session
+    from engine.journal.registry import update_predict_loop_config
+
+    with get_session(get_settings()) as session:
+        update_predict_loop_config(session, enabled=False)
+
+    sleep_calls = []
+    monkeypatch.setattr("engine.cli.main.time.sleep", lambda s: sleep_calls.append(s))
+
+    import engine.cli.main as cli_main
+
+    result = runner.invoke(app, ["predict-loop", "--max-iterations", "2", "--poll-seconds", "3600"])
+    assert result.exit_code == 0, result.stdout
+    assert sleep_calls == [cli_main.PAUSED_RECHECK_SECONDS]  # not the full 3600s poll interval
+
+
 def test_predict_loop_daily_drawdown_still_halts_while_paused(monkeypatch, tmp_path):
     # The daily-drawdown breach check must not be skipped just because
     # PredictLoopConfig.enabled=False -- an already-open position still
@@ -590,6 +614,29 @@ def test_anticipatory_loop_pause_skips_cycle_body_but_keeps_looping(monkeypatch,
 
     with get_session(get_settings()) as session:
         assert get_anticipatory_loop_config(session).last_cycle_at is not None
+
+
+def test_anticipatory_loop_paused_rechecks_frequently_instead_of_full_poll_interval(monkeypatch, tmp_path):
+    # Mirrors test_predict_loop_paused_rechecks_frequently_instead_of_full_poll_interval.
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("engine.cli.main.build_prediction_client", _FakePredictionClient)
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_candidate_markets", lambda limit: [])
+    monkeypatch.setattr("engine.anticipatory.pipeline.fetch_market_price", lambda market_id: None)
+
+    from engine.journal.db import get_session
+    from engine.journal.registry import update_anticipatory_loop_config
+
+    with get_session(get_settings()) as session:
+        update_anticipatory_loop_config(session, enabled=False)
+
+    sleep_calls = []
+    monkeypatch.setattr("engine.cli.main.time.sleep", lambda s: sleep_calls.append(s))
+
+    import engine.cli.main as cli_main
+
+    result = runner.invoke(app, ["anticipatory-loop", "--max-iterations", "2", "--poll-seconds", "10800"])
+    assert result.exit_code == 0, result.stdout
+    assert sleep_calls == [cli_main.PAUSED_RECHECK_SECONDS]  # not the full 10800s (3h) poll interval
 
 
 def test_anticipatory_loop_daily_drawdown_still_halts_while_paused(monkeypatch, tmp_path):

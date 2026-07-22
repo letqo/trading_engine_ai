@@ -1139,4 +1139,61 @@ fix -- two new CLI-level integration tests
 `enabled=False`, simulate a 10% equity drop via a broker fake, and assert
 the loop still halts, flattens, and records the halt -- proving the old
 bug would have failed these tests before the restructure.
-project actually works, not just that it's technically running.
+
+**Deployment note:** the automatic git-push-triggered deploy, and several
+follow-up `railway redeploy` attempts, all built a valid image cleanly but
+then failed to actually start a container -- zero container logs ever
+appeared for the new deployment, across all four services simultaneously.
+`railway redeploy` also refused ("cannot be redeployed... currently
+building, deploying, or was removed") even once the failed attempt had
+settled. Nothing was broken in production throughout -- all four services
+stayed Online, serving the prior successful deployment (dashboard
+`/health` kept returning 200) -- so this was a stuck-rollout problem, not
+an outage. Resolved by `railway up --service <name> --detach` (a fresh
+manual upload/deploy) for each of the four services individually, which
+succeeded where both the automatic deploy and `redeploy` had not.
+Confirmed via real log output (the "paused" log line now includes the new
+`stopped=` field) that the redeployed containers were actually running
+the new code, not just reporting Online.
+
+## 2026-07-23 -- Fix: re-enabling a paused loop could take up to a full poll interval (hours) to take effect
+
+Found via the user's own reaction after using the fix above: they
+enabled both loops from the dashboard, then asked why no new predictions/
+hypotheses appeared. Checked production directly -- both configs really
+were `enabled=True`, but `last_cycle_at` on each was still from *before*
+they'd re-enabled it. Root cause: the pause-recheck fix earlier in this
+file made the risk block (drawdown check, stop-loss sweep) run every
+cycle regardless of pause state, but the loop still only *checks*
+`config.enabled` once per iteration, and the iteration cadence itself was
+still `time.sleep(config.poll_seconds)` unconditionally -- paused or not.
+So flipping `enabled` mid-sleep did nothing until whatever was left of
+that sleep finished, which could be nearly a full poll_seconds (up to 3
+hours for anticipatory-loop's default) after the toggle, not "the next
+few seconds" a user would reasonably expect from something they just
+turned on.
+
+**Fix:** `poll_seconds` should mean "the cost-control gap between real
+(paid) cycles," not "how long it takes to notice you re-enabled the
+loop" -- those are different concerns that happened to share one sleep
+call. Added `PAUSED_RECHECK_SECONDS = 30` (`engine/cli/main.py`) and
+changed both loops' final sleep to
+`config.poll_seconds if config.enabled else min(config.poll_seconds,
+PAUSED_RECHECK_SECONDS)` -- while paused, the loop now re-checks
+`enabled` roughly every 30s instead of sleeping the full interval; once
+actually running, the full poll_seconds still applies between cycles as
+before. The `min()` also means test suites that seed `poll_seconds=0`
+(via the CLI seed flag, for fast tests) see no behavior change --
+`min(0, 30) == 0` either way. Not made dashboard-configurable: unlike
+poll_seconds (a real cost lever), this is an internal implementation
+detail with no cost implication either way (a single-row DB read every
+30s is negligible), so exposing it as a tunable would be needless
+surface area.
+
+New CLI-level tests (`test_predict_loop_paused_rechecks_frequently
+_instead_of_full_poll_interval`, `test_anticipatory_loop_paused
+_rechecks_frequently_instead_of_full_poll_interval`) patch `time.sleep`
+to record what duration it's actually called with, set a large
+poll_seconds (3600s / 10800s) with the loop paused, and assert the
+recorded sleep call is `PAUSED_RECHECK_SECONDS`, not the full interval --
+proving the old bug would have failed these tests too.
