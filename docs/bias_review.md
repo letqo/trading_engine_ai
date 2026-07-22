@@ -178,3 +178,46 @@ strategy in this repo can place a real order outside the backtester.
      JOURNAL.md and SPEC.md's anti-self-deception protocol. Treat any
      live results from this wiring as informal until that comparison
      happens.
+
+## Metrics computation (`engine.backtest.metrics.sharpe_ratio`) — 2026-07-22
+
+Not a per-strategy review -- this is a correctness bug in the shared scoring
+function every backtest above is judged by, found while verifying the
+2026-07-21 walk-forward suite result (JOURNAL.md: "no strategy beat both
+baselines on validation Sharpe") before trusting it for anything downstream.
+
+1. **The bug:** `sharpe_ratio` annualized with a hardcoded
+   `periods_per_year=252` (one point per trading day), and nothing in the
+   codebase ever overrode it. But `BacktestEngine` appends one `EquityPoint`
+   per `BAR` *event*, and `build_event_stream` emits one `BAR` event per
+   `(symbol, timestamp)` pair -- a full-universe backtest (27 symbols)
+   produces ~27 equity points per calendar day, not 1, and
+   `overnight_gap`'s dev/validation runs used hourly bars on top of that.
+   `sqrt(252)` was the wrong annualization factor for either case.
+2. **Why it isn't obviously a look-ahead or survivorship issue:** it's a
+   pure scoring-function bug, not a data-leakage one -- every strategy and
+   both baselines were scored with the *same* wrong formula, so this isn't
+   asymmetric the way look-ahead/survivorship bias usually is. It's
+   documented here rather than skipped specifically because "wrong
+   computation can lead to false conclusions" independent of bias in the
+   traditional sense.
+3. **The fix:** `sharpe_ratio` now (a) collapses same-timestamp
+   `EquityPoint`s to the last one seen before computing returns, so a
+   multi-symbol universe's per-symbol bar events don't inflate the return
+   series, and (b) derives `periods_per_year` from the curve's own elapsed
+   wall-clock time (against 365.25 calendar days/year) instead of a caller-
+   supplied constant, so daily and hourly runs are each annualized
+   correctly without a call site needing to remember which constant to
+   pass. See `tests/test_metrics.py` for hand-computed cases (previously
+   `sharpe_ratio` had zero test coverage despite this module's stated goal
+   of hand-verifiable tests for every function).
+4. **What this does and doesn't tell us about the 2026-07-21 result:**
+   because the bug applied uniformly to all 5 strategies + 2 baselines in
+   both tables, it may not flip the qualitative "no strategy beat both
+   baselines" ranking -- but different strategies hold different symbol
+   subsets with different correlation structure, so the distortion isn't
+   guaranteed to be identical in magnitude across rows either. The fix
+   alone doesn't tell us the answer; only raw equity curves were never
+   persisted (`ExperimentRun` stores summary metrics only), the dev and
+   validation walk-forward runs need to be redone with the corrected metric
+   before the 2026-07-21 result can be treated as confirmed either way.

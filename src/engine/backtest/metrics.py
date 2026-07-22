@@ -53,11 +53,53 @@ def max_drawdown_pct(equity_curve: list[EquityPoint]) -> float:
     return worst * 100.0
 
 
-def sharpe_ratio(equity_curve: list[EquityPoint], periods_per_year: float = 252.0) -> float:
-    if len(equity_curve) < 3:
+def _dedupe_by_timestamp(equity_curve: list[EquityPoint]) -> list[EquityPoint]:
+    """Collapse same-timestamp points to the last one seen. The engine
+    appends one EquityPoint per BAR event, and a multi-symbol universe emits
+    one BAR event per (symbol, timestamp) pair even when many symbols share
+    the same timestamp (e.g. every symbol's daily bar closes at the same
+    calendar day) -- only the last point at a given timestamp reflects the
+    fully mark-to-market portfolio once every symbol at that instant has
+    been processed. build_event_stream sorts globally by timestamp, so
+    same-timestamp points are always contiguous here."""
+    deduped: list[EquityPoint] = []
+    for point in equity_curve:
+        if deduped and deduped[-1].timestamp == point.timestamp:
+            deduped[-1] = point
+        else:
+            deduped.append(point)
+    return deduped
+
+
+def sharpe_ratio(equity_curve: list[EquityPoint]) -> float:
+    """Annualized Sharpe of the (deduplicated) mark-to-market equity curve.
+
+    periods_per_year is derived from the curve's own timestamps rather than
+    a caller-supplied constant. A previous version hardcoded 252 (one point
+    per trading day) and nothing ever overrode it -- silently wrong for
+    anything not literally one EquityPoint per calendar day, which in
+    practice included every backtest ever run here (a multi-symbol universe
+    produces many same-timestamp points per day, and interval="1h" runs
+    produce many points per day at hourly spacing). Deriving the factor from
+    real elapsed time between (deduplicated) points is correct regardless of
+    bar frequency, and removes an entire class of bug where a future call
+    site forgets to pass the right constant for its own data's frequency.
+
+    Deliberate choice: annualizes against 365.25 calendar days/year, not the
+    conventional ~252 trading days/year. Using elapsed wall-clock time
+    between real data points needs no trading-calendar knowledge (market
+    holidays, weekends, exchange hours) to get right; a trading-day
+    convention would require exactly that. This makes the absolute Sharpe
+    magnitude slightly different from a strict trading-day annualization
+    even for genuinely-daily equity curves, but it is comparable across
+    every strategy/baseline pair here, which is what a validation
+    comparison actually needs.
+    """
+    resampled = _dedupe_by_timestamp(equity_curve)
+    if len(resampled) < 3:
         return 0.0
     returns = []
-    for prev, curr in zip(equity_curve, equity_curve[1:]):
+    for prev, curr in zip(resampled, resampled[1:]):
         if prev.equity == 0:
             continue
         returns.append((curr.equity - prev.equity) / prev.equity)
@@ -68,6 +110,11 @@ def sharpe_ratio(equity_curve: list[EquityPoint], periods_per_year: float = 252.
     std = math.sqrt(variance)
     if std == 0:
         return 0.0
+
+    total_days = (resampled[-1].timestamp - resampled[0].timestamp).total_seconds() / 86400.0
+    if total_days <= 0:
+        return 0.0
+    periods_per_year = len(returns) / total_days * 365.25
     return (mean / std) * math.sqrt(periods_per_year)
 
 
