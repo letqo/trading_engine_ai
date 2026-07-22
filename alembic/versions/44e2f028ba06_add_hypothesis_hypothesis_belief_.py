@@ -36,14 +36,19 @@ def upgrade() -> None:
     sa.Column('market_id', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
     sa.Column('question', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
     sa.Column('symbol', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
-    # create_type=False: 'predictiondirection' already exists -- created by
-    # 26dca4757036_add_prediction_table's Prediction.direction column. A
-    # fresh sa.Enum() here defaults to create_type=True and would emit
-    # CREATE TYPE again (fails on Postgres: type already exists) and, on
-    # downgrade, DROP TYPE (would break prediction.direction, which still
-    # uses it). SQLite has no native enum type so this only ever bites in
-    # production Postgres, not the local/test suite.
-    sa.Column('direction_if_yes', sa.Enum('UP', 'DOWN', name='predictiondirection', create_type=False), nullable=False),
+    # Created as plain VARCHAR here, then ALTERed to the existing
+    # 'predictiondirection' enum type via raw SQL below -- NOT
+    # sa.Enum(..., create_type=False) inline. That flag turned out not to
+    # reliably suppress SQLAlchemy's CREATE TYPE emission for a Postgres
+    # ENUM referenced by name from a fresh sa.Enum() instance inside
+    # op.create_table (confirmed against real production Postgres:
+    # DuplicateObject: type "predictiondirection" already exists, even
+    # with create_type=False set) -- 'predictiondirection' already exists,
+    # created by 26dca4757036_add_prediction_table's Prediction.direction
+    # column. Raw ALTER COLUMN TYPE sidesteps the DDL compiler's
+    # visit_enum path entirely. SQLite has no native enum type so this
+    # only ever bites in production Postgres, not the local/test suite.
+    sa.Column('direction_if_yes', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
     sa.Column('status', sa.Enum('OPEN', 'CLOSED', name='hypothesisstatus'), nullable=False),
     sa.Column('closed_at', sa.DateTime(), nullable=True),
     sa.Column('resolution_outcome', sa.Boolean(), nullable=True),
@@ -53,6 +58,11 @@ def upgrade() -> None:
     sa.Column('exit_order_id', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
+    if op.get_bind().dialect.name == "postgresql":
+        op.execute(
+            "ALTER TABLE hypothesis ALTER COLUMN direction_if_yes TYPE predictiondirection "
+            "USING direction_if_yes::predictiondirection"
+        )
     op.create_index(op.f('ix_hypothesis_market_id'), 'hypothesis', ['market_id'], unique=True)
     op.create_index(op.f('ix_hypothesis_status'), 'hypothesis', ['status'], unique=False)
     op.create_index(op.f('ix_hypothesis_symbol'), 'hypothesis', ['symbol'], unique=False)
