@@ -5,6 +5,7 @@ from sqlmodel import select
 from engine.journal.models import PredictionDirection, PredictionStatus, PredictionTopic
 from engine.journal.registry import (
     get_predict_loop_config,
+    get_risk_gate_config,
     headline_near_duplicate,
     load_actionable_predictions,
     load_expired_open_trades,
@@ -18,6 +19,7 @@ from engine.journal.registry import (
     record_prediction,
     resolve_prediction,
     update_predict_loop_config,
+    update_risk_gate_config,
 )
 
 NOW = datetime(2026, 7, 20, tzinfo=timezone.utc)
@@ -311,6 +313,31 @@ def test_mark_predict_loop_cycle_stamps_last_cycle_at_without_touching_updated_a
     # Heartbeat is a distinct signal from "a setting was edited" -- must
     # not bump updated_at, or the dashboard couldn't tell the two apart.
     assert refreshed.updated_at == original_updated_at
+
+
+def test_get_risk_gate_config_defaults_to_use_defaults_true(db_session):
+    config = get_risk_gate_config(db_session)
+    assert config.use_defaults is True
+    assert config.max_capital_per_position_pct == 0.05  # mirrors RiskLimits' own default
+
+
+def test_update_risk_gate_config_persists_overrides_and_flips_use_defaults(db_session):
+    updated = update_risk_gate_config(
+        db_session,
+        use_defaults=False,
+        max_capital_per_position_pct=0.1,
+        max_total_exposure_pct=0.3,
+        stop_loss_pct=0.04,
+        max_daily_drawdown_pct=0.05,
+        max_consecutive_losses_per_day=6,
+        allow_overnight_positions=True,
+    )
+    assert updated.use_defaults is False
+    assert updated.max_capital_per_position_pct == 0.1
+    assert updated.allow_overnight_positions is True
+
+    refreshed = get_risk_gate_config(db_session)
+    assert refreshed.max_capital_per_position_pct == 0.1  # persisted, not just returned in-memory
 
 
 def _record_with_headline(session, headline, symbol="SPY", decision_ts=NOW):

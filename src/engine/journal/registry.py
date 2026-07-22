@@ -28,6 +28,7 @@ from engine.journal.models import (
     PredictionStatus,
     PredictionTopic,
     ReconciliationReport,
+    RiskGateConfig,
     RiskHaltEvent,
     RunMode,
     TradeRecord,
@@ -336,6 +337,30 @@ def get_predict_loop_config(session: Session) -> PredictLoopConfig:
 
 def update_predict_loop_config(session: Session, **fields) -> PredictLoopConfig:
     row = get_predict_loop_config(session)
+    for key, value in fields.items():
+        setattr(row, key, value)
+    row.updated_at = datetime.now(timezone.utc)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def get_risk_gate_config(session: Session) -> RiskGateConfig:
+    """Live-tunable RiskGate override, read fresh by every live trading
+    path before each RiskGate is built/refreshed -- same get-or-create
+    singleton pattern as get_predict_loop_config, see its docstring."""
+    row = session.get(RiskGateConfig, RiskGateConfig.SINGLETON_ID)
+    if row is None:
+        row = RiskGateConfig(id=RiskGateConfig.SINGLETON_ID)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row
+
+
+def update_risk_gate_config(session: Session, **fields) -> RiskGateConfig:
+    row = get_risk_gate_config(session)
     for key, value in fields.items():
         setattr(row, key, value)
     row.updated_at = datetime.now(timezone.utc)

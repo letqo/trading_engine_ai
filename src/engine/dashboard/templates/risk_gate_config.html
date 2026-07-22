@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Risk gate config{% endblock %}
+{% block content %}
+<h1>Risk gate config</h1>
+<div class="subtitle">Live-tunable -- every live trading path (papertrade, predict-loop, anticipatory-loop, act-on-predictions, resolve-predictions) reads this fresh before each order. Backtests always use env defaults, never this, so results stay reproducible. Fractions, not percentages (0.05 = 5%).</div>
+{% if saved %}<div class="note">Saved.</div>{% endif %}
+<div class="note">Env defaults (used whenever "use defaults" below is checked): max capital/position {{ "%.2f"|format(env_defaults.max_capital_per_position_pct) }}, max total exposure {{ "%.2f"|format(env_defaults.max_total_exposure_pct) }}, stop loss {{ "%.2f"|format(env_defaults.stop_loss_pct) }}, max daily drawdown {{ "%.2f"|format(env_defaults.max_daily_drawdown_pct) }}, max consecutive losses/day {{ env_defaults.max_consecutive_losses_per_day }}, allow overnight positions {{ env_defaults.allow_overnight_positions }}.</div>
+<form method="post" action="/risk-gate-config">
+  <label>
+    <input type="checkbox" name="use_defaults" {% if config.use_defaults %}checked{% endif %}>
+    Use defaults (checked = ignore the overrides below entirely and enforce the env-configured limits shown above; uncheck to enforce the manual overrides instead. Toggling back to defaults does not discard the values below.)
+  </label>
+  <label>
+    Max capital per position (fraction of equity)
+    <input type="number" step="0.01" name="max_capital_per_position_pct" value="{{ config.max_capital_per_position_pct }}" min="0" max="1" required>
+  </label>
+  <label>
+    Max total exposure (fraction of equity, across all positions)
+    <input type="number" step="0.01" name="max_total_exposure_pct" value="{{ config.max_total_exposure_pct }}" min="0" max="1" required>
+  </label>
+  <label>
+    Stop loss (fraction adverse move that triggers an exit)
+    <input type="number" step="0.01" name="stop_loss_pct" value="{{ config.stop_loss_pct }}" min="0" max="1" required>
+  </label>
+  <label>
+    Max daily drawdown (fraction of session-start equity; breach halts and flattens everything)
+    <input type="number" step="0.01" name="max_daily_drawdown_pct" value="{{ config.max_daily_drawdown_pct }}" min="0" max="1" required>
+  </label>
+  <label>
+    Max consecutive losses per day (breach halts and flattens everything)
+    <input type="number" name="max_consecutive_losses_per_day" value="{{ config.max_consecutive_losses_per_day }}" min="1" required>
+  </label>
+  <label>
+    <input type="checkbox" name="allow_overnight_positions" {% if config.allow_overnight_positions %}checked{% endif %}>
+    Allow overnight positions
+  </label>
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

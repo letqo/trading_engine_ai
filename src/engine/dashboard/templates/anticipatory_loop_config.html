@@ -22,6 +22,10 @@
     <input type="number" name="max_open_hypotheses" value="{{ config.max_open_hypotheses }}" min="1" required>
   </label>
   <label>
+    Max open hypotheses per symbol (Polymarket often splits one commodity into several threshold markets -- e.g. "hit $110" and "hit $120" -- that all map to the same symbol; this stops one instrument from eating the whole budget above on correlated bets)
+    <input type="number" name="max_open_hypotheses_per_symbol" value="{{ config.max_open_hypotheses_per_symbol }}" min="1" required>
+  </label>
+  <label>
     Discovery limit (candidate Polymarket events considered per discovery sweep)
     <input type="number" name="discovery_limit" value="{{ config.discovery_limit }}" min="1" required>
   </label>

@@ -4,12 +4,15 @@ not imported here. The only broker calls made are AlpacaPaperClient's read
 methods (get_account_equity, get_positions), same as any other dashboard
 consumer of a paper account's public state.
 
-The exceptions are /predict-loop-config and /anticipatory-loop-config:
-GET/POST pairs that read and write PredictLoopConfig/AnticipatoryLoopConfig
-(poll interval, thresholds, pause/resume). Either can pause or retune its
-respective research loop, but neither can place or cancel an order -- same
-trust boundary as everything else here, just no longer read-only for those
-two settings.
+The exceptions are /predict-loop-config, /anticipatory-loop-config, and
+/risk-gate-config: GET/POST pairs that read and write PredictLoopConfig/
+AnticipatoryLoopConfig/RiskGateConfig (poll interval, thresholds,
+pause/resume, position/exposure/drawdown caps). Each can pause or retune
+its respective research loop or risk limits, but none can place or cancel
+an order directly -- same trust boundary as everything else here, just no
+longer read-only for those settings. RiskGateConfig itself is inert until
+a live trading path (engine.risk.resolve.resolve_risk_limits) reads it and
+builds a RiskGate from it -- this module never constructs a RiskGate.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from engine.journal.models import Prediction, PredictionStatus
 from engine.journal.registry import (
     get_anticipatory_loop_config,
     get_predict_loop_config,
+    get_risk_gate_config,
     load_latest_beliefs_by_hypothesis,
     load_off_universe_symbol_stats,
     load_prediction_trades,
@@ -39,6 +43,7 @@ from engine.journal.registry import (
     load_recent_risk_halts,
     update_anticipatory_loop_config,
     update_predict_loop_config,
+    update_risk_gate_config,
 )
 from engine.risk.kill_switch import is_kill_switch_engaged
 
@@ -358,6 +363,7 @@ def anticipatory_loop_config_update(
     poll_seconds: int = Form(...),
     min_gap_threshold: float = Form(...),
     max_open_hypotheses: int = Form(...),
+    max_open_hypotheses_per_symbol: int = Form(...),
     discovery_limit: int = Form(...),
 ):
     with get_session(settings) as session:
@@ -367,9 +373,48 @@ def anticipatory_loop_config_update(
             poll_seconds=poll_seconds,
             min_gap_threshold=min_gap_threshold,
             max_open_hypotheses=max_open_hypotheses,
+            max_open_hypotheses_per_symbol=max_open_hypotheses_per_symbol,
             discovery_limit=discovery_limit,
         )
     return _templates.TemplateResponse(request, "anticipatory_loop_config.html", {"config": config, "saved": True})
+
+
+@app.get("/risk-gate-config", response_class=HTMLResponse)
+def risk_gate_config_view(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    with get_session(settings) as session:
+        config = get_risk_gate_config(session)
+    return _templates.TemplateResponse(
+        request, "risk_gate_config.html", {"config": config, "env_defaults": settings.risk, "saved": False}
+    )
+
+
+@app.post("/risk-gate-config", response_class=HTMLResponse)
+def risk_gate_config_update(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    use_defaults: bool = Form(False),
+    max_capital_per_position_pct: float = Form(...),
+    max_total_exposure_pct: float = Form(...),
+    stop_loss_pct: float = Form(...),
+    max_daily_drawdown_pct: float = Form(...),
+    max_consecutive_losses_per_day: int = Form(...),
+    allow_overnight_positions: bool = Form(False),
+):
+    with get_session(settings) as session:
+        config = update_risk_gate_config(
+            session,
+            use_defaults=use_defaults,
+            max_capital_per_position_pct=max_capital_per_position_pct,
+            max_total_exposure_pct=max_total_exposure_pct,
+            stop_loss_pct=stop_loss_pct,
+            max_daily_drawdown_pct=max_daily_drawdown_pct,
+            max_consecutive_losses_per_day=max_consecutive_losses_per_day,
+            allow_overnight_positions=allow_overnight_positions,
+        )
+    return _templates.TemplateResponse(
+        request, "risk_gate_config.html", {"config": config, "env_defaults": settings.risk, "saved": True}
+    )
 
 
 @app.get("/health")

@@ -9,6 +9,8 @@ engine.cli.main.anticipatory_loop for how the two get wired together.
 
 from __future__ import annotations
 
+from collections import Counter
+
 from engine.data.polymarket import fetch_candidate_markets, fetch_market_price
 from engine.journal.models import Hypothesis, HypothesisAction, HypothesisBelief, PredictionDirection
 from engine.journal.registry import (
@@ -41,7 +43,13 @@ def _decide_action(*, gap: float, min_gap_threshold: float, position_side: str |
 
 
 def discover_hypotheses(
-    session, client: PredictionClient, *, discovery_limit: int, max_open_hypotheses: int, min_gap_threshold: float
+    session,
+    client: PredictionClient,
+    *,
+    discovery_limit: int,
+    max_open_hypotheses: int,
+    min_gap_threshold: float,
+    max_open_hypotheses_per_symbol: int = 2,
 ) -> list[Hypothesis]:
     """One discovery sweep: fetch candidate Polymarket markets (already
     category-filtered, see engine.data.polymarket.EXCLUDED_TAG_SLUGS),
@@ -49,10 +57,22 @@ def discover_hypotheses(
     tradable equity/ETF exposure, and create a Hypothesis for each
     relevant new one -- capped at max_open_hypotheses total open at any
     time, since each candidate costs one paid LLM call regardless of
-    whether it turns out relevant."""
-    open_count = len(load_open_hypotheses(session))
+    whether it turns out relevant.
+
+    Also capped per-symbol at max_open_hypotheses_per_symbol: Polymarket
+    often splits one underlying question into several threshold markets
+    (e.g. "hit $110" and "hit $120"), which the LLM will legitimately map
+    to the same tradable symbol every time -- without this cap, one
+    commodity/instrument could consume most of max_open_hypotheses on
+    correlated bets. This is checked only after the relevance LLM call
+    returns a symbol, since the symbol isn't known beforehand -- it can't
+    avoid the paid call's cost, only stop the resulting Hypothesis/position
+    from being created."""
+    open_hypotheses = load_open_hypotheses(session)
+    open_count = len(open_hypotheses)
     if open_count >= max_open_hypotheses:
         return []
+    symbol_counts = Counter(h.symbol for h in open_hypotheses)
 
     created: list[Hypothesis] = []
     for market in fetch_candidate_markets(limit=discovery_limit):
@@ -63,6 +83,16 @@ def discover_hypotheses(
 
         estimate = client.estimate_hypothesis(market.question, market.description)
         if not estimate.relevant or not estimate.symbol or not estimate.direction_if_yes:
+            continue
+
+        if symbol_counts[estimate.symbol] >= max_open_hypotheses_per_symbol:
+            logger.info(
+                "skipping hypothesis -- symbol already at correlated-hypothesis cap",
+                extra={"extra_fields": {
+                    "market_id": market.market_id, "symbol": estimate.symbol,
+                    "max_open_hypotheses_per_symbol": max_open_hypotheses_per_symbol,
+                }},
+            )
             continue
 
         direction = PredictionDirection.UP if estimate.direction_if_yes == "up" else PredictionDirection.DOWN
@@ -81,6 +111,7 @@ def discover_hypotheses(
             confidence=estimate.confidence, rationale=estimate.rationale, action=action,
         )
         created.append(hyp)
+        symbol_counts[estimate.symbol] += 1
         logger.info(
             "new hypothesis tracked",
             extra={"extra_fields": {

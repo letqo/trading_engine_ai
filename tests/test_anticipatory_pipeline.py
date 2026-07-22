@@ -68,6 +68,32 @@ def test_discover_hypotheses_respects_max_open_hypotheses_cap(db_session):
     assert client.calls == []
 
 
+def test_discover_hypotheses_respects_per_symbol_cap(db_session):
+    create_hypothesis(db_session, market_id="existing", question="Will WTI hit $110?", symbol="USO", direction_if_yes=PredictionDirection.UP)
+    client = FakeClient(estimate=FakeEstimate(symbol="USO"))
+    with patch("engine.anticipatory.pipeline.fetch_candidate_markets", return_value=[_market(market_id="new", question="Will WTI hit $120?")]):
+        created = discover_hypotheses(
+            db_session, client,
+            discovery_limit=10, max_open_hypotheses=10, min_gap_threshold=0.05,
+            max_open_hypotheses_per_symbol=1,
+        )
+    assert created == []  # USO already at its per-symbol cap of 1, even though max_open_hypotheses (10) has room
+    assert len(client.calls) == 1  # the LLM call itself can't be skipped -- the symbol isn't known beforehand
+
+
+def test_discover_hypotheses_per_symbol_cap_allows_other_symbols(db_session):
+    create_hypothesis(db_session, market_id="existing", question="Will WTI hit $110?", symbol="USO", direction_if_yes=PredictionDirection.UP)
+    client = FakeClient(estimate=FakeEstimate(symbol="XLE"))
+    with patch("engine.anticipatory.pipeline.fetch_candidate_markets", return_value=[_market(market_id="new")]):
+        created = discover_hypotheses(
+            db_session, client,
+            discovery_limit=10, max_open_hypotheses=10, min_gap_threshold=0.05,
+            max_open_hypotheses_per_symbol=1,
+        )
+    assert len(created) == 1
+    assert created[0].symbol == "XLE"
+
+
 def test_discover_hypotheses_records_initial_belief_with_gap(db_session):
     client = FakeClient(estimate=FakeEstimate(p_model=0.7))
     with patch("engine.anticipatory.pipeline.fetch_candidate_markets", return_value=[_market(price_yes=0.5)]):

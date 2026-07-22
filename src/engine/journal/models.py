@@ -393,3 +393,46 @@ class AnticipatoryLoopConfig(SQLModel, table=True):
     min_gap_threshold: float = Field(default=0.05)  # |p_model - p_market| below this: no trade
     max_open_hypotheses: int = Field(default=10)  # discovery stops creating new ones above this
     discovery_limit: int = Field(default=20)  # candidate events considered per discovery sweep
+    # Polymarket often splits one underlying question into several
+    # threshold markets (e.g. "hit $110" and "hit $120"), which all map to
+    # the same tradable symbol via the same LLM reasoning -- capping per
+    # symbol keeps max_open_hypotheses from being spent entirely on
+    # correlated bets on one instrument. Checked after the relevance LLM
+    # call returns a symbol (that call's cost can't be avoided -- the
+    # symbol isn't known before asking), so this only prevents the
+    # Hypothesis row/position from being created, not the paid call itself.
+    max_open_hypotheses_per_symbol: int = Field(default=2)
+
+
+class RiskGateConfig(SQLModel, table=True):
+    """Single-row live-tunable override of engine.config.settings.RiskLimits,
+    same get-or-create singleton pattern as PredictLoopConfig (see its
+    docstring). Field defaults mirror RiskLimits' env-var defaults exactly,
+    but that's only the seed value shown before anyone edits this row --
+    the two are otherwise independent, resolved by engine.risk.resolve
+    .resolve_risk_limits().
+
+    use_defaults=True (the default) means every live trading path ignores
+    this row entirely and uses Settings.risk (env-configured) instead --
+    "activate default mode" without discarding whatever's been typed into
+    the overrides below, so toggling back to manual doesn't mean
+    re-entering every number. Only the three continuously-running loops
+    (papertrade, predict-loop, anticipatory-loop) and the two one-shot
+    live-trading CLI commands (act-on-predictions, resolve-predictions)
+    read this row; `engine backtest`/perturbation analysis stay
+    Settings.risk-only so results stay reproducible regardless of what's
+    been tuned live in production."""
+
+    __tablename__ = "risk_gate_config"
+    SINGLETON_ID: ClassVar[str] = "singleton"
+
+    id: str = Field(default="singleton", primary_key=True)
+    updated_at: datetime = Field(default_factory=_now)
+
+    use_defaults: bool = Field(default=True)
+    max_capital_per_position_pct: float = Field(default=0.05)
+    max_total_exposure_pct: float = Field(default=0.20)
+    stop_loss_pct: float = Field(default=0.02)
+    max_daily_drawdown_pct: float = Field(default=0.03)
+    max_consecutive_losses_per_day: int = Field(default=4)
+    allow_overnight_positions: bool = Field(default=False)

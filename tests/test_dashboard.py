@@ -51,7 +51,7 @@ def test_rejects_wrong_password(client):
 def test_all_routes_render_with_empty_database(client):
     for path in (
         "/", "/predictions", "/trades", "/ticker-suggestions", "/backtests", "/risk-events",
-        "/predict-loop-config", "/hypotheses", "/anticipatory-loop-config",
+        "/predict-loop-config", "/hypotheses", "/anticipatory-loop-config", "/risk-gate-config",
     ):
         resp = client.get(path, headers=_auth_header("admin", "testpass"))
         assert resp.status_code == 200, f"{path} returned {resp.status_code}: {resp.text[:300]}"
@@ -289,7 +289,10 @@ def test_anticipatory_loop_config_post_updates_the_row(tmp_path):
         auth = _auth_header("admin", "testpass")
         resp = client.post(
             "/anticipatory-loop-config", headers=auth,
-            data={"poll_seconds": "1800", "min_gap_threshold": "0.1", "max_open_hypotheses": "5", "discovery_limit": "15"},
+            data={
+                "poll_seconds": "1800", "min_gap_threshold": "0.1", "max_open_hypotheses": "5",
+                "max_open_hypotheses_per_symbol": "3", "discovery_limit": "15",
+            },
         )
         assert resp.status_code == 200
         assert "1800" in resp.text
@@ -300,6 +303,63 @@ def test_anticipatory_loop_config_post_updates_the_row(tmp_path):
         assert 'value="5"' in resp2.text
     finally:
         app.dependency_overrides.clear()
+
+
+def test_risk_gate_config_get_requires_auth(client):
+    resp = client.get("/risk-gate-config")
+    assert resp.status_code == 401
+
+
+def test_risk_gate_config_post_requires_auth(client):
+    resp = client.post("/risk-gate-config", data={
+        "max_capital_per_position_pct": "0.05", "max_total_exposure_pct": "0.2",
+        "stop_loss_pct": "0.02", "max_daily_drawdown_pct": "0.03", "max_consecutive_losses_per_day": "4",
+    })
+    assert resp.status_code == 401
+
+
+def test_risk_gate_config_defaults_to_use_defaults_true(client):
+    resp = client.get("/risk-gate-config", headers=_auth_header("admin", "testpass"))
+    assert resp.status_code == 200
+    assert "checked" in resp.text.split('name="use_defaults"')[1].split(">")[0]
+
+
+def test_risk_gate_config_post_updates_the_row_and_unchecking_use_defaults_persists(client):
+    auth = _auth_header("admin", "testpass")
+    resp = client.post(
+        "/risk-gate-config",
+        headers=auth,
+        data={
+            "max_capital_per_position_pct": "0.1",
+            "max_total_exposure_pct": "0.3",
+            "stop_loss_pct": "0.04",
+            "max_daily_drawdown_pct": "0.05",
+            "max_consecutive_losses_per_day": "6",
+        },
+    )
+    assert resp.status_code == 200
+    assert 'value="0.1"' in resp.text
+    assert "checked" not in resp.text.split('name="use_defaults"')[1].split(">")[0]  # omitted -> False
+
+    # A follow-up GET must reflect the saved override, not stale defaults.
+    resp2 = client.get("/risk-gate-config", headers=auth)
+    assert 'value="0.1"' in resp2.text
+    assert 'value="6"' in resp2.text
+
+
+def test_risk_gate_config_post_omitting_use_defaults_and_overnight_saves_as_false(client):
+    resp = client.post(
+        "/risk-gate-config",
+        headers=_auth_header("admin", "testpass"),
+        data={
+            "use_defaults": "on",
+            "max_capital_per_position_pct": "0.05", "max_total_exposure_pct": "0.2",
+            "stop_loss_pct": "0.02", "max_daily_drawdown_pct": "0.03", "max_consecutive_losses_per_day": "4",
+        },
+    )
+    assert resp.status_code == 200
+    assert "checked" in resp.text.split('name="use_defaults"')[1].split(">")[0]
+    assert "checked" not in resp.text.split('name="allow_overnight_positions"')[1].split(">")[0]
 
 
 def _status_settings(tmp_path, db_url, halted=False):

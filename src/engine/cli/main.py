@@ -37,6 +37,7 @@ from engine.journal.registry import (
     load_news_items,
     load_off_universe_symbol_stats,
     load_open_hypotheses,
+    get_risk_gate_config,
     load_prediction_trades,
     mark_anticipatory_loop_cycle,
     mark_predict_loop_cycle,
@@ -57,6 +58,7 @@ from engine.prediction.pipeline import resolve_pending_predictions, run_predicti
 from engine.prediction.trading import act_on_pending_predictions, close_expired_prediction_trades
 from engine.risk.gate import RiskGate
 from engine.risk.kill_switch import disengage_kill_switch, engage_kill_switch, is_kill_switch_engaged
+from engine.risk.resolve import resolve_risk_limits
 from engine.strategy.baselines import BuyAndHoldStrategy, RandomEntryStrategy
 from engine.strategy.dumb_news import DumbNewsStrategy
 from engine.strategy.overnight_gap import OvernightGapStrategy
@@ -434,7 +436,8 @@ def act_on_predictions_cmd(
     threshold = min_confidence if min_confidence is not None else settings.prediction_action_confidence_threshold
     universe = load_universe(settings.universe_path)
     client = AlpacaPaperClient(settings)
-    risk_gate = RiskGate(settings.risk)
+    with get_session(settings) as session:
+        risk_gate = RiskGate(resolve_risk_limits(settings, get_risk_gate_config(session)))
     account = reconcile_account_state(client)
     risk_gate.start_new_session(account)
 
@@ -470,7 +473,8 @@ def resolve_predictions_cmd() -> None:
         raise typer.Exit(1)
     universe = load_universe(settings.universe_path)
     client = AlpacaPaperClient(settings)
-    risk_gate = RiskGate(settings.risk)
+    with get_session(settings) as session:
+        risk_gate = RiskGate(resolve_risk_limits(settings, get_risk_gate_config(session)))
     account = reconcile_account_state(client)
     risk_gate.start_new_session(account)
     with get_session(settings) as session:
@@ -646,7 +650,8 @@ def papertrade(
         raise typer.Exit(1)
 
     client = AlpacaPaperClient(settings)
-    risk_gate = RiskGate(settings.risk)
+    with get_session(settings) as session:
+        risk_gate = RiskGate(resolve_risk_limits(settings, get_risk_gate_config(session)))
 
     account = reconcile_account_state(client)
     cancel_stale_orders(client)
@@ -681,6 +686,9 @@ def papertrade(
             break
 
         try:
+            with get_session(settings) as session:
+                risk_gate.limits = resolve_risk_limits(settings, get_risk_gate_config(session))
+
             today = datetime.now(timezone.utc).date()
             if today != current_date:
                 # New trading day: this is the only point a fresh
@@ -782,7 +790,8 @@ def predict_loop(
             typer.echo(str(exc), err=True)
             raise typer.Exit(1)
         broker = AlpacaPaperClient(settings)
-        risk_gate = RiskGate(settings.risk)
+        with get_session(settings) as session:
+            risk_gate = RiskGate(resolve_risk_limits(settings, get_risk_gate_config(session)))
         account = reconcile_account_state(broker)
         risk_gate.start_new_session(account)
         current_date = datetime.now(timezone.utc).date()
@@ -866,6 +875,9 @@ def predict_loop(
                     ))
 
             if can_trade:
+                with get_session(settings) as session:
+                    risk_gate.limits = resolve_risk_limits(settings, get_risk_gate_config(session))
+
                 today = datetime.now(timezone.utc).date()
                 if today != current_date:
                     account = reconcile_account_state(broker)
@@ -962,7 +974,8 @@ def anticipatory_loop(
             typer.echo(str(exc), err=True)
             raise typer.Exit(1)
         broker = AlpacaPaperClient(settings)
-        risk_gate = RiskGate(settings.risk)
+        with get_session(settings) as session:
+            risk_gate = RiskGate(resolve_risk_limits(settings, get_risk_gate_config(session)))
         account = reconcile_account_state(broker)
         risk_gate.start_new_session(account)
         current_date = datetime.now(timezone.utc).date()
@@ -1013,6 +1026,7 @@ def anticipatory_loop(
                     discovery_limit=config.discovery_limit,
                     max_open_hypotheses=config.max_open_hypotheses,
                     min_gap_threshold=config.min_gap_threshold,
+                    max_open_hypotheses_per_symbol=config.max_open_hypotheses_per_symbol,
                 ))
 
             with get_session(settings) as session:
@@ -1020,6 +1034,9 @@ def anticipatory_loop(
                 beliefs, resolved = revise_open_hypotheses(session, client, min_gap_threshold=config.min_gap_threshold)
 
             if can_trade:
+                with get_session(settings) as session:
+                    risk_gate.limits = resolve_risk_limits(settings, get_risk_gate_config(session))
+
                 today = datetime.now(timezone.utc).date()
                 if today != current_date:
                     account = reconcile_account_state(broker)

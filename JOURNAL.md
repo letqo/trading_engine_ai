@@ -1013,3 +1013,64 @@ indefinitely under `ON_FAILURE` and still show green. Checking actual
 service logs (`railway logs --service <name>`), not just deployment
 status, should be the standard way to verify anything deployed in this
 project actually works, not just that it's technically running.
+
+## 2026-07-22 (later) -- Add: per-symbol hypothesis cap + dashboard-tunable RiskGate overrides
+
+Two small, separable asks. First: the user noticed two `/hypotheses` rows
+for the same underlying (`USO`, up) from a single discovery cycle --
+Polymarket's WTI-$110 and WTI-$120 threshold questions, each a genuinely
+distinct market with its own `market_id`, both independently judged
+relevant by the LLM. Not a bug (`discover_hypotheses` dedups by
+`market_id`, correctly, since these really are different questions with
+different real probabilities -- 0.04 vs 0.01), but a real design gap:
+Polymarket routinely splits one commodity into several threshold markets
+that all map to the same tradable symbol, so `max_open_hypotheses` could
+end up spent entirely on correlated bets on one instrument rather than
+diverse ideas. Added `AnticipatoryLoopConfig.max_open_hypotheses_per_symbol`
+(default 2, dashboard-tunable at `/anticipatory-loop-config`), enforced in
+`discover_hypotheses` (`engine/anticipatory/pipeline.py`) via a `Counter`
+seeded from currently-open hypotheses. The cap is checked only *after* the
+relevance LLM call returns a symbol -- the symbol isn't known before
+asking, so the paid call's cost can't be avoided, only the resulting
+Hypothesis/position creation is skipped.
+
+Second, and larger: the user asked whether `RiskGate`'s limits (position
+cap, exposure cap, stop-loss, daily drawdown, consecutive-loss halt,
+overnight-positions) could be set manually from the dashboard too, "with
+the possibility to activate the default mode." Until now `RiskGate` was
+always built from `engine.config.settings.RiskLimits` -- env-var-only,
+fixed for the life of the process, the same category of limitation
+`PredictLoopConfig`/`AnticipatoryLoopConfig` were built to solve for their
+own loops. Added `RiskGateConfig` (`engine/journal/models.py`), a
+single-row live-tunable table mirroring `RiskLimits`' fields exactly, plus
+a `use_defaults: bool` column (default `True`). `use_defaults=True` means
+every live trading path ignores the row entirely and uses `Settings.risk`
+-- "activate default mode" without losing whatever's been typed into the
+override fields, so flipping back to manual later doesn't mean re-entering
+every number.
+
+New `engine.risk.resolve.resolve_risk_limits(settings, config) ->
+RiskLimits` is the single place that decides which of the two wins.
+Deliberately **not** wired into `engine backtest`/perturbation analysis --
+those must keep building `RiskGate` straight from `settings.risk` so a
+backtest result stays reproducible regardless of what's been tuned live in
+production since. Wired into all five live-trading paths: `papertrade` and
+the two research loops (`predict-loop`, `anticipatory-loop`) now re-read
+`RiskGateConfig` and refresh `risk_gate.limits` in place every iteration/
+cycle -- same live-tunable-without-redeploy pattern as the loops' own
+configs -- while the two one-shot commands (`act-on-predictions`,
+`resolve-predictions`) read it once before building `RiskGate`. New
+`/risk-gate-config` dashboard page (GET/POST, same trust boundary as
+`/predict-loop-config`: can retune risk limits, cannot place or cancel an
+order directly) shows the current env defaults alongside the override
+fields so "what wins right now" is never ambiguous.
+
+Migration `7a2039bab008` adds `anticipatory_loop_config
+.max_open_hypotheses_per_symbol` (plain integer column, `server_default`
+so existing Postgres rows backfill cleanly) and creates `risk_gate_config`
+-- no enum columns involved this time, so none of the Postgres
+`create_type=False` issues from the `Hypothesis` migration applied here.
+Verified by running `alembic upgrade head` against the local dev SQLite DB
+(several revisions behind) and confirming both the new column and table
+exist with the right shape before deploying.
+project actually works, not just that it's technically running.
