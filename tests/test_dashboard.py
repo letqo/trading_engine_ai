@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -153,6 +153,63 @@ def test_prediction_stats_match_hand_computed_values_and_rationale_renders(tmp_p
         assert resp2.status_code == 200
         assert "66.7%" in resp2.text
         assert "rate hike strengthens yen, hurts exporters" in resp2.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_predictions_page_filters_by_symbol_outcome_and_date(tmp_path):
+    db_path = tmp_path / "dashboard_filters_test.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    now = datetime.now(timezone.utc)
+
+    def seed(session, *, symbol, headline, outcome_correct, decision_ts):
+        pred = record_prediction(
+            session,
+            news_headline=headline, news_source="rss", news_published_at=decision_ts,
+            news_decision_timestamp=decision_ts,
+            topics=[], symbol=symbol, direction="up", confidence=0.5,
+            rationale="r", model_name="test", model_knowledge_cutoff=now, forward_safe=True,
+            resolution_window_hours=24.0, in_tracked_universe=True,
+        )
+        pred.status = PredictionStatus.RESOLVED
+        pred.outcome_correct = outcome_correct
+        session.add(pred)
+        session.commit()
+
+    with Session(engine_) as session:
+        seed(session, symbol="EWJ", headline="ewj headline old", outcome_correct=True,
+             decision_ts=now - timedelta(days=10))
+        seed(session, symbol="SPY", headline="spy headline recent", outcome_correct=False,
+             decision_ts=now - timedelta(days=1))
+
+    test_settings = Settings(database_url=db_url, dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        client = TestClient(app)
+        auth = _auth_header("admin", "testpass")
+
+        resp = client.get("/predictions?symbol=EWJ", headers=auth)
+        assert "ewj headline old" in resp.text
+        assert "spy headline recent" not in resp.text
+
+        resp = client.get("/predictions?outcome=incorrect", headers=auth)
+        assert "spy headline recent" in resp.text
+        assert "ewj headline old" not in resp.text
+
+        start_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+        resp = client.get(f"/predictions?start_date={start_date}", headers=auth)
+        assert "spy headline recent" in resp.text
+        assert "ewj headline old" not in resp.text
+
+        # Unfiltered: both present, symbol dropdown lists both.
+        resp = client.get("/predictions", headers=auth)
+        assert "ewj headline old" in resp.text
+        assert "spy headline recent" in resp.text
+        assert '<option value="EWJ"' in resp.text
+        assert '<option value="SPY"' in resp.text
     finally:
         app.dependency_overrides.clear()
 

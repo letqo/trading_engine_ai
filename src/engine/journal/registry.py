@@ -397,7 +397,15 @@ def load_resolved_predictions_by_topics(
     session: Session, topics: set[str], limit: int = 5
 ) -> list[Prediction]:
     """Retrieval for the prediction pipeline's few-shot context: past
-    resolved cases sharing at least one topic tag, most recent first.
+    resolved cases sharing at least one topic tag, most recent first --
+    plus the single most recent *wrong* call on these topics, if one
+    exists and isn't already in the recency window. Pure recency risks
+    the model never seeing its own mistakes on a topic (if the last
+    `limit` matches all happened to be correct, it never gets the
+    corrective example); guaranteeing one miss is in the mix replaces the
+    oldest slot rather than adding one, so `limit` still hard-caps how
+    many past cases get fed to the LLM per prediction -- no extra token
+    cost.
 
     Queries via the PredictionTopic index (populated by record_prediction)
     rather than loading every resolved Prediction into Python to filter
@@ -409,15 +417,24 @@ def load_resolved_predictions_by_topics(
     LIMIT stay correct entirely at the DB level, on both SQLite (dev) and
     Postgres (prod) -- no query-syntax divergence between the two.
     """
-    if not topics:
+    if not topics or limit <= 0:
         return []
     matching_ids = select(PredictionTopic.prediction_id).where(PredictionTopic.topic.in_(topics)).distinct()
-    return session.exec(
-        select(Prediction)
-        .where(Prediction.status == PredictionStatus.RESOLVED, Prediction.id.in_(matching_ids))
-        .order_by(Prediction.resolved_at.desc())
-        .limit(limit)
-    ).all()
+    base = select(Prediction).where(Prediction.status == PredictionStatus.RESOLVED, Prediction.id.in_(matching_ids))
+
+    recent = list(session.exec(base.order_by(Prediction.resolved_at.desc()).limit(limit)).all())
+
+    if not any(p.outcome_correct is False for p in recent):
+        worst = session.exec(
+            base.where(Prediction.outcome_correct == False)  # noqa: E712
+            .order_by(Prediction.resolved_at.desc())
+            .limit(1)
+        ).first()
+        if worst is not None:
+            recent = recent[:-1] + [worst]
+
+    recent.sort(key=lambda p: p.resolved_at, reverse=True)
+    return recent
 
 
 def load_pending_predictions_past_window(session: Session, as_of: datetime) -> list[Prediction]:

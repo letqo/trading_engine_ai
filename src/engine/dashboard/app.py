@@ -14,6 +14,7 @@ one setting.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, Request
@@ -40,17 +41,54 @@ app = FastAPI(title="Trading engine dashboard")
 _templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
-def _prediction_stats(settings: Settings) -> dict:
+def _parse_date_filters(start_date: str | None, end_date: str | None) -> tuple[datetime | None, datetime | None]:
+    """Parses "YYYY-MM-DD" strings from an HTML date input into the naive
+    UTC-assumed datetimes Prediction.news_decision_timestamp is stored as
+    (see registry._hours_elapsed's docstring on the same SQLite tzinfo-drop
+    convention). end_date is inclusive of the whole day, so the WHERE clause
+    uses a `<` on the following midnight rather than `<=` on the bare date."""
+    start = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
+    end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1) if end_date else None
+    return start, end
+
+
+def _prediction_stats(
+    settings: Settings,
+    *,
+    symbol: str | None = None,
+    outcome: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict:
     """Aggregate stats computed SQL-side (COUNT/AVG/conditional SUM), not by
     loading every resolved prediction into Python and summing over it --
     this runs on every dashboard page load, and a full-table Python scan
     gets slower every day the prediction log grows (months of predict-loop
     running easily reaches tens of thousands of rows). `recent` is already
-    bounded (limit 100), left as-is."""
+    bounded (limit 100), left as-is.
+
+    symbol/outcome/start/end are optional display filters (from /predictions'
+    filter form) -- when all None, behavior is identical to unfiltered."""
     stop_pct = settings.risk.stop_loss_pct * 100.0
 
     with get_session(settings) as session:
-        resolved_filter = (Prediction.status == PredictionStatus.RESOLVED, Prediction.forward_safe == True)  # noqa: E712
+        display_filters = []
+        if symbol:
+            display_filters.append(Prediction.symbol == symbol)
+        if outcome == "correct":
+            display_filters.append(Prediction.outcome_correct == True)  # noqa: E712
+        elif outcome == "incorrect":
+            display_filters.append(Prediction.outcome_correct == False)  # noqa: E712
+        if start is not None:
+            display_filters.append(Prediction.news_decision_timestamp >= start)
+        if end is not None:
+            display_filters.append(Prediction.news_decision_timestamp < end)
+
+        resolved_filter = (
+            Prediction.status == PredictionStatus.RESOLVED,
+            Prediction.forward_safe == True,  # noqa: E712
+            *display_filters,
+        )
 
         resolved_count, correct_count = session.exec(
             select(
@@ -76,7 +114,12 @@ def _prediction_stats(settings: Settings) -> dict:
         ).one()
 
         traded_count = len(load_prediction_trades(session))
-        recent = session.exec(select(Prediction).order_by(Prediction.news_decision_timestamp.desc()).limit(100)).all()
+        recent = session.exec(
+            select(Prediction)
+            .where(*display_filters)
+            .order_by(Prediction.news_decision_timestamp.desc())
+            .limit(100)
+        ).all()
 
     accuracy_pct = (correct_count / resolved_count * 100.0) if resolved_count else None
 
@@ -136,10 +179,33 @@ def overview(request: Request, _user: str = Depends(require_auth), settings: Set
 
 
 @app.get("/predictions", response_class=HTMLResponse)
-def predictions(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
-    stats = _prediction_stats(settings)
+def predictions(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    symbol: str | None = None,
+    outcome: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+):
+    start, end = _parse_date_filters(start_date, end_date)
+    stats = _prediction_stats(settings, symbol=symbol or None, outcome=outcome or None, start=start, end=end)
+    with get_session(settings) as session:
+        symbols = session.exec(select(Prediction.symbol).distinct().order_by(Prediction.symbol)).all()
     return _templates.TemplateResponse(
-        request, "predictions.html", {"predictions": stats.pop("recent_predictions"), **stats}
+        request,
+        "predictions.html",
+        {
+            "predictions": stats.pop("recent_predictions"),
+            "symbols": symbols,
+            "filters": {
+                "symbol": symbol or "",
+                "outcome": outcome or "",
+                "start_date": start_date or "",
+                "end_date": end_date or "",
+            },
+            **stats,
+        },
     )
 
 

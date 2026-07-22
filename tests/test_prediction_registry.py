@@ -78,6 +78,45 @@ def test_load_resolved_predictions_respects_limit(db_session):
     assert len(results) == 2
 
 
+def test_load_resolved_predictions_by_topics_includes_most_recent_miss_over_recency_alone(db_session):
+    # If the top-`limit` most recent topic matches all happen to be correct,
+    # the model would never see its own mistakes on that topic. The most
+    # recent incorrect match should still be included, bumping the oldest
+    # of the recency window rather than being dropped or added on top.
+    old_miss = _make(db_session, topics=("boj",), status=PredictionStatus.RESOLVED)
+    old_miss.outcome_correct = False
+    old_miss.resolved_at = NOW - timedelta(days=10)
+    db_session.add(old_miss)
+    db_session.commit()
+
+    hits = []
+    for i in range(3):
+        hit = _make(db_session, topics=("boj",), status=PredictionStatus.RESOLVED)
+        hit.outcome_correct = True
+        hit.resolved_at = NOW - timedelta(hours=i)
+        db_session.add(hit)
+        db_session.commit()
+        hits.append(hit)
+
+    results = load_resolved_predictions_by_topics(db_session, {"boj"}, limit=3)
+    result_ids = {r.id for r in results}
+
+    assert len(results) == 3  # limit is not raised to fit the miss in
+    assert old_miss.id in result_ids
+    assert hits[2].id not in result_ids  # the oldest of the recency window got bumped
+
+
+def test_load_resolved_predictions_by_topics_does_not_duplicate_an_already_included_miss(db_session):
+    miss = _make(db_session, topics=("boj",), status=PredictionStatus.RESOLVED)
+    miss.outcome_correct = False
+    miss.resolved_at = NOW
+    db_session.add(miss)
+    db_session.commit()
+
+    results = load_resolved_predictions_by_topics(db_session, {"boj"}, limit=5)
+    assert [r.id for r in results] == [miss.id]
+
+
 def test_record_prediction_writes_a_prediction_topic_row_per_topic(db_session):
     # load_resolved_predictions_by_topics queries this table instead of
     # loading every resolved Prediction into Python -- record_prediction

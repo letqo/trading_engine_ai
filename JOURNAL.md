@@ -5,6 +5,34 @@ SPEC.md's working agreement). Newest first.
 
 ---
 
+## 2026-07-22 -- Guarantee a past miss in the LLM's few-shot context; add dashboard filters to /predictions
+
+**The retrieval concern.** `load_resolved_predictions_by_topics` (the
+few-shot past-case retrieval feeding every new prediction) picked the top
+`limit` (default 5) most recent topic-matching resolved predictions --
+pure recency, unchanged from before this session's indexing fix. Raised
+after shipping that fix: if the most recent 5 topic matches all happened
+to be correct, the model would never see its own mistakes on that topic,
+which is arguably the most useful thing to show it for self-correction.
+
+**The fix.** `load_resolved_predictions_by_topics` now guarantees the
+single most recent *incorrect* (`outcome_correct == False`) match is in
+the returned set, if one exists and isn't already in the recency window
+-- it replaces the oldest slot of the recency window rather than being
+appended, so `limit` still hard-caps the token cost per prediction (this
+runs on every headline predict-loop analyzes). Selection is otherwise
+unchanged: pure recency when no correction-worthy miss exists.
+
+**Dashboard filters.** `/predictions` previously showed only the most
+recent 100 rows with no way to narrow them. Added a GET filter form
+(symbol, correct/incorrect, date range) -- `_prediction_stats` now takes
+optional `symbol`/`outcome`/`start`/`end` filters applied at the SQL
+`WHERE` level to both the summary cards and the row list, so the numbers
+shown always describe exactly what's filtered into view. `/` (overview)
+is unaffected -- it calls the same function with no filters.
+
+---
+
 ## 2026-07-22 -- Fix: Sharpe annualization bug; walk-forward suite rerun confirms the 2026-07-21 finding; a reproducibility gap found along the way
 
 **The bug.** `engine.backtest.metrics.sharpe_ratio` hardcoded

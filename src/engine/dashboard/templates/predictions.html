@@ -14,6 +14,32 @@
 <div class="note">{{ would_have_stopped }} of {{ correct_count }} "correct" predictions moved past the {{ stop_pct }}% stop-loss threshold before recovering -- directionally right, but a live position would've been stopped out first.</div>
 {% endif %}
 
+<form class="filter-bar" method="get" action="/predictions">
+  <label>Symbol
+    <select name="symbol">
+      <option value="">All</option>
+      {% for s in symbols %}
+      <option value="{{ s }}" {{ "selected" if filters.symbol == s else "" }}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Outcome
+    <select name="outcome">
+      <option value="" {{ "selected" if filters.outcome == "" else "" }}>All</option>
+      <option value="correct" {{ "selected" if filters.outcome == "correct" else "" }}>Correct</option>
+      <option value="incorrect" {{ "selected" if filters.outcome == "incorrect" else "" }}>Incorrect</option>
+    </select>
+  </label>
+  <label>From
+    <input type="date" name="start_date" value="{{ filters.start_date }}">
+  </label>
+  <label>To
+    <input type="date" name="end_date" value="{{ filters.end_date }}">
+  </label>
+  <button type="submit">Filter</button>
+  <a href="/predictions">Clear</a>
+</form>
+
 <h1>Recent predictions</h1>
 {% if predictions %}
 <table>
