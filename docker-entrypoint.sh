@@ -12,11 +12,14 @@ case "${SERVICE_ROLE:-worker}" in
   predict-loop)
     exec python -m engine.cli.main predict-loop
     ;;
+  anticipatory-loop)
+    exec python -m engine.cli.main anticipatory-loop
+    ;;
   dashboard)
     exec python -m uvicorn engine.dashboard.app:app --host 0.0.0.0 --port "${PORT:-8000}"
     ;;
   *)
-    echo "Unknown SERVICE_ROLE: '${SERVICE_ROLE}' -- expected worker, predict-loop, or dashboard" >&2
+    echo "Unknown SERVICE_ROLE: '${SERVICE_ROLE}' -- expected worker, predict-loop, anticipatory-loop, or dashboard" >&2
     exit 1
     ;;
 esac
