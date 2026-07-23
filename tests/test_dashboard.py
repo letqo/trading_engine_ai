@@ -158,6 +158,51 @@ def test_predict_loop_config_post_omitting_enabled_saves_as_disabled(client):
     assert "checked" not in resp.text.split('name="enabled"')[1].split(">")[0]
 
 
+def test_predict_loop_config_shows_all_sources_checked_by_default(client):
+    resp = client.get("/predict-loop-config", headers=_auth_header("admin", "testpass"))
+    assert resp.status_code == 200
+    assert 'name="enabled_sources" value="yahoo_finance_top"' in resp.text
+    assert 'name="enabled_sources" value="marketwatch_top"' in resp.text
+    assert 'name="enabled_sources" value="prnewswire_all"' in resp.text
+    # config.enabled_sources is None (never saved) -- every source shows checked.
+    assert resp.text.count("checked") >= 3
+
+
+def test_predict_loop_config_post_saves_selected_sources_only(client):
+    resp = client.post(
+        "/predict-loop-config",
+        headers=_auth_header("admin", "testpass"),
+        data={
+            "poll_seconds": "3600", "rotation_hours": "1", "headlines_per_source": "10",
+            "near_dup_window_hours": "48", "near_dup_threshold": "90",
+            "enabled_sources": ["yahoo_finance_top"],
+        },
+    )
+    assert resp.status_code == 200
+    block = resp.text.split('value="yahoo_finance_top"')[1].split(">")[0]
+    assert "checked" in block
+    block = resp.text.split('value="marketwatch_top"')[1].split(">")[0]
+    assert "checked" not in block
+
+
+def test_predict_loop_config_reset_restores_tunable_defaults_but_not_enabled(client):
+    client.post(
+        "/predict-loop-config",
+        headers=_auth_header("admin", "testpass"),
+        data={
+            "enabled": "on", "poll_seconds": "60", "rotation_hours": "5", "headlines_per_source": "1",
+            "near_dup_window_hours": "1", "near_dup_threshold": "1", "enabled_sources": ["prnewswire_all"],
+        },
+    )
+    resp = client.post("/predict-loop-config/reset", headers=_auth_header("admin", "testpass"))
+    assert resp.status_code == 200
+    assert 'value="3600"' in resp.text
+    assert 'value="1.0"' in resp.text
+    assert 'value="10"' in resp.text
+    # enabled=True must survive the reset untouched -- reset only affects tunables.
+    assert "checked" in resp.text.split('name="enabled"')[1].split(">")[0]
+
+
 def test_papertrade_config_get_requires_auth(client):
     resp = client.get("/papertrade-config")
     assert resp.status_code == 401

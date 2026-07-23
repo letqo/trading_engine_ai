@@ -29,6 +29,19 @@
     Near-duplicate threshold (0-100, higher = stricter match required to skip)
     <input type="number" step="0.1" name="near_dup_threshold" value="{{ config.near_dup_threshold }}" min="0" max="100" required>
   </label>
+  <label>
+    News sources in the rotation (unchecking all falls back to every source below, rather than pulling nothing)
+    {% for source_name in rss_feeds %}
+    <div>
+      <input type="checkbox" name="enabled_sources" value="{{ source_name }}" id="src-{{ source_name }}"
+        {% if config.enabled_sources is none or source_name in config.enabled_sources %}checked{% endif %}>
+      <label for="src-{{ source_name }}" style="display:inline;">{{ source_name }}</label>
+    </div>
+    {% endfor %}
+  </label>
   <button type="submit">Save</button>
+</form>
+<form method="post" action="/predict-loop-config/reset" style="margin-top: 0.75rem;">
+  <button type="submit" style="background: #3a3f4a;">Reset tunable settings to defaults</button>
 </form>
 {% endblock %}

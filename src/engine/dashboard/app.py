@@ -53,6 +53,7 @@ from engine.cli.main import LIVE_ELIGIBLE_STRATEGIES
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
 from engine.config.settings import Settings, get_settings
 from engine.dashboard.auth import require_auth
+from engine.data.news import RSS_FEEDS, RSS_ROTATION_ORDER
 from engine.data.universe import Universe, load_universe
 from engine.execution.alpaca import AlpacaPaperClient
 from engine.execution.broker import Broker
@@ -388,11 +389,24 @@ def risk_events(request: Request, _user: str = Depends(require_auth), settings: 
     return _templates.TemplateResponse(request, "risk_events.html", {"events": rows})
 
 
+_PREDICT_LOOP_TUNABLE_DEFAULTS = {
+    "poll_seconds": 3600,
+    "rotation_hours": 1.0,
+    "headlines_per_source": 10,
+    "near_dup_window_hours": 48.0,
+    "near_dup_threshold": 90.0,
+    "enabled_sources": list(RSS_ROTATION_ORDER),
+}
+
+
 @app.get("/predict-loop-config", response_class=HTMLResponse)
 def predict_loop_config_view(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
     with get_session(settings) as session:
         config = get_predict_loop_config(session)
-    return _templates.TemplateResponse(request, "predict_loop_config.html", {"config": config, "saved": False})
+    return _templates.TemplateResponse(
+        request, "predict_loop_config.html",
+        {"config": config, "saved": False, "rss_feeds": RSS_FEEDS},
+    )
 
 
 @app.post("/predict-loop-config", response_class=HTMLResponse)
@@ -406,6 +420,7 @@ def predict_loop_config_update(
     headlines_per_source: int = Form(...),
     near_dup_window_hours: float = Form(...),
     near_dup_threshold: float = Form(...),
+    enabled_sources: list[str] = Form([]),
 ):
     with get_session(settings) as session:
         config = update_predict_loop_config(
@@ -416,8 +431,26 @@ def predict_loop_config_update(
             headlines_per_source=headlines_per_source,
             near_dup_window_hours=near_dup_window_hours,
             near_dup_threshold=near_dup_threshold,
+            enabled_sources=enabled_sources,
         )
-    return _templates.TemplateResponse(request, "predict_loop_config.html", {"config": config, "saved": True})
+    return _templates.TemplateResponse(
+        request, "predict_loop_config.html",
+        {"config": config, "saved": True, "rss_feeds": RSS_FEEDS},
+    )
+
+
+@app.post("/predict-loop-config/reset", response_class=HTMLResponse)
+def predict_loop_config_reset(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    """Resets only the tunable numeric/source settings to their shipped
+    defaults -- deliberately leaves `enabled` (pause/resume state) alone,
+    since that's an operational toggle, not a tunable parameter, and a
+    silent un-pause here would be a real safety surprise."""
+    with get_session(settings) as session:
+        config = update_predict_loop_config(session, **_PREDICT_LOOP_TUNABLE_DEFAULTS)
+    return _templates.TemplateResponse(
+        request, "predict_loop_config.html",
+        {"config": config, "saved": True, "rss_feeds": RSS_FEEDS},
+    )
 
 
 @app.get("/hypotheses", response_class=HTMLResponse)

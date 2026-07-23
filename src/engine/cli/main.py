@@ -18,7 +18,7 @@ from engine.config.settings import get_settings
 from engine.data.alpaca_news import AlpacaNewsAuthError, fetch_alpaca_news
 from engine.data.bars import bars_to_domain, fetch_bars
 from engine.data.events import EventType, build_event_stream
-from engine.data.news import RSS_FEEDS, active_rss_source, fetch_all_rss, fetch_rss_feed
+from engine.data.news import RSS_FEEDS, RSS_ROTATION_ORDER, active_rss_source, fetch_all_rss, fetch_rss_feed
 from engine.data.router import tag_and_route
 from engine.data.snapshot import create_snapshot
 from engine.data.universe import load_universe
@@ -924,7 +924,15 @@ def predict_loop(
             if not config.enabled:
                 logger.info("predict-loop paused -- skipping cycle body", extra={"extra_fields": {"poll_seconds": config.poll_seconds, "stopped": stopped}})
             else:
-                active_source = active_rss_source(config.rotation_anchor, datetime.now(timezone.utc), config.rotation_hours)
+                # config.enabled_sources is the dashboard's source picker --
+                # None (never set) or an empty list (all unchecked) both
+                # fall back to every known feed, and any stale/unknown name
+                # is dropped, so a config drift can never wedge rotation
+                # with zero valid sources. See PredictLoopConfig.enabled_sources.
+                rotation_order = tuple(s for s in (config.enabled_sources or []) if s in RSS_FEEDS) or RSS_ROTATION_ORDER
+                active_source = active_rss_source(
+                    config.rotation_anchor, datetime.now(timezone.utc), config.rotation_hours, order=rotation_order,
+                )
                 raw_items = fetch_rss_feed(active_source, RSS_FEEDS[active_source])
                 predicted = 0
                 skipped_duplicate = 0

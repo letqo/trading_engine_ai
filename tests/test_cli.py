@@ -325,7 +325,7 @@ def test_predict_loop_uses_active_rss_source_for_rotation(monkeypatch, tmp_path)
     rotation = ["yahoo_finance_top", "marketwatch_top", "prnewswire_all"]
     calls = []
 
-    def fake_active_source(anchor, now, rotation_hours):
+    def fake_active_source(anchor, now, rotation_hours, order=None):
         return rotation[len(calls) % len(rotation)]
 
     def fake_fetch_rss_feed(source, url):

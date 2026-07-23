@@ -311,6 +311,14 @@ class PredictLoopConfig(SQLModel, table=True):
     headlines_per_source: int = Field(default=10)
     near_dup_window_hours: float = Field(default=48.0)
     near_dup_threshold: float = Field(default=90.0)
+    # Which of engine.data.news.RSS_FEEDS predict-loop rotates through.
+    # None means "no override" -- every existing row before this field was
+    # added reads back as None, and the call site (engine.cli.main) treats
+    # both None and an empty list the same way: fall back to
+    # engine.data.news.RSS_ROTATION_ORDER (all sources), so a config drift
+    # or an accidentally-cleared selection can never wedge the loop with
+    # zero sources to rotate through.
+    enabled_sources: list[str] | None = Field(default=None, sa_column=Column(JSON))
 
 
 class HypothesisStatus(str, Enum):
