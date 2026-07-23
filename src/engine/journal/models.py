@@ -527,3 +527,27 @@ class RiskGateConfig(SQLModel, table=True):
     max_daily_drawdown_pct: float = Field(default=0.03)
     max_consecutive_losses_per_day: int = Field(default=4)
     allow_overnight_positions: bool = Field(default=False)
+
+
+class PapertradeConfig(SQLModel, table=True):
+    """Single-row live-tunable strategy selection for `engine papertrade`
+    (the `worker` service), same get-or-create singleton pattern as
+    PredictLoopConfig (see its docstring for why this isn't
+    engine.config.settings.Settings / the PAPERTRADE_STRATEGY env var).
+
+    strategy=None means the reconcile/kill-switch skeleton only, no
+    trading -- same meaning as the CLI's `--strategy` being omitted. The
+    `--strategy`/PAPERTRADE_STRATEGY CLI option only *seeds* this row on
+    first run when explicitly passed; once set, papertrade re-reads this
+    row every iteration (see mark_papertrade_cycle) and hot-switches
+    strategies without a restart, the same way PredictLoopConfig.enabled
+    is re-checked every predict-loop cycle."""
+
+    __tablename__ = "papertrade_config"
+    SINGLETON_ID: ClassVar[str] = "singleton"
+
+    id: str = Field(default="singleton", primary_key=True)
+    updated_at: datetime = Field(default_factory=_now)
+    last_cycle_at: datetime | None = Field(default=None)  # see PredictLoopConfig's docstring
+
+    strategy: str | None = Field(default=None)

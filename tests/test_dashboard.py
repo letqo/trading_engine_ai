@@ -101,6 +101,7 @@ def test_all_routes_render_with_empty_database(client):
     for path in (
         "/", "/predictions", "/trades", "/ticker-suggestions", "/backtests", "/risk-events",
         "/predict-loop-config", "/hypotheses", "/anticipatory-loop-config", "/risk-gate-config",
+        "/strategy-trades", "/papertrade-config",
     ):
         resp = client.get(path, headers=_auth_header("admin", "testpass"))
         assert resp.status_code == 200, f"{path} returned {resp.status_code}: {resp.text[:300]}"
@@ -155,6 +156,41 @@ def test_predict_loop_config_post_omitting_enabled_saves_as_disabled(client):
     )
     assert resp.status_code == 200
     assert "checked" not in resp.text.split('name="enabled"')[1].split(">")[0]
+
+
+def test_papertrade_config_get_requires_auth(client):
+    resp = client.get("/papertrade-config")
+    assert resp.status_code == 401
+
+
+def test_papertrade_config_post_requires_auth(client):
+    resp = client.post("/papertrade-config", data={"strategy": "momentum"})
+    assert resp.status_code == 401
+
+
+def test_papertrade_config_post_sets_strategy_and_persists(client):
+    resp = client.post(
+        "/papertrade-config", headers=_auth_header("admin", "testpass"), data={"strategy": "momentum"},
+    )
+    assert resp.status_code == 200
+    assert 'value="momentum" selected' in resp.text
+
+    resp2 = client.get("/papertrade-config", headers=_auth_header("admin", "testpass"))
+    assert 'value="momentum" selected' in resp2.text
+
+
+def test_papertrade_config_post_empty_string_clears_strategy(client):
+    client.post("/papertrade-config", headers=_auth_header("admin", "testpass"), data={"strategy": "momentum"})
+    resp = client.post("/papertrade-config", headers=_auth_header("admin", "testpass"), data={"strategy": ""})
+    assert resp.status_code == 200
+    assert 'value="" selected' in resp.text
+
+
+def test_papertrade_config_post_rejects_unknown_strategy(client):
+    resp = client.post(
+        "/papertrade-config", headers=_auth_header("admin", "testpass"), data={"strategy": "not_a_real_strategy"},
+    )
+    assert resp.status_code == 400
 
 
 def test_health_check_requires_no_auth(client):

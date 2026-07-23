@@ -5,7 +5,8 @@ from typer.testing import CliRunner
 import engine.journal.models  # noqa: F401  registers tables on SQLModel.metadata
 from engine.cli.main import app
 from engine.config.settings import get_settings
-from engine.journal.db import _engine_for_url
+from engine.journal.db import _engine_for_url, get_session
+from engine.journal.registry import get_papertrade_config, update_papertrade_config
 
 runner = CliRunner()
 
@@ -160,6 +161,53 @@ def test_papertrade_without_strategy_still_runs_skeleton_only(monkeypatch, tmp_p
     result = runner.invoke(app, ["papertrade", "--max-iterations", "1", "--poll-seconds", "0"])
     assert result.exit_code == 0, result.stdout
     assert "papertrade worker stopped" in result.stdout
+
+
+def test_papertrade_reads_strategy_from_dashboard_config_without_cli_flag(monkeypatch, tmp_path):
+    # The dashboard's /papertrade-config page writes straight to
+    # PapertradeConfig -- worker must pick that up with no --strategy flag
+    # and no PAPERTRADE_STRATEGY env var at all.
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+    settings = get_settings()
+    with get_session(settings) as session:
+        update_papertrade_config(session, strategy="momentum")
+
+    fake_broker = _FakeAlpacaClient(settings)
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+    monkeypatch.setattr("engine.execution.live_loop.fetch_bars", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr("engine.execution.live_loop.fetch_all_rss", lambda: [])
+
+    result = runner.invoke(app, ["papertrade", "--max-iterations", "1", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    with get_session(settings) as session:
+        config = get_papertrade_config(session)
+        assert config.strategy == "momentum"  # untouched -- no --strategy flag means no seed/override
+        assert config.last_cycle_at is not None  # mark_papertrade_cycle ran
+
+
+def test_papertrade_cli_flag_never_overrides_existing_dashboard_choice(monkeypatch, tmp_path):
+    # Once a strategy has been chosen from the dashboard, a later restart
+    # with the env var/flag unset must not silently revert it.
+    _isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_API_SECRET", "secret")
+    get_settings.cache_clear()
+    settings = get_settings()
+    with get_session(settings) as session:
+        update_papertrade_config(session, strategy="mean_reversion")
+
+    fake_broker = _FakeAlpacaClient(settings)
+    monkeypatch.setattr("engine.cli.main.AlpacaPaperClient", lambda settings: fake_broker)
+    monkeypatch.setattr("engine.execution.live_loop.fetch_bars", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr("engine.execution.live_loop.fetch_all_rss", lambda: [])
+
+    result = runner.invoke(app, ["papertrade", "--max-iterations", "1", "--poll-seconds", "0"])
+    assert result.exit_code == 0, result.stdout
+    with get_session(settings) as session:
+        assert get_papertrade_config(session).strategy == "mean_reversion"
 
 
 def test_predict_loop_refuses_without_anthropic_key(monkeypatch, tmp_path):

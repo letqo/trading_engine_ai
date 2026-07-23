@@ -38,8 +38,10 @@ from engine.journal.registry import (
     load_off_universe_symbol_stats,
     load_open_hypotheses,
     get_risk_gate_config,
+    get_papertrade_config,
     load_prediction_trades,
     mark_anticipatory_loop_cycle,
+    mark_papertrade_cycle,
     mark_predict_loop_cycle,
     record_halt,
     record_metrics,
@@ -48,6 +50,7 @@ from engine.journal.registry import (
     record_trade,
     register_run,
     update_anticipatory_loop_config,
+    update_papertrade_config,
     update_predict_loop_config,
 )
 from engine.logging_setup import configure_logging, get_logger
@@ -631,8 +634,9 @@ def papertrade(
     strategy: str = typer.Option(
         None, envvar="PAPERTRADE_STRATEGY",
         help=f"one of: {', '.join(sorted(LIVE_ELIGIBLE_STRATEGIES))} (omit to run the reconcile/kill-switch "
-             f"skeleton only, no trading). Also settable via PAPERTRADE_STRATEGY, so a Railway deployment "
-             f"can switch strategies with an env var change instead of a start-command edit.",
+             f"skeleton only, no trading). Only seeds the dashboard-tunable strategy choice on first run when "
+             f"explicitly passed (also settable via PAPERTRADE_STRATEGY) -- after that, the /papertrade-config "
+             f"dashboard page is authoritative and the loop hot-switches strategies without a restart.",
     ),
     interval: str = typer.Option("1h", envvar="PAPERTRADE_INTERVAL", help="bar timeframe for the selected strategy"),
     poll_seconds: int = typer.Option(60, help="loop interval"),
@@ -640,11 +644,20 @@ def papertrade(
 ) -> None:
     """Live paper-trading worker loop. Paper-only guard is enforced before
     anything else; the loop reconciles broker state on startup and checks
-    the kill switch and daily-drawdown halt every iteration. With
-    `--strategy`, it also polls for new bars/news and trades that strategy
-    live through RiskGate -- the same object, same signal semantics, as
-    `engine backtest`. Without it, this is the pre-existing crash-safe
-    skeleton with no trading at all."""
+    the kill switch and daily-drawdown halt every iteration. With a
+    strategy selected (via PapertradeConfig, dashboard-tunable at
+    /papertrade-config), it also polls for new bars/news and trades that
+    strategy live through RiskGate -- the same object, same signal
+    semantics, as `engine backtest`. With no strategy selected, this is
+    the pre-existing crash-safe skeleton with no trading at all.
+
+    Strategy selection is read fresh from PapertradeConfig every
+    iteration, the same live-tunable-without-redeploy pattern as
+    PredictLoopConfig.enabled -- see engine.cli.main.predict_loop's
+    docstring. The `--strategy`/PAPERTRADE_STRATEGY option only seeds
+    that row on first run when explicitly passed; it never overrides a
+    choice already made from the dashboard on a later restart with the
+    env var unset."""
     settings = get_settings()
     if strategy is not None and strategy not in LIVE_ELIGIBLE_STRATEGIES:
         typer.echo(f"unknown or backtest-only strategy {strategy!r}, choices: {sorted(LIVE_ELIGIBLE_STRATEGIES)}", err=True)
@@ -668,18 +681,38 @@ def papertrade(
     risk_gate.start_new_session(account)
     current_date = datetime.now(timezone.utc).date()
 
-    universe = None
+    universe = load_universe(settings.universe_path)
+    active_strategy_name = "__unset__"  # sentinel distinct from None so the first _activate() always runs
     strategy_obj = None
     live_state = None
-    if strategy is not None:
-        universe = load_universe(settings.universe_path)
-        strategy_obj = STRATEGY_FACTORIES[strategy](universe, settings.random_seed)
-        live_state = LiveLoopState()
-        seed_bar_history(universe, interval, live_state)
+
+    def _activate(name: str | None) -> None:
+        nonlocal active_strategy_name, strategy_obj, live_state
+        if name == active_strategy_name:
+            return
+        if name is not None and name not in LIVE_ELIGIBLE_STRATEGIES:
+            logger.error(f"unknown or backtest-only strategy {name!r} from dashboard config -- treating as no strategy (no trading)", extra={"extra_fields": {"strategy": name}})
+            name = None
+        if name is None:
+            strategy_obj = None
+            live_state = None
+        else:
+            strategy_obj = STRATEGY_FACTORIES[name](universe, settings.random_seed)
+            live_state = LiveLoopState()
+            seed_bar_history(universe, interval, live_state)
+        logger.info("papertrade strategy switched", extra={"extra_fields": {"from": active_strategy_name, "to": name}})
+        active_strategy_name = name
+
+    with get_session(settings) as session:
+        if strategy is not None:
+            config = update_papertrade_config(session, strategy=strategy)
+        else:
+            config = get_papertrade_config(session)
+    _activate(config.strategy)
 
     logger.info(
         "papertrade worker started",
-        extra={"extra_fields": {"equity": account.equity, "strategy": strategy, "interval": interval}},
+        extra={"extra_fields": {"equity": account.equity, "strategy": active_strategy_name, "interval": interval}},
     )
     alert_service_restart(settings)
 
@@ -694,6 +727,10 @@ def papertrade(
             with get_session(settings) as session:
                 record_halt(session, reason="kill switch engaged", account_equity=account.equity, triggered_by="kill_switch")
             break
+
+        with get_session(settings) as session:
+            config = mark_papertrade_cycle(session)
+        _activate(config.strategy)
 
         try:
             with get_session(settings) as session:

@@ -46,6 +46,7 @@ from sqlalchemy import case, func
 from sqlmodel import select
 
 from engine.anticipatory.trading import MAX_SEVERITY, open_hypothesis_trade
+from engine.cli.main import LIVE_ELIGIBLE_STRATEGIES
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
 from engine.config.settings import Settings, get_settings
 from engine.dashboard.auth import require_auth
@@ -60,6 +61,7 @@ from engine.journal.models import Hypothesis, Prediction, PredictionStatus
 from engine.journal.registry import (
     find_open_trade_by_symbol,
     get_anticipatory_loop_config,
+    get_papertrade_config,
     get_predict_loop_config,
     get_risk_gate_config,
     load_latest_beliefs_by_hypothesis,
@@ -73,6 +75,7 @@ from engine.journal.registry import (
     load_recent_strategy_trades,
     load_recent_trade_rejections,
     update_anticipatory_loop_config,
+    update_papertrade_config,
     update_predict_loop_config,
     update_risk_gate_config,
 )
@@ -429,6 +432,39 @@ def strategy_trades(request: Request, _user: str = Depends(require_auth), settin
     with get_session(settings) as session:
         rows = load_recent_strategy_trades(session, limit=200)
     return _templates.TemplateResponse(request, "strategy_trades.html", {"trades": rows})
+
+
+@app.get("/papertrade-config", response_class=HTMLResponse)
+def papertrade_config_view(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    now = datetime.now(timezone.utc)
+    with get_session(settings) as session:
+        config = get_papertrade_config(session)
+        last_cycle_display = _format_ago(config.last_cycle_at, now)
+        strategy = config.strategy
+    return _templates.TemplateResponse(
+        request, "papertrade_config.html",
+        {"strategy": strategy, "strategies": sorted(LIVE_ELIGIBLE_STRATEGIES), "last_cycle_display": last_cycle_display, "saved": False},
+    )
+
+
+@app.post("/papertrade-config", response_class=HTMLResponse)
+def papertrade_config_update(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    strategy: str = Form(""),
+):
+    strategy = strategy or None
+    if strategy is not None and strategy not in LIVE_ELIGIBLE_STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"unknown or backtest-only strategy {strategy!r}")
+    now = datetime.now(timezone.utc)
+    with get_session(settings) as session:
+        config = update_papertrade_config(session, strategy=strategy)
+        last_cycle_display = _format_ago(config.last_cycle_at, now)
+    return _templates.TemplateResponse(
+        request, "papertrade_config.html",
+        {"strategy": strategy, "strategies": sorted(LIVE_ELIGIBLE_STRATEGIES), "last_cycle_display": last_cycle_display, "saved": True},
+    )
 
 
 @app.get("/anticipatory-loop-config", response_class=HTMLResponse)

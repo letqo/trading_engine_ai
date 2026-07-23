@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Papertrade config{% endblock %}
+{% block content %}
+<h1>Papertrade config</h1>
+<div class="subtitle">Live-tunable strategy for the `worker` service's technical-strategy live-trading path (engine.execution.live_loop) -- independent of and running alongside the news-driven predict-loop and anticipatory-loop, not a replacement for either. Takes effect within one loop iteration, no redeploy needed. Choosing "no strategy" runs the reconcile/kill-switch skeleton only -- worker stays up but places no trades.</div>
+{% if saved %}<div class="note">Saved. Worker will pick this up on its next iteration ({{ last_cycle_display }} since its last one).</div>{% else %}<div class="note">Worker last iterated: {{ last_cycle_display }}.</div>{% endif %}
+<form method="post" action="/papertrade-config">
+  <label>
+    Strategy
+    <select name="strategy">
+      <option value="" {% if not strategy %}selected{% endif %}>(no strategy -- no trading)</option>
+      {% for s in strategies %}
+      <option value="{{ s }}" {% if strategy == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

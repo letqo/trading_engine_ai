@@ -23,6 +23,7 @@ from engine.journal.models import (
     HypothesisStatus,
     ManualTrade,
     NewsItemRecord,
+    PapertradeConfig,
     PredictLoopConfig,
     Prediction,
     PredictionDirection,
@@ -369,6 +370,43 @@ def update_risk_gate_config(session: Session, **fields) -> RiskGateConfig:
     for key, value in fields.items():
         setattr(row, key, value)
     row.updated_at = datetime.now(timezone.utc)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def get_papertrade_config(session: Session) -> PapertradeConfig:
+    """Live-tunable papertrade strategy selection, polled fresh every
+    iteration (see engine.cli.main.papertrade) so the dashboard can
+    switch/stop the worker's technical strategy without a redeploy --
+    same get-or-create singleton pattern as get_predict_loop_config."""
+    row = session.get(PapertradeConfig, PapertradeConfig.SINGLETON_ID)
+    if row is None:
+        row = PapertradeConfig(id=PapertradeConfig.SINGLETON_ID)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row
+
+
+def update_papertrade_config(session: Session, **fields) -> PapertradeConfig:
+    row = get_papertrade_config(session)
+    for key, value in fields.items():
+        setattr(row, key, value)
+    row.updated_at = datetime.now(timezone.utc)
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def mark_papertrade_cycle(session: Session) -> PapertradeConfig:
+    """Stamp last_cycle_at -- see mark_predict_loop_cycle's docstring for
+    why this is separate from updated_at and why it returns the refreshed
+    row instead of leaving callers to fetch it again."""
+    row = get_papertrade_config(session)
+    row.last_cycle_at = datetime.now(timezone.utc)
     session.add(row)
     session.commit()
     session.refresh(row)
