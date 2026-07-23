@@ -122,6 +122,23 @@ def _fetch_resolution_data(
         return None, None, None, None
 
     df = df.sort_values("timestamp").reset_index(drop=True)
+
+    # SQLite/Postgres both hand back a naive datetime for
+    # Prediction.news_decision_timestamp (see engine.journal.registry
+    # ._as_utc's docstring for the same round-trip gap), while
+    # engine.data.bars.fetch_bars always returns tz-aware UTC timestamps --
+    # comparing the two directly raises "Cannot compare tz-naive and
+    # tz-aware datetime-like objects" the first time this runs against a
+    # real (non-empty) bars frame. Align decision_timestamp to whatever
+    # df["timestamp"] actually is, rather than assuming a fixed direction,
+    # so this is correct for both the real caller and any test fixture that
+    # builds bars with naive timestamps to match a naive decision_timestamp.
+    df_is_tz_aware = df["timestamp"].dt.tz is not None
+    if df_is_tz_aware and decision_timestamp.tzinfo is None:
+        decision_timestamp = decision_timestamp.replace(tzinfo=timezone.utc)
+    elif not df_is_tz_aware and decision_timestamp.tzinfo is not None:
+        decision_timestamp = decision_timestamp.replace(tzinfo=None)
+
     exit_deadline = decision_timestamp + timedelta(hours=window_hours)
 
     entry_positions = df.index[df["timestamp"] >= decision_timestamp]

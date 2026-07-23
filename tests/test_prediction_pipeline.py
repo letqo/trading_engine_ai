@@ -154,6 +154,45 @@ def test_resolve_pending_predictions_computes_correct_outcome(db_session):
     assert resolved[0].outcome_correct is True  # predicted DOWN, price fell
 
 
+def test_resolve_pending_predictions_handles_tz_aware_bars_against_naive_decision_timestamp(db_session):
+    # Real bug found in production: engine.data.bars.fetch_bars always
+    # returns tz-aware UTC timestamps, but Prediction.news_decision_timestamp
+    # round-trips through the DB as naive (same SQLite/Postgres datetime
+    # round-trip gap documented on engine.journal.registry._as_utc) --
+    # comparing them directly raised "Cannot compare tz-naive and tz-aware
+    # datetime-like objects" and silently skipped resolving every pending
+    # prediction. The other tests in this file build bars with naive
+    # timestamps matching a naive decision_ts, so they never exercised this;
+    # this one deliberately mirrors real fetch_bars output (tz-aware) against
+    # a naive decision_ts (post record_prediction()'s session.refresh).
+    pred = record_prediction(
+        db_session, news_headline="BOJ hikes", news_source="rss",
+        news_published_at=NOW - timedelta(days=2), news_decision_timestamp=NOW - timedelta(days=2),
+        topics=["boj"], symbol="EWJ", direction=PredictionDirection.DOWN, confidence=0.7, rationale="x",
+        model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF, forward_safe=True,
+        resolution_window_hours=24.0, in_tracked_universe=True,
+    )
+    decision_ts_naive = pred.news_decision_timestamp.replace(tzinfo=None)
+    assert decision_ts_naive.tzinfo is None  # sanity: this is the real-world shape being reproduced
+
+    tz_aware_ts = pred.news_decision_timestamp  # already tz-aware here; bars must be tz-aware like real fetch_bars
+    bars = _bars_df("EWJ", [
+        (tz_aware_ts, 100.0, 100.0),
+        (tz_aware_ts + timedelta(hours=12), 100.0, 97.0),
+        (tz_aware_ts + timedelta(hours=24), 97.0, 95.0),
+    ])
+    pred.news_decision_timestamp = decision_ts_naive  # force the naive shape fetch_resolution_data actually receives
+    db_session.add(pred)
+    db_session.commit()
+
+    with patch("engine.prediction.pipeline.fetch_bars", return_value=bars):
+        resolved = resolve_pending_predictions(db_session, as_of=NOW)
+
+    assert len(resolved) == 1
+    assert resolved[0].status == PredictionStatus.RESOLVED
+    assert resolved[0].outcome_correct is True  # predicted DOWN, price fell
+
+
 def test_resolve_pending_predictions_marks_invalid_when_no_bars(db_session):
     record_prediction(
         db_session, news_headline="BOJ hikes", news_source="rss",
