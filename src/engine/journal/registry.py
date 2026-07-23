@@ -500,7 +500,11 @@ def load_actionable_predictions(session: Session, min_confidence: float) -> list
     what `engine act-on-predictions` operates on. forward_safe is required
     here too even though its real purpose is scoring integrity: trading on
     a prediction that might reflect hindsight leakage would be reckless
-    regardless of which reason we'd be using it for."""
+    regardless of which reason we'd be using it for. trade_rejected==False
+    excludes predictions the broker already refused (see mark_prediction
+    _trade_rejected) -- retrying those every cycle would silently waste API
+    calls on something structurally untradeable (e.g. a non-shortable
+    asset) forever."""
     rows = session.exec(
         select(Prediction).where(
             Prediction.status == PredictionStatus.PENDING,
@@ -508,6 +512,7 @@ def load_actionable_predictions(session: Session, min_confidence: float) -> list
             Prediction.in_tracked_universe == True,  # noqa: E712 -- only vetted, tradable symbols
             Prediction.confidence >= min_confidence,
             Prediction.traded_order_id.is_(None),
+            Prediction.trade_rejected == False,  # noqa: E712
         )
     ).all()
     return list(rows)
@@ -520,6 +525,29 @@ def mark_prediction_traded(session: Session, prediction: Prediction, *, order_id
     session.commit()
     session.refresh(prediction)
     return prediction
+
+
+def mark_prediction_trade_rejected(session: Session, prediction: Prediction, *, reason: str) -> Prediction:
+    """The broker itself refused this order (e.g. Alpaca rejecting a
+    short-sell on a non-shortable asset) -- distinct from a RiskGate
+    rejection, which is transient and left to retry every cycle. See
+    Prediction.trade_rejected's docstring."""
+    prediction.trade_rejected = True
+    prediction.trade_rejection_reason = reason
+    session.add(prediction)
+    session.commit()
+    session.refresh(prediction)
+    return prediction
+
+
+def load_recent_trade_rejections(session: Session, limit: int = 20) -> list[Prediction]:
+    rows = session.exec(
+        select(Prediction)
+        .where(Prediction.trade_rejected == True)  # noqa: E712
+        .order_by(Prediction.created_at.desc())
+        .limit(limit)
+    ).all()
+    return list(rows)
 
 
 def mark_prediction_exited(session: Session, prediction: Prediction, *, order_id: str) -> Prediction:
@@ -795,6 +823,29 @@ def mark_hypothesis_traded(
     session.commit()
     session.refresh(hypothesis)
     return hypothesis
+
+
+def mark_hypothesis_trade_rejected(session: Session, hypothesis: Hypothesis, *, reason: str) -> Hypothesis:
+    """See Prediction.trade_rejected's docstring -- same distinction
+    (broker-level rejection, not retried) applied to hypotheses.
+    act_on_hypothesis_beliefs skips calling _open_position again once
+    this is set, even though belief revision keeps re-estimating."""
+    hypothesis.trade_rejected = True
+    hypothesis.trade_rejection_reason = reason
+    session.add(hypothesis)
+    session.commit()
+    session.refresh(hypothesis)
+    return hypothesis
+
+
+def load_recent_hypothesis_trade_rejections(session: Session, limit: int = 20) -> list[Hypothesis]:
+    rows = session.exec(
+        select(Hypothesis)
+        .where(Hypothesis.trade_rejected == True)  # noqa: E712
+        .order_by(Hypothesis.created_at.desc())
+        .limit(limit)
+    ).all()
+    return list(rows)
 
 
 def mark_hypothesis_flat(session: Session, hypothesis: Hypothesis, *, exit_order_id: str) -> Hypothesis:

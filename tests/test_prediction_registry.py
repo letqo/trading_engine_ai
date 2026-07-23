@@ -13,10 +13,12 @@ from engine.journal.registry import (
     load_open_traded_predictions,
     load_pending_predictions_past_window,
     load_prediction_trades,
+    load_recent_trade_rejections,
     load_resolved_predictions_by_topics,
     mark_predict_loop_cycle,
     mark_prediction_exited,
     mark_prediction_traded,
+    mark_prediction_trade_rejected,
     record_prediction,
     resolve_prediction,
     update_predict_loop_config,
@@ -193,6 +195,32 @@ def test_load_actionable_predictions_excludes_already_traded(db_session):
     mark_prediction_traded(db_session, pred, order_id="order-1", quantity=10.0)
     results = load_actionable_predictions(db_session, min_confidence=0.6)
     assert results == []
+
+
+def test_load_actionable_predictions_excludes_trade_rejected(db_session):
+    pred = _make(db_session)
+    mark_prediction_trade_rejected(db_session, pred, reason="422 not shortable")
+    results = load_actionable_predictions(db_session, min_confidence=0.6)
+    assert results == []
+
+
+def test_mark_prediction_trade_rejected_sets_fields_and_leaves_traded_order_id_none(db_session):
+    pred = _make(db_session)
+    updated = mark_prediction_trade_rejected(db_session, pred, reason="422 not shortable: EWJ")
+    assert updated.trade_rejected is True
+    assert updated.trade_rejection_reason == "422 not shortable: EWJ"
+    assert updated.traded_order_id is None  # a rejection is not a trade
+
+
+def test_load_recent_trade_rejections_returns_only_rejected_most_recent_first(db_session):
+    older = _make(db_session, decision_ts=NOW - timedelta(hours=2))
+    mark_prediction_trade_rejected(db_session, older, reason="r1")
+    newer = _make(db_session, decision_ts=NOW - timedelta(hours=1))
+    mark_prediction_trade_rejected(db_session, newer, reason="r2")
+    _make(db_session)  # never rejected -- not in scope
+
+    results = load_recent_trade_rejections(db_session)
+    assert [p.id for p in results] == [newer.id, older.id]
 
 
 def test_mark_prediction_traded_sets_fields(db_session):

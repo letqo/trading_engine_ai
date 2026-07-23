@@ -6,7 +6,7 @@
 
 {% if hypotheses %}
 <table>
-  <tr><th>Opened</th><th>Symbol</th><th>If YES</th><th>Status</th><th>Position</th><th>P_model</th><th>P_market</th><th>Gap</th><th>Last action</th><th>Question</th><th>Rationale</th></tr>
+  <tr><th>Opened</th><th>Symbol</th><th>If YES</th><th>Status</th><th>Position</th><th>Trade</th><th>P_model</th><th>P_market</th><th>Gap</th><th>Last action</th><th>Question</th><th>Rationale</th></tr>
   {% for h in hypotheses %}
   {% set belief = latest_beliefs.get(h.id) %}
   <tr>
@@ -21,6 +21,15 @@
       {% endif %}
     </td>
     <td>{{ h.position_side or "flat" }}</td>
+    <td>
+      {% if h.trade_rejected %}
+        <span class="tag incorrect" title="{{ h.trade_rejection_reason }}">rejected</span>
+      {% elif h.traded_order_id %}
+        <span class="tag correct">traded</span>
+      {% else %}
+        -
+      {% endif %}
+    </td>
     <td>{{ "%.2f"|format(belief.p_model) if belief else "-" }}</td>
     <td>{{ "%.2f"|format(belief.p_market) if belief else "-" }}</td>
     <td>{{ "%+.2f"|format(belief.gap) if belief else "-" }}</td>

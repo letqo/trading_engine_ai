@@ -7,8 +7,10 @@ from engine.journal.registry import (
     load_latest_beliefs_by_hypothesis,
     load_open_hypotheses,
     load_recent_hypotheses,
+    load_recent_hypothesis_trade_rejections,
     mark_anticipatory_loop_cycle,
     mark_hypothesis_flat,
+    mark_hypothesis_trade_rejected,
     mark_hypothesis_traded,
     record_hypothesis_belief,
     update_anticipatory_loop_config,
@@ -100,6 +102,25 @@ def test_mark_hypothesis_flat_clears_position_fields(db_session):
     assert hyp.traded_order_id is None
     assert hyp.traded_quantity is None
     assert hyp.exit_order_id == "order-2"
+
+
+def test_mark_hypothesis_trade_rejected_sets_fields_and_leaves_traded_order_id_none(db_session):
+    hyp = _make_hyp(db_session)
+    updated = mark_hypothesis_trade_rejected(db_session, hyp, reason="422 not shortable: XLE")
+    assert updated.trade_rejected is True
+    assert updated.trade_rejection_reason == "422 not shortable: XLE"
+    assert updated.traded_order_id is None  # a rejection is not a trade
+
+
+def test_load_recent_hypothesis_trade_rejections_returns_only_rejected_most_recent_first(db_session):
+    older = _make_hyp(db_session, market_id="m1")
+    mark_hypothesis_trade_rejected(db_session, older, reason="r1")
+    newer = _make_hyp(db_session, market_id="m2")
+    mark_hypothesis_trade_rejected(db_session, newer, reason="r2")
+    _make_hyp(db_session, market_id="m3")  # never rejected -- not in scope
+
+    results = load_recent_hypothesis_trade_rejections(db_session)
+    assert [h.id for h in results] == [newer.id, older.id]
 
 
 def test_close_hypothesis_sets_status_and_outcome(db_session):

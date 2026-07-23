@@ -38,6 +38,14 @@
   &mdash; see <a href="/risk-events">risk events</a>
 </div>
 {% endif %}
+{% if status.recent_rejected_predictions or status.recent_rejected_hypotheses %}
+<div class="note" style="color:#e8756c;">
+  Trade rejections (broker refused the order, not retried):
+  {% for p in status.recent_rejected_predictions %}{{ p.symbol }} prediction ({{ p.created_at.strftime("%Y-%m-%d %H:%M") }}){% if not loop.last or status.recent_rejected_hypotheses %}, {% endif %}{% endfor %}
+  {% for h in status.recent_rejected_hypotheses %}{{ h.symbol }} hypothesis ({{ h.created_at.strftime("%Y-%m-%d %H:%M") }}){% if not loop.last %}, {% endif %}{% endfor %}
+  &mdash; see <a href="/predictions">predictions</a> / <a href="/hypotheses">hypotheses</a>
+</div>
+{% endif %}
 
 <h1>Account</h1>
 <div class="cards">

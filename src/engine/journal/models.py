@@ -250,6 +250,17 @@ class Prediction(SQLModel, table=True):
     traded_quantity: float | None = None
     exit_order_id: str | None = None
 
+    # Set if a real order submission was attempted and the broker itself
+    # rejected it (e.g. Alpaca refusing a short-sell on an asset that
+    # isn't shortable) -- distinct from a RiskGate rejection, which is
+    # transient (position/exposure caps can free up) and so is retried
+    # every cycle. A broker-level rejection is a structural fact about
+    # this symbol/order that retrying won't change, so it's excluded from
+    # load_actionable_predictions instead of silently re-attempted (and
+    # re-failing) forever. See engine.prediction.trading.
+    trade_rejected: bool = Field(default=False, index=True)
+    trade_rejection_reason: str | None = None
+
 
 class PredictionTopic(SQLModel, table=True):
     """One row per (prediction, topic) pair -- lets
@@ -341,6 +352,15 @@ class Hypothesis(SQLModel, table=True):
     traded_order_id: str | None = Field(default=None, index=True)
     traded_quantity: float | None = None
     exit_order_id: str | None = None
+
+    # See Prediction.trade_rejected's docstring -- same distinction (a
+    # broker-level rejection is structural, not retried) applied here.
+    # act_on_hypothesis_beliefs skips calling _open_position again once
+    # this is set, even though belief revision keeps re-estimating and
+    # may keep producing OPENED actions -- tracking the model's belief
+    # stays useful even for a symbol that turned out untradeable.
+    trade_rejected: bool = Field(default=False, index=True)
+    trade_rejection_reason: str | None = None
 
 
 class HypothesisAction(str, Enum):

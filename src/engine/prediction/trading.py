@@ -29,6 +29,7 @@ from engine.journal.registry import (
     load_open_traded_predictions,
     mark_prediction_exited,
     mark_prediction_traded,
+    mark_prediction_trade_rejected,
 )
 from engine.logging_setup import get_logger
 from engine.risk.gate import RiskGate
@@ -84,12 +85,27 @@ def act_on_pending_predictions(
             )
             continue
 
-        broker_order = broker.submit_order(
-            OrderRequest(
-                symbol=prediction.symbol, side=side, quantity=decision.approved_quantity, price=price,
-                timestamp=order.timestamp, strategy_id="consequence_prediction",
+        try:
+            broker_order = broker.submit_order(
+                OrderRequest(
+                    symbol=prediction.symbol, side=side, quantity=decision.approved_quantity, price=price,
+                    timestamp=order.timestamp, strategy_id="consequence_prediction",
+                )
             )
-        )
+        except Exception as exc:
+            # A broker-level rejection (e.g. Alpaca refusing to short an
+            # asset that isn't shortable) is a structural fact about this
+            # order, not a transient RiskGate-style cap -- retrying every
+            # cycle would silently waste API calls forever. Isolated here
+            # (rather than letting it propagate) so one bad symbol can't
+            # also abort every other actionable prediction in this batch.
+            logger.error(
+                "prediction order rejected by broker -- marking untradeable, will not retry",
+                extra={"extra_fields": {"symbol": prediction.symbol, "side": side.value, "error": str(exc)}},
+            )
+            mark_prediction_trade_rejected(session, prediction, reason=str(exc))
+            continue
+
         apply_opening_fill(account, prediction.symbol, side, decision.approved_quantity, price, "consequence_prediction")
         mark_prediction_traded(session, prediction, order_id=broker_order.broker_order_id, quantity=decision.approved_quantity)
         acted.append(prediction)
@@ -174,12 +190,24 @@ def _close_position(
         )
         return False
 
-    broker_order = broker.submit_order(
-        OrderRequest(
-            symbol=prediction.symbol, side=exit_side, quantity=decision.approved_quantity, price=price,
-            timestamp=order.timestamp, strategy_id="consequence_prediction",
+    try:
+        broker_order = broker.submit_order(
+            OrderRequest(
+                symbol=prediction.symbol, side=exit_side, quantity=decision.approved_quantity, price=price,
+                timestamp=order.timestamp, strategy_id="consequence_prediction",
+            )
         )
-    )
+    except Exception as exc:
+        # Unlike an opening order, a closing order should always keep
+        # being retried -- giving up on closing real exposure would be
+        # the dangerous direction to fail in. Isolated here so one failed
+        # close can't abort the rest of this cycle's closes too.
+        logger.error(
+            "prediction exit order rejected by broker -- position stays open, will retry next cycle",
+            extra={"extra_fields": {"symbol": prediction.symbol, "error": str(exc)}},
+        )
+        return False
+
     apply_closing_fill(account, risk_gate, prediction.symbol, existing, decision.approved_quantity, price)
     mark_prediction_exited(session, prediction, order_id=broker_order.broker_order_id)
     return True

@@ -13,7 +13,12 @@ from engine.data.universe import Universe
 from engine.execution.broker import Broker
 from engine.execution.position_bookkeeping import apply_closing_fill, apply_opening_fill
 from engine.journal.models import Hypothesis, HypothesisAction, HypothesisBelief, PredictionDirection
-from engine.journal.registry import load_open_hypotheses, mark_hypothesis_flat, mark_hypothesis_traded
+from engine.journal.registry import (
+    load_open_hypotheses,
+    mark_hypothesis_flat,
+    mark_hypothesis_trade_rejected,
+    mark_hypothesis_traded,
+)
 from engine.logging_setup import get_logger
 from engine.risk.gate import RiskGate
 from engine.risk.models import AccountState, OrderRequest, Side
@@ -55,6 +60,17 @@ def act_on_hypothesis_beliefs(
     for belief in beliefs:
         hyp = hypotheses[belief.hypothesis_id]
         if belief.action == HypothesisAction.OPENED:
+            if hyp.trade_rejected:
+                # A prior open attempt was refused by the broker itself
+                # (structural, e.g. non-shortable) -- belief revision
+                # keeps re-estimating and can keep producing OPENED, but
+                # retrying the same doomed order every cycle would just
+                # waste API calls. See mark_hypothesis_trade_rejected.
+                logger.info(
+                    "skipping hypothesis open -- previously rejected by broker",
+                    extra={"extra_fields": {"symbol": hyp.symbol, "hypothesis_id": hyp.id}},
+                )
+                continue
             if _open_position(session, broker, risk_gate, account, tradable, hyp, belief, min_gap_threshold):
                 opened += 1
         elif belief.action == HypothesisAction.EXITED:
@@ -158,12 +174,24 @@ def _open_position(
         )
         return False
 
-    broker_order = broker.submit_order(
-        OrderRequest(
-            symbol=hyp.symbol, side=side, quantity=decision.approved_quantity, price=price,
-            timestamp=order.timestamp, strategy_id=_STRATEGY_ID,
+    try:
+        broker_order = broker.submit_order(
+            OrderRequest(
+                symbol=hyp.symbol, side=side, quantity=decision.approved_quantity, price=price,
+                timestamp=order.timestamp, strategy_id=_STRATEGY_ID,
+            )
         )
-    )
+    except Exception as exc:
+        # See engine.prediction.trading's identical handling -- a broker-
+        # level rejection is structural, not retried; isolated here so one
+        # bad symbol can't abort the rest of this cycle's beliefs too.
+        logger.error(
+            "hypothesis order rejected by broker -- marking untradeable, will not retry",
+            extra={"extra_fields": {"symbol": hyp.symbol, "side": side.value, "error": str(exc)}},
+        )
+        mark_hypothesis_trade_rejected(session, hyp, reason=str(exc))
+        return False
+
     apply_opening_fill(account, hyp.symbol, side, decision.approved_quantity, price, _STRATEGY_ID)
     mark_hypothesis_traded(session, hyp, order_id=broker_order.broker_order_id, quantity=decision.approved_quantity, side=position_side)
     return True
@@ -196,12 +224,24 @@ def _close_position(session, broker: Broker, risk_gate: RiskGate, account: Accou
         )
         return False
 
-    broker_order = broker.submit_order(
-        OrderRequest(
-            symbol=hyp.symbol, side=exit_side, quantity=decision.approved_quantity, price=price,
-            timestamp=order.timestamp, strategy_id=_STRATEGY_ID,
+    try:
+        broker_order = broker.submit_order(
+            OrderRequest(
+                symbol=hyp.symbol, side=exit_side, quantity=decision.approved_quantity, price=price,
+                timestamp=order.timestamp, strategy_id=_STRATEGY_ID,
+            )
         )
-    )
+    except Exception as exc:
+        # Unlike an opening order, a closing order should always keep
+        # being retried -- see engine.prediction.trading's identical
+        # reasoning. Isolated here so one failed close can't abort the
+        # rest of this cycle's closes too.
+        logger.error(
+            "hypothesis exit order rejected by broker -- position stays open, will retry next cycle",
+            extra={"extra_fields": {"symbol": hyp.symbol, "error": str(exc)}},
+        )
+        return False
+
     apply_closing_fill(account, risk_gate, hyp.symbol, existing, decision.approved_quantity, price)
     mark_hypothesis_flat(session, hyp, exit_order_id=broker_order.broker_order_id)
     return True

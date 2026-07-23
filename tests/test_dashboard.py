@@ -13,6 +13,8 @@ from engine.journal.registry import (
     create_hypothesis,
     get_anticipatory_loop_config,
     get_predict_loop_config,
+    mark_hypothesis_trade_rejected,
+    mark_prediction_trade_rejected,
     record_halt,
     record_hypothesis_belief,
     record_prediction,
@@ -259,6 +261,54 @@ def test_hypotheses_page_renders_symbol_and_latest_belief(tmp_path):
         assert "XLE" in resp.text
         assert "fed cut would boost energy demand" in resp.text
         assert "opened" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_trade_rejections_render_on_predictions_hypotheses_and_overview(tmp_path):
+    db_path = tmp_path / "dashboard_rejections_test.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    now = datetime.now(timezone.utc)
+    with Session(engine_) as session:
+        pred = record_prediction(
+            session,
+            news_headline="h", news_source="rss", news_published_at=now, news_decision_timestamp=now,
+            topics=[], symbol="EWJ", direction="down", confidence=0.7,
+            rationale="r", model_name="test", model_knowledge_cutoff=now, forward_safe=True,
+            resolution_window_hours=24.0, in_tracked_universe=True,
+        )
+        mark_prediction_trade_rejected(session, pred, reason="422 not shortable: EWJ")
+
+        hyp = create_hypothesis(
+            session, market_id="m1", question="Will X happen?", symbol="XLE",
+            direction_if_yes=PredictionDirection.UP,
+        )
+        mark_hypothesis_trade_rejected(session, hyp, reason="422 not shortable: XLE")
+
+    test_settings = Settings(database_url=db_url, dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        auth = _auth_header("admin", "testpass")
+        client = TestClient(app)
+
+        resp = client.get("/predictions", headers=auth)
+        assert resp.status_code == 200
+        assert "rejected" in resp.text
+        assert "422 not shortable: EWJ" in resp.text
+
+        resp2 = client.get("/hypotheses", headers=auth)
+        assert resp2.status_code == 200
+        assert "rejected" in resp2.text
+        assert "422 not shortable: XLE" in resp2.text
+
+        resp3 = client.get("/", headers=auth)
+        assert resp3.status_code == 200
+        assert "Trade rejections" in resp3.text
+        assert "EWJ prediction" in resp3.text
+        assert "XLE hypothesis" in resp3.text
     finally:
         app.dependency_overrides.clear()
 

@@ -1197,3 +1197,70 @@ to record what duration it's actually called with, set a large
 poll_seconds (3600s / 10800s) with the loop paused, and assert the
 recorded sleep call is `PAUSED_RECHECK_SECONDS`, not the full interval --
 proving the old bug would have failed these tests too.
+
+## 2026-07-23 (later) -- Fix: a broker order rejection crashed the whole trading batch, and there was no dashboard visibility into it
+
+Once predict-loop actually resumed real cycles (thanks to the two fixes
+above), it hit a genuine production error within minutes: `422 Client
+Error: Unprocessable Entity` from Alpaca on `/v2/orders`. The three
+actionable predictions waiting to trade were all DOWN-direction (short)
+on USO/XLE -- commodity ETFs that are plausibly excluded from Alpaca's
+shortable list. Confirmed via `railway logs` that the exception fully
+propagated out of `act_on_pending_predictions`, aborting the entire
+cycle's order-submission loop -- not just the one bad symbol. Since
+`load_actionable_predictions` never marks anything as "attempted and
+failed," the same bad prediction would be retried (and fail identically)
+every single cycle, forever, silently blocking every other actionable
+prediction from ever trading too.
+
+**Root cause:** `broker.submit_order()` calls inside `act_on_pending
+_predictions` (opens) and `_close_position` (closes, both prediction and
+anticipatory modules) had no exception handling at all -- a single HTTP
+error from the broker unwound the whole per-cycle loop via Python's normal
+exception propagation.
+
+**Fix:** wrapped every `broker.submit_order()` call in try/except, but
+with two different recovery behaviors depending on direction, matching
+the difference in what "giving up" would mean:
+- **Opens** (`act_on_pending_predictions`, `_open_position` in both
+  prediction and anticipatory trading modules): a broker-level rejection
+  is a structural fact about that symbol/order (e.g. "not shortable")
+  that retrying won't fix -- unlike a RiskGate rejection, which is
+  transient (caps can free up) and stays eligible for retry. Added
+  `Prediction.trade_rejected`/`trade_rejection_reason` and the Hypothesis
+  equivalent, set via new `mark_prediction_trade_rejected`/
+  `mark_hypothesis_trade_rejected`. `load_actionable_predictions` now
+  excludes `trade_rejected` rows; `act_on_hypothesis_beliefs` now skips
+  calling `_open_position` again for a hypothesis already marked rejected
+  (belief revision keeps re-estimating and can keep producing OPENED --
+  tracking the model's belief stays useful even for an untradeable
+  symbol, only the *act* step needed to stop retrying).
+- **Closes** (`_close_position` in both modules): the opposite
+  direction -- a failed close must always keep being retried, since
+  giving up on closing real exposure is the dangerous failure mode.
+  These just log the error and return False (no rejection flag set,
+  position stays open), same as an existing RiskGate-rejected close.
+
+Both cases isolate the exception per-symbol/per-hypothesis so one failure
+can no longer abort the rest of that cycle's batch.
+
+**Dashboard visibility** (the user explicitly asked this be visible, not
+just logged): added a "Trade" column to `/predictions` and `/hypotheses`
+showing a `rejected` tag (hover shows the reason) or `traded`, and a new
+"Trade rejections" note on the Overview page's System Status section
+(`_system_status()` now also loads the 5 most recent of each via
+`load_recent_trade_rejections`/`load_recent_hypothesis_trade_rejections`),
+same visual treatment as the existing "Recent halts" note.
+
+Migration `4dd240b2722e`: two plain columns + one index per table
+(`prediction`, `hypothesis`) -- no enum involved, so none of the earlier
+Postgres `create_type` migration issues applied here.
+
+New tests across `test_prediction_trading.py`/`test_anticipatory_trading.py`
+(rejection marks the row and doesn't retry; rejection on one symbol
+doesn't block a sibling symbol in the same batch; a rejected *close*
+stays open for retry and does *not* get the rejected flag),
+`test_prediction_registry.py`/`test_hypothesis_registry.py` (the new
+mark/load functions, `load_actionable_predictions` excluding rejected),
+and `test_dashboard.py` (rejected rows render on both list pages and the
+Overview note, with the reason text visible).

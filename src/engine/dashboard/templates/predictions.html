@@ -43,7 +43,7 @@
 <h1>Recent predictions</h1>
 {% if predictions %}
 <table>
-  <tr><th>Decision time</th><th>Symbol</th><th>Predicted</th><th>Status</th><th>Move</th><th>MFE</th><th>MAE</th><th>Tracked</th><th>Headline</th><th>Reasoning</th></tr>
+  <tr><th>Decision time</th><th>Symbol</th><th>Predicted</th><th>Status</th><th>Move</th><th>MFE</th><th>MAE</th><th>Tracked</th><th>Trade</th><th>Headline</th><th>Reasoning</th></tr>
   {% for p in predictions %}
   <tr>
     <td>{{ p.news_decision_timestamp.strftime("%Y-%m-%d %H:%M") }}</td>
@@ -60,6 +60,15 @@
     <td>{{ "%.2f%%"|format(p.mfe_pct) if p.mfe_pct is not none else "-" }}</td>
     <td>{{ "%.2f%%"|format(p.mae_pct) if p.mae_pct is not none else "-" }}</td>
     <td>{{ "yes" if p.in_tracked_universe else "no" }}</td>
+    <td>
+      {% if p.trade_rejected %}
+        <span class="tag incorrect" title="{{ p.trade_rejection_reason }}">rejected</span>
+      {% elif p.traded_order_id %}
+        <span class="tag correct">traded</span>
+      {% else %}
+        -
+      {% endif %}
+    </td>
     <td class="headline">{{ p.news_headline }}</td>
     <td class="rationale">{{ p.rationale }}</td>
   </tr>

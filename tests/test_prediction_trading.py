@@ -26,6 +26,16 @@ def make_universe():
     )
 
 
+def make_two_symbol_universe():
+    return Universe(
+        instruments=(
+            Instrument(symbol="EWJ", tier=2, asset_class="equity_etf", news_topics=("boj",)),
+            Instrument(symbol="XLE", tier=2, asset_class="equity_etf", news_topics=("energy",)),
+        ),
+        source_text="x",
+    )
+
+
 class FakeBroker:
     def __init__(self):
         self.submitted = []
@@ -55,11 +65,25 @@ class FakeBroker:
         pass
 
 
-def make_prediction(session, *, direction, confidence=0.8, decision_ts=None, resolution_window_hours=24.0, in_tracked_universe=True):
+class _RaisingBroker(FakeBroker):
+    """A broker that rejects orders for specific symbols, like Alpaca
+    refusing to short-sell a non-shortable asset (422)."""
+
+    def __init__(self, fail_symbols):
+        super().__init__()
+        self.fail_symbols = set(fail_symbols)
+
+    def submit_order(self, order):
+        if order.symbol in self.fail_symbols:
+            raise RuntimeError(f"422 Client Error: Unprocessable Entity for {order.symbol}")
+        return super().submit_order(order)
+
+
+def make_prediction(session, *, direction, confidence=0.8, decision_ts=None, resolution_window_hours=24.0, in_tracked_universe=True, symbol="EWJ"):
     decision_ts = decision_ts or NOW
     return record_prediction(
         session, news_headline="BOJ hikes rates", news_source="rss", news_published_at=decision_ts,
-        news_decision_timestamp=decision_ts, topics=["boj"], symbol="EWJ", direction=direction,
+        news_decision_timestamp=decision_ts, topics=["boj"], symbol=symbol, direction=direction,
         confidence=confidence, rationale="x", model_name="claude-opus-4-8", model_knowledge_cutoff=CUTOFF,
         forward_safe=True, resolution_window_hours=resolution_window_hours, in_tracked_universe=in_tracked_universe,
     )
@@ -130,6 +154,46 @@ def test_act_on_pending_predictions_respects_risk_gate_rejection(db_session):
     assert broker.submitted == []
 
 
+def test_act_on_pending_predictions_marks_broker_rejection_without_retrying(db_session):
+    pred = make_prediction(db_session, direction=PredictionDirection.DOWN)  # short -> the one Alpaca might refuse
+    broker = _RaisingBroker(fail_symbols={"EWJ"})
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
+    account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
+
+    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+        acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
+
+    assert acted == []
+    assert pred.trade_rejected is True
+    assert "422" in pred.trade_rejection_reason
+    assert pred.traded_order_id is None  # never actually traded
+    assert "EWJ" not in account.positions  # no fill applied
+
+    # Re-running must not retry it -- load_actionable_predictions excludes
+    # trade_rejected rows.
+    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+        acted_again = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
+    assert acted_again == []
+    assert broker.submitted == []
+
+
+def test_act_on_pending_predictions_broker_rejection_does_not_block_other_predictions(db_session):
+    failing = make_prediction(db_session, direction=PredictionDirection.DOWN, symbol="EWJ")
+    healthy = make_prediction(db_session, direction=PredictionDirection.UP, symbol="XLE")
+    broker = _RaisingBroker(fail_symbols={"EWJ"})
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
+    account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
+
+    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+        acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_two_symbol_universe(), min_confidence=0.6)
+
+    # The rejected EWJ prediction must not abort the batch -- XLE still trades.
+    assert [p.id for p in acted] == [healthy.id]
+    assert failing.trade_rejected is True
+    assert healthy.traded_order_id is not None
+    assert "XLE" in account.positions
+
+
 def test_close_expired_prediction_trades_closes_long_with_profit(db_session):
     pred = make_prediction(db_session, direction=PredictionDirection.UP, decision_ts=NOW - timedelta(days=2))
     broker = FakeBroker()
@@ -190,6 +254,29 @@ def test_close_expired_prediction_trades_skips_when_no_open_position(db_session)
     assert len(closed) == 1
     assert closed[0].exit_order_id == "none:no_open_position"
     assert broker.submitted == []
+
+
+def test_close_expired_prediction_trades_broker_rejection_leaves_position_open_for_retry(db_session):
+    pred = make_prediction(db_session, direction=PredictionDirection.UP, decision_ts=NOW - timedelta(days=2))
+    broker = _RaisingBroker(fail_symbols={"EWJ"})
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0))
+    account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
+    account.positions["EWJ"] = Position(symbol="EWJ", quantity=50.0, avg_entry_price=100.0)
+    pred.traded_order_id = "order-1"
+    pred.traded_quantity = 50.0
+    db_session.add(pred)
+    db_session.commit()
+
+    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(110.0)):
+        closed = close_expired_prediction_trades(db_session, broker, risk_gate, account, make_universe(), as_of=NOW)
+
+    # Unlike an open rejection, a close must NOT be given up on -- the
+    # position stays open (and traded) so it's retried next cycle, rather
+    # than being marked exited when no real exit ever happened.
+    assert closed == []
+    assert pred.exit_order_id is None
+    assert pred.trade_rejected is False  # rejection tracking is open-only, closes always retry
+    assert "EWJ" in account.positions
 
 
 def test_close_stopped_prediction_trades_closes_long_when_stop_triggered(db_session):

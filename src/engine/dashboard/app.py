@@ -40,7 +40,9 @@ from engine.journal.registry import (
     load_prediction_trades,
     load_recent_experiment_runs,
     load_recent_hypotheses,
+    load_recent_hypothesis_trade_rejections,
     load_recent_risk_halts,
+    load_recent_trade_rejections,
     update_anticipatory_loop_config,
     update_predict_loop_config,
     update_risk_gate_config,
@@ -189,12 +191,16 @@ def _system_status(settings: Settings) -> dict:
         predict_loop_status = _loop_status(get_predict_loop_config(session), now)
         anticipatory_loop_status = _loop_status(get_anticipatory_loop_config(session), now)
         recent_halts = list(load_recent_risk_halts(session, limit=5))
+        recent_rejected_predictions = list(load_recent_trade_rejections(session, limit=5))
+        recent_rejected_hypotheses = list(load_recent_hypothesis_trade_rejections(session, limit=5))
     return {
         "kill_switch_engaged": is_kill_switch_engaged(settings),
         "alpaca_configured": bool(settings.alpaca_api_key and settings.alpaca_api_secret),
         "predict_loop": predict_loop_status,
         "anticipatory_loop": anticipatory_loop_status,
         "recent_halts": recent_halts,
+        "recent_rejected_predictions": recent_rejected_predictions,
+        "recent_rejected_hypotheses": recent_rejected_hypotheses,
     }
 
 
