@@ -6,12 +6,13 @@ every other order path in this codebase (SPEC.md hard constraint #2).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from engine.data.bars import fetch_bars
 from engine.data.universe import Universe
 from engine.execution.broker import Broker
 from engine.execution.position_bookkeeping import apply_closing_fill, apply_opening_fill
+from engine.execution.pricing import latest_price as _latest_price
+from engine.execution.trade_result import TradeAttemptResult
 from engine.journal.models import Hypothesis, HypothesisAction, HypothesisBelief, PredictionDirection
 from engine.journal.registry import (
     load_open_hypotheses,
@@ -26,16 +27,8 @@ from engine.risk.models import AccountState, OrderRequest, Side
 logger = get_logger(__name__)
 
 _STRATEGY_ID = "anticipatory"
-_MAX_SEVERITY = 3.0  # caps sizing at 3x the base cap even for an extreme gap
-
-
-def _latest_price(symbol: str) -> float | None:
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=7)
-    df = fetch_bars([symbol], start=str(start), end=str(end + timedelta(days=1)), interval="1d")
-    if df.empty:
-        return None
-    return float(df.sort_values("timestamp").iloc[-1]["close"])
+MAX_SEVERITY = 3.0  # caps sizing at 3x the base cap even for an extreme gap -- not private: the
+# dashboard's manual-convert size preview (engine.dashboard.app) mirrors this exact formula.
 
 
 def act_on_hypothesis_beliefs(
@@ -71,7 +64,7 @@ def act_on_hypothesis_beliefs(
                     extra={"extra_fields": {"symbol": hyp.symbol, "hypothesis_id": hyp.id}},
                 )
                 continue
-            if _open_position(session, broker, risk_gate, account, tradable, hyp, belief, min_gap_threshold):
+            if open_hypothesis_trade(session, broker, risk_gate, account, tradable, hyp, belief, min_gap_threshold).ok:
                 opened += 1
         elif belief.action == HypothesisAction.EXITED:
             if _close_position(session, broker, risk_gate, account, tradable, hyp):
@@ -130,20 +123,31 @@ def flatten_stopped_hypotheses(
     return flattened
 
 
-def _open_position(
+def open_hypothesis_trade(
     session, broker: Broker, risk_gate: RiskGate, account: AccountState, tradable: set[str],
-    hyp: Hypothesis, belief: HypothesisBelief, min_gap_threshold: float,
-) -> bool:
+    hyp: Hypothesis, belief: HypothesisBelief, min_gap_threshold: float, *, override_quantity: float | None = None,
+) -> TradeAttemptResult:
+    """Open the real position behind one hypothesis belief, sized by gap
+    magnitude x confidence. Shared by act_on_hypothesis_beliefs (automatic;
+    only ever called for a freshly-produced OPENED belief) and the
+    dashboard's manual convert route (called directly against a
+    hypothesis's latest stored belief, regardless of whether that belief's
+    gap cleared min_gap_threshold -- deliberately bypasses that filter,
+    same override principle as engine.prediction.trading.open_prediction_trade).
+
+    override_quantity, if given, replaces the oversize-and-clip candidate
+    quantity before RiskGate.evaluate -- RiskGate still clips it exactly
+    like every other opening order."""
     if hyp.symbol not in tradable:
         logger.warning(
             "hypothesis named a symbol outside the tradable universe -- skipped",
             extra={"extra_fields": {"symbol": hyp.symbol, "hypothesis_id": hyp.id}},
         )
-        return False
+        return TradeAttemptResult(ok=False, reason="symbol outside the tradable universe")
     price = _latest_price(hyp.symbol)
     if price is None:
         logger.warning("no price data to size hypothesis trade -- skipped", extra={"extra_fields": {"symbol": hyp.symbol}})
-        return False
+        return TradeAttemptResult(ok=False, reason="no price data available")
 
     # gap > 0 means P_model says YES is more likely than the market prices
     # it -- go the same direction the symbol moves if YES happens
@@ -158,9 +162,9 @@ def _open_position(
     position_side = "long" if long_position else "short"
 
     cap_value = account.equity * risk_gate.limits.max_capital_per_position_pct
-    severity = min(abs(belief.gap) / max(min_gap_threshold, 1e-6), _MAX_SEVERITY)  # 1.0 at threshold
+    severity = min(abs(belief.gap) / max(min_gap_threshold, 1e-6), MAX_SEVERITY)  # 1.0 at threshold
     size_fraction = severity * belief.confidence
-    candidate_qty = (cap_value * size_fraction * 2) / price  # oversized on purpose; RiskGate clips to the real cap
+    candidate_qty = override_quantity if override_quantity is not None else (cap_value * size_fraction * 2) / price  # oversized on purpose; RiskGate clips to the real cap
 
     order = OrderRequest(
         symbol=hyp.symbol, side=side, quantity=candidate_qty, price=price,
@@ -172,7 +176,7 @@ def _open_position(
             "hypothesis trade rejected by RiskGate",
             extra={"extra_fields": {"symbol": hyp.symbol, "reason": decision.reason.value}},
         )
-        return False
+        return TradeAttemptResult(ok=False, reason=decision.detail or decision.reason.value)
 
     try:
         broker_order = broker.submit_order(
@@ -190,11 +194,11 @@ def _open_position(
             extra={"extra_fields": {"symbol": hyp.symbol, "side": side.value, "error": str(exc)}},
         )
         mark_hypothesis_trade_rejected(session, hyp, reason=str(exc))
-        return False
+        return TradeAttemptResult(ok=False, reason=str(exc))
 
     apply_opening_fill(account, hyp.symbol, side, decision.approved_quantity, price, _STRATEGY_ID)
     mark_hypothesis_traded(session, hyp, order_id=broker_order.broker_order_id, quantity=decision.approved_quantity, side=position_side)
-    return True
+    return TradeAttemptResult(ok=True)
 
 
 def _close_position(session, broker: Broker, risk_gate: RiskGate, account: AccountState, tradable: set[str], hyp: Hypothesis) -> bool:

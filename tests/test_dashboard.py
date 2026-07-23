@@ -1,14 +1,17 @@
 import base64
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 import engine.journal.models  # noqa: F401  registers tables on SQLModel.metadata
 from engine.config.settings import Settings, get_settings
-from engine.dashboard.app import app
-from engine.journal.models import HypothesisAction, PredictionDirection, PredictionStatus
+from engine.dashboard.app import app, get_broker
+from engine.execution.broker import BrokerOrder
+from engine.journal.models import HypothesisAction, ManualTrade, PredictionDirection, PredictionStatus
 from engine.journal.registry import (
     create_hypothesis,
     get_anticipatory_loop_config,
@@ -19,11 +22,53 @@ from engine.journal.registry import (
     record_hypothesis_belief,
     record_prediction,
 )
+from engine.risk.models import Position
 
 
 def _auth_header(username: str, password: str) -> dict:
     token = base64.b64encode(f"{username}:{password}".encode()).decode()
     return {"Authorization": f"Basic {token}"}
+
+
+class FakeBroker:
+    """Stands in for AlpacaPaperClient in dashboard tests -- overridden via
+    app.dependency_overrides[get_broker], never a real network call."""
+
+    def __init__(self, *, equity=100_000.0, positions=None):
+        self.equity = equity
+        self.positions = positions or {}
+        self.submitted = []
+        self._next_id = 0
+
+    def get_account_equity(self):
+        return self.equity
+
+    def get_positions(self):
+        return dict(self.positions)
+
+    def get_open_orders(self):
+        return []
+
+    def submit_order(self, order):
+        self._next_id += 1
+        self.submitted.append(order)
+        return BrokerOrder(
+            broker_order_id=f"order-{self._next_id}", symbol=order.symbol, side=order.side,
+            quantity=order.quantity, status="filled", filled_avg_price=order.price, submitted_at=order.timestamp,
+        )
+
+    def cancel_all_orders(self):
+        pass
+
+    def close_all_positions(self):
+        pass
+
+
+def _price_bars(price=100.0):
+    return pd.DataFrame([{
+        "symbol": "SPY", "timestamp": datetime.now(timezone.utc), "open": price, "high": price, "low": price,
+        "close": price, "volume": 1000, "timeframe": "1d",
+    }])
 
 
 @pytest.fixture()
@@ -571,5 +616,316 @@ def test_refuses_to_serve_when_password_unset(tmp_path):
     try:
         resp = TestClient(app).get("/", headers=_auth_header("admin", "anything"))
         assert resp.status_code == 503
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _manual_trade_settings(tmp_path, db_url):
+    return Settings(_env_file=None, database_url=db_url, dashboard_password="testpass")
+
+
+def test_manual_trade_routes_require_auth(client):
+    # get_broker is deliberately NOT overridden here -- require_auth runs
+    # first and must reject before a real broker client is ever built.
+    assert client.get("/manual-trade").status_code == 401
+    assert client.post("/manual-trade/raw", data={"symbol": "SPY", "side": "buy", "quantity": "1"}).status_code == 401
+    assert client.post("/manual-trade/close/SPY").status_code == 401
+    assert client.get("/manual-trade/convert/prediction/does-not-exist").status_code == 401
+    assert client.post("/manual-trade/convert/prediction/does-not-exist", data={"override_quantity": "1"}).status_code == 401
+
+
+def test_manual_trade_view_renders_with_no_positions(tmp_path):
+    db_path = tmp_path / "manual_trade_empty.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: FakeBroker()
+    try:
+        resp = TestClient(app).get("/manual-trade", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "No open positions" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_view_shows_unattributed_position(tmp_path):
+    db_path = tmp_path / "manual_trade_positions.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    broker = FakeBroker(positions={"SPY": Position(symbol="SPY", quantity=5.0, avg_entry_price=400.0)})
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        resp = TestClient(app).get("/manual-trade", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "SPY" in resp.text
+        assert "unattributed" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_raw_happy_path_creates_row_and_redirects(tmp_path):
+    db_path = tmp_path / "manual_trade_raw_ok.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
+            resp = TestClient(app).post(
+                "/manual-trade/raw", headers=_auth_header("admin", "testpass"),
+                data={"symbol": "SPY", "side": "buy", "quantity": "1", "note": "test buy"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert "ok=True" in resp.headers["location"]
+        assert len(broker.submitted) == 1
+
+        with Session(engine_) as session:
+            rows = session.exec(select(ManualTrade)).all()
+        assert len(rows) == 1
+        assert rows[0].symbol == "SPY"
+        assert rows[0].note == "test buy"
+        assert rows[0].submitted_by == "admin"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_raw_rejected_for_symbol_outside_universe(tmp_path):
+    db_path = tmp_path / "manual_trade_raw_reject.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
+            resp = TestClient(app).post(
+                "/manual-trade/raw", headers=_auth_header("admin", "testpass"),
+                data={"symbol": "ZZZZNOTREAL", "side": "buy", "quantity": "1"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert "ok=False" in resp.headers["location"]
+        assert broker.submitted == []
+
+        with Session(engine_) as session:
+            rows = session.exec(select(ManualTrade)).all()
+        assert rows == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_raw_blocked_by_kill_switch(tmp_path):
+    db_path = tmp_path / "manual_trade_raw_killed.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    halt_file = tmp_path / "HALT"
+    halt_file.write_text("halted for test\n")
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, database_url=db_url, dashboard_password="testpass", halt_file=halt_file,
+    )
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        resp = TestClient(app).post(
+            "/manual-trade/raw", headers=_auth_header("admin", "testpass"),
+            data={"symbol": "SPY", "side": "buy", "quantity": "1"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert "ok=False" in resp.headers["location"]
+        assert broker.submitted == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_close_unattributed_position(tmp_path):
+    db_path = tmp_path / "manual_trade_close.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    broker = FakeBroker(positions={"SPY": Position(symbol="SPY", quantity=5.0, avg_entry_price=400.0)})
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(410.0)):
+            resp = TestClient(app).post(
+                "/manual-trade/close/SPY", headers=_auth_header("admin", "testpass"), follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert "ok=True" in resp.headers["location"]
+        assert "unattributed" in resp.headers["location"]
+        assert len(broker.submitted) == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_close_not_blocked_by_kill_switch(tmp_path):
+    db_path = tmp_path / "manual_trade_close_killed.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    halt_file = tmp_path / "HALT"
+    halt_file.write_text("halted for test\n")
+    broker = FakeBroker(positions={"SPY": Position(symbol="SPY", quantity=5.0, avg_entry_price=400.0)})
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, database_url=db_url, dashboard_password="testpass", halt_file=halt_file,
+    )
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(410.0)):
+            resp = TestClient(app).post(
+                "/manual-trade/close/SPY", headers=_auth_header("admin", "testpass"), follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert "ok=True" in resp.headers["location"]
+        assert len(broker.submitted) == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_convert_prediction_shows_suggested_quantity(tmp_path):
+    db_path = tmp_path / "manual_trade_convert_get.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    now = datetime.now(timezone.utc)
+    with Session(engine_) as session:
+        pred = record_prediction(
+            session, news_headline="h", news_source="rss", news_published_at=now, news_decision_timestamp=now,
+            topics=[], symbol="SPY", direction=PredictionDirection.UP, confidence=0.4, rationale="below threshold",
+            model_name="test", model_knowledge_cutoff=now, forward_safe=True, resolution_window_hours=24.0,
+            in_tracked_universe=True,
+        )
+        pred_id = pred.id
+
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
+            resp = TestClient(app).get(
+                f"/manual-trade/convert/prediction/{pred_id}", headers=_auth_header("admin", "testpass"),
+            )
+        assert resp.status_code == 200
+        assert "Suggested quantity" in resp.text
+        assert "below threshold" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_convert_prediction_happy_path_marks_traded(tmp_path):
+    db_path = tmp_path / "manual_trade_convert_post.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    now = datetime.now(timezone.utc)
+    with Session(engine_) as session:
+        pred = record_prediction(
+            session, news_headline="h", news_source="rss", news_published_at=now, news_decision_timestamp=now,
+            topics=[], symbol="SPY", direction=PredictionDirection.UP, confidence=0.4, rationale="r",
+            model_name="test", model_knowledge_cutoff=now, forward_safe=True, resolution_window_hours=24.0,
+            in_tracked_universe=True,
+        )
+        pred_id = pred.id
+
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
+            resp = TestClient(app).post(
+                f"/manual-trade/convert/prediction/{pred_id}", headers=_auth_header("admin", "testpass"),
+                data={"override_quantity": "1"}, follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert "ok=True" in resp.headers["location"]
+        assert len(broker.submitted) == 1
+
+        with Session(engine_) as session:
+            refreshed = session.get(type(pred), pred_id)
+            assert refreshed.traded_order_id is not None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_convert_blocked_when_forward_safe_false(tmp_path):
+    db_path = tmp_path / "manual_trade_convert_blocked.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    now = datetime.now(timezone.utc)
+    with Session(engine_) as session:
+        pred = record_prediction(
+            session, news_headline="h", news_source="rss", news_published_at=now, news_decision_timestamp=now,
+            topics=[], symbol="SPY", direction=PredictionDirection.UP, confidence=0.9, rationale="r",
+            model_name="test", model_knowledge_cutoff=now, forward_safe=False, resolution_window_hours=24.0,
+            in_tracked_universe=True,
+        )
+        pred_id = pred.id
+
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
+            resp = TestClient(app).post(
+                f"/manual-trade/convert/prediction/{pred_id}", headers=_auth_header("admin", "testpass"),
+                data={"override_quantity": "1"}, follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert "ok=False" in resp.headers["location"]
+        assert broker.submitted == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_convert_unknown_id_is_404(tmp_path):
+    db_path = tmp_path / "manual_trade_convert_404.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: FakeBroker()
+    try:
+        resp = TestClient(app).get(
+            "/manual-trade/convert/prediction/does-not-exist", headers=_auth_header("admin", "testpass"),
+        )
+        assert resp.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_manual_trade_convert_invalid_kind_is_422(tmp_path):
+    db_path = tmp_path / "manual_trade_convert_kind.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: FakeBroker()
+    try:
+        resp = TestClient(app).get(
+            "/manual-trade/convert/not-a-kind/some-id", headers=_auth_header("admin", "testpass"),
+        )
+        assert resp.status_code == 422
     finally:
         app.dependency_overrides.clear()

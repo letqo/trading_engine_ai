@@ -65,6 +65,8 @@
         <span class="tag incorrect" title="{{ p.trade_rejection_reason }}">rejected</span>
       {% elif p.traded_order_id %}
         <span class="tag correct">traded</span>
+      {% elif p.status.value == "pending" %}
+        <a href="/manual-trade/convert/prediction/{{ p.id }}">trade</a>
       {% else %}
         -
       {% endif %}

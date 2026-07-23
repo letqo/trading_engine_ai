@@ -1,37 +1,64 @@
-"""Mostly-read-only reporting dashboard. Never imports anything that can
-submit, modify, or cancel an order -- engine.execution.broker/RiskGate are
-not imported here. The only broker calls made are AlpacaPaperClient's read
-methods (get_account_equity, get_positions), same as any other dashboard
-consumer of a paper account's public state.
+"""Reporting + manual-trading dashboard.
 
-The exceptions are /predict-loop-config, /anticipatory-loop-config, and
-/risk-gate-config: GET/POST pairs that read and write PredictLoopConfig/
-AnticipatoryLoopConfig/RiskGateConfig (poll interval, thresholds,
-pause/resume, position/exposure/drawdown caps). Each can pause or retune
-its respective research loop or risk limits, but none can place or cancel
-an order directly -- same trust boundary as everything else here, just no
-longer read-only for those settings. RiskGateConfig itself is inert until
-a live trading path (engine.risk.resolve.resolve_risk_limits) reads it and
-builds a RiskGate from it -- this module never constructs a RiskGate.
+Every order submitted from here -- raw manual trades, Prediction/Hypothesis
+conversions, and closes (the /manual-trade* routes) -- goes through the
+exact same RiskGate.evaluate() -> broker.submit_order() ->
+apply_opening_fill/apply_closing_fill -> mark_* path as predict-loop/
+anticipatory-loop (SPEC.md hard constraint #2, never bypassed). See
+engine.execution.manual_trading and engine.prediction.trading
+.open_prediction_trade / engine.anticipatory.trading.open_hypothesis_trade.
+
+Auth is unchanged: a single shared HTTP Basic password
+(engine.dashboard.auth), originally proportionate for a read-only
+reporting view. That is no longer strictly true now that anyone with the
+password can place and close real (paper) orders directly -- a deliberate
+call-out, not a silent change; revisit if the trust model ever needs to
+change (per-user credentials, etc.).
+
+Manual orders share RiskGate's position/exposure caps with the automatic
+loops (recomputed fresh from live broker state every request), but NOT the
+automatic loops' in-memory daily-drawdown/consecutive-loss halt state --
+AccountState is process-local and never persisted (see
+engine.execution.reconcile), and this is the first entrypoint that reaches
+it from a separate process than the one that set it. Manual *opens* are
+hard-blocked while the kill switch is engaged, as partial mitigation
+(reuses engine.risk.kill_switch.is_kill_switch_engaged, same check the
+loops use); manual *closes* are never blocked on it, since closing a
+position is exactly what you want to be able to do while other trading is
+halted.
+
+The /predict-loop-config, /anticipatory-loop-config, and /risk-gate-config
+GET/POST pairs (poll interval, thresholds, pause/resume, position/
+exposure/drawdown caps) predate the /manual-trade* routes and are unaffected.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
+from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import case, func
 from sqlmodel import select
 
+from engine.anticipatory.trading import MAX_SEVERITY, open_hypothesis_trade
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
 from engine.config.settings import Settings, get_settings
 from engine.dashboard.auth import require_auth
+from engine.data.universe import Universe, load_universe
+from engine.execution.alpaca import AlpacaPaperClient
+from engine.execution.broker import Broker
+from engine.execution.manual_trading import close_any_position, open_manual_trade
+from engine.execution.pricing import latest_price
+from engine.execution.reconcile import reconcile_account_state
 from engine.journal.db import get_session
-from engine.journal.models import Prediction, PredictionStatus
+from engine.journal.models import Hypothesis, Prediction, PredictionStatus
 from engine.journal.registry import (
+    find_open_trade_by_symbol,
     get_anticipatory_loop_config,
     get_predict_loop_config,
     get_risk_gate_config,
@@ -41,16 +68,61 @@ from engine.journal.registry import (
     load_recent_experiment_runs,
     load_recent_hypotheses,
     load_recent_hypothesis_trade_rejections,
+    load_recent_manual_trades,
     load_recent_risk_halts,
     load_recent_trade_rejections,
     update_anticipatory_loop_config,
     update_predict_loop_config,
     update_risk_gate_config,
 )
+from engine.prediction.trading import open_prediction_trade
+from engine.risk.gate import RiskGate
 from engine.risk.kill_switch import is_kill_switch_engaged
+from engine.risk.models import AccountState, Side
+from engine.risk.resolve import resolve_risk_limits
 
 app = FastAPI(title="Trading engine dashboard")
 _templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+
+def get_broker(settings: Settings = Depends(get_settings)) -> Broker:
+    enforce_paper_only(settings)
+    return AlpacaPaperClient(settings)
+
+
+def _trading_context(settings: Settings, broker: Broker) -> tuple[RiskGate, AccountState, Universe]:
+    """RiskGate + a fresh AccountState + Universe, built the same way every
+    live trading path in engine.cli.main builds them -- see this module's
+    docstring for the cross-process halt-state caveat."""
+    with get_session(settings) as session:
+        risk_gate = RiskGate(resolve_risk_limits(settings, get_risk_gate_config(session)))
+    account = reconcile_account_state(broker)
+    universe = load_universe(settings.universe_path)
+    return risk_gate, account, universe
+
+
+def _redirect(path: str, *, ok: bool, msg: str) -> RedirectResponse:
+    return RedirectResponse(f"{path}?ok={ok}&msg={quote(msg)}", status_code=303)
+
+
+def _convert_blocked_reason(kind: str, row: Prediction | Hypothesis) -> str | None:
+    """Shared between the convert GET (advisory display) and POST (actual
+    enforcement) so the two can never drift apart."""
+    if row.trade_rejected:
+        return f"broker already rejected this {kind}: {row.trade_rejection_reason}"
+    if kind == "prediction":
+        if row.traded_order_id is not None or row.exit_order_id is not None:
+            return "already traded or exited"
+        if row.status != PredictionStatus.PENDING:
+            return "prediction is no longer pending (already resolved/invalid)"
+        if not row.forward_safe:
+            return "forward_safe is False -- blocked even for manual trades (hindsight-leakage integrity, not a quality bar)"
+    else:
+        if row.position_side is not None:
+            return "already has an open position"
+        if row.status.value != "open":
+            return "hypothesis market is closed"
+    return None
 
 
 def _parse_date_filters(start_date: str | None, end_date: str | None) -> tuple[datetime | None, datetime | None]:
@@ -216,8 +288,6 @@ def overview(request: Request, _user: str = Depends(require_auth), settings: Set
     if settings.alpaca_api_key and settings.alpaca_api_secret:
         try:
             enforce_paper_only(settings)
-            from engine.execution.alpaca import AlpacaPaperClient
-
             client = AlpacaPaperClient(settings)
             equity = client.get_account_equity()
             equity_display = f"${equity:,.2f}"
@@ -421,6 +491,174 @@ def risk_gate_config_update(
     return _templates.TemplateResponse(
         request, "risk_gate_config.html", {"config": config, "env_defaults": settings.risk, "saved": True}
     )
+
+
+@app.get("/manual-trade", response_class=HTMLResponse)
+def manual_trade_view(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    broker: Broker = Depends(get_broker),
+    ok: str | None = None,
+    msg: str | None = None,
+):
+    risk_gate, account, universe = _trading_context(settings, broker)
+    with get_session(settings) as session:
+        positions = []
+        for symbol, pos in account.positions.items():
+            if pos.quantity == 0:
+                continue
+            match = find_open_trade_by_symbol(session, symbol)
+            positions.append({
+                "symbol": symbol,
+                "quantity": pos.quantity,
+                "avg_entry_price": pos.avg_entry_price,
+                "market_value": pos.market_value,
+                "attribution": match[0] if match else "unattributed",
+            })
+        recent_manual_trades = load_recent_manual_trades(session, limit=50)
+    return _templates.TemplateResponse(
+        request,
+        "manual_trade.html",
+        {
+            "positions": positions,
+            "recent_manual_trades": recent_manual_trades,
+            "symbols": sorted(universe.tradable_symbols()),
+            "equity_display": f"${account.equity:,.2f}",
+            "kill_switch_engaged": is_kill_switch_engaged(settings),
+            "ok": ok,
+            "msg": msg,
+        },
+    )
+
+
+@app.post("/manual-trade/raw")
+def manual_trade_raw(
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    broker: Broker = Depends(get_broker),
+    symbol: str = Form(...),
+    side: str = Form(...),
+    quantity: float = Form(...),
+    note: str = Form(""),
+):
+    if is_kill_switch_engaged(settings):
+        return _redirect("/manual-trade", ok=False, msg="kill switch engaged -- manual opens are blocked")
+    risk_gate, account, universe = _trading_context(settings, broker)
+    with get_session(settings) as session:
+        result = open_manual_trade(
+            session, broker, risk_gate, account, universe,
+            symbol=symbol.strip().upper(), side=Side(side), quantity=quantity,
+            submitted_by=_user, note=note or None,
+        )
+    return _redirect("/manual-trade", ok=result.ok, msg="submitted" if result.ok else result.reason)
+
+
+@app.post("/manual-trade/close/{symbol}")
+def manual_trade_close(
+    symbol: str,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    broker: Broker = Depends(get_broker),
+):
+    risk_gate, account, universe = _trading_context(settings, broker)
+    with get_session(settings) as session:
+        result = close_any_position(session, broker, risk_gate, account, universe, symbol)
+    msg = f"closed, attributed to {result.attribution}" if result.ok else result.reason
+    return _redirect("/manual-trade", ok=result.ok, msg=msg)
+
+
+@app.get("/manual-trade/convert/{kind}/{item_id}", response_class=HTMLResponse)
+def manual_trade_convert_view(
+    request: Request,
+    kind: Literal["prediction", "hypothesis"],
+    item_id: str,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    broker: Broker = Depends(get_broker),
+    ok: str | None = None,
+    msg: str | None = None,
+):
+    risk_gate, account, universe = _trading_context(settings, broker)
+    with get_session(settings) as session:
+        belief = None
+        if kind == "prediction":
+            row = session.get(Prediction, item_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="prediction not found")
+        else:
+            row = session.get(Hypothesis, item_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="hypothesis not found")
+            belief = load_latest_beliefs_by_hypothesis(session, [row.id]).get(row.id)
+
+        blocked_reason = _convert_blocked_reason(kind, row)
+        if kind == "hypothesis" and blocked_reason is None and belief is None:
+            blocked_reason = "no belief recorded yet -- nothing to size a trade from"
+
+        price = latest_price(row.symbol)
+        suggested_qty = None
+        if price:
+            cap_value = account.equity * risk_gate.limits.max_capital_per_position_pct
+            if kind == "prediction":
+                suggested_qty = (cap_value * 2) / price
+            elif belief is not None:
+                config = get_anticipatory_loop_config(session)
+                severity = min(abs(belief.gap) / max(config.min_gap_threshold, 1e-6), MAX_SEVERITY)
+                suggested_qty = (cap_value * severity * belief.confidence * 2) / price
+
+    return _templates.TemplateResponse(
+        request,
+        "manual_trade_convert.html",
+        {
+            "kind": kind, "row": row, "belief": belief, "blocked_reason": blocked_reason,
+            "price": price, "suggested_qty": suggested_qty, "ok": ok, "msg": msg,
+        },
+    )
+
+
+@app.post("/manual-trade/convert/{kind}/{item_id}")
+def manual_trade_convert_submit(
+    kind: Literal["prediction", "hypothesis"],
+    item_id: str,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    broker: Broker = Depends(get_broker),
+    override_quantity: float = Form(...),
+):
+    redirect_path = f"/manual-trade/convert/{kind}/{item_id}"
+    if is_kill_switch_engaged(settings):
+        return _redirect(redirect_path, ok=False, msg="kill switch engaged -- manual opens are blocked")
+
+    risk_gate, account, universe = _trading_context(settings, broker)
+    tradable = universe.tradable_symbols()
+    with get_session(settings) as session:
+        if kind == "prediction":
+            row = session.get(Prediction, item_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="prediction not found")
+            blocked_reason = _convert_blocked_reason(kind, row)
+            if blocked_reason:
+                return _redirect(redirect_path, ok=False, msg=blocked_reason)
+            result = open_prediction_trade(
+                session, broker, risk_gate, account, tradable, row, override_quantity=override_quantity,
+            )
+        else:
+            row = session.get(Hypothesis, item_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="hypothesis not found")
+            blocked_reason = _convert_blocked_reason(kind, row)
+            if blocked_reason:
+                return _redirect(redirect_path, ok=False, msg=blocked_reason)
+            belief = load_latest_beliefs_by_hypothesis(session, [row.id]).get(row.id)
+            if belief is None:
+                return _redirect(redirect_path, ok=False, msg="no belief recorded yet")
+            config = get_anticipatory_loop_config(session)
+            result = open_hypothesis_trade(
+                session, broker, risk_gate, account, tradable, row, belief, config.min_gap_threshold,
+                override_quantity=override_quantity,
+            )
+    return _redirect(redirect_path, ok=result.ok, msg="submitted" if result.ok else result.reason)
 
 
 @app.get("/health")

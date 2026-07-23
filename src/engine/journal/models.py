@@ -424,6 +424,41 @@ class AnticipatoryLoopConfig(SQLModel, table=True):
     max_open_hypotheses_per_symbol: int = Field(default=2)
 
 
+class ManualTrade(SQLModel, table=True):
+    """One row per raw manual order submitted from the dashboard with no
+    Prediction/Hypothesis behind it (engine.execution.manual_trading
+    .open_manual_trade). Converting an existing Prediction/Hypothesis into
+    a trade does NOT create a row here -- it reuses that row's own
+    traded_order_id/traded_quantity/exit_order_id/trade_rejected fields via
+    the existing mark_prediction_traded/mark_hypothesis_traded machinery,
+    exactly like an automatically-traded one. This table exists only for
+    the "no journal row exists yet" case.
+
+    Only ever created once an order is approved by RiskGate and attempted
+    at the broker -- a RiskGate rejection on a raw manual order is
+    surfaced to the operator directly and never journaled (there's no
+    retry loop to suppress here, unlike Prediction/Hypothesis's
+    trade_rejected, which exists specifically to stop the *automatic* loop
+    from retrying a structurally-doomed order forever)."""
+
+    __tablename__ = "manual_trade"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    created_at: datetime = Field(default_factory=_now, index=True)
+    submitted_by: str  # HTTP Basic username from require_auth -- audit trail only, not an authz boundary
+    symbol: str = Field(index=True)
+    side: str  # "buy" / "sell", the requested opening side (engine.risk.models.Side.value)
+    requested_quantity: float  # what the operator typed, pre-RiskGate-clip
+    note: str | None = None
+
+    traded_order_id: str | None = Field(default=None, index=True)
+    traded_quantity: float | None = None
+    exit_order_id: str | None = None
+
+    trade_rejected: bool = Field(default=False, index=True)
+    trade_rejection_reason: str | None = None
+
+
 class RiskGateConfig(SQLModel, table=True):
     """Single-row live-tunable override of engine.config.settings.RiskLimits,
     same get-or-create singleton pattern as PredictLoopConfig (see its

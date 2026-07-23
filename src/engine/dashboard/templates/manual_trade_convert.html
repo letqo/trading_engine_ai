@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Convert to trade{% endblock %}
+{% block content %}
+<h1>Convert {{ kind }} to a trade</h1>
+<div class="subtitle">Manually trade this {{ kind }} right now, overriding the automatic confidence/gap bar -- still goes through the same RiskGate check as every other order.</div>
+
+{% if msg is not none %}
+<div class="note">{{ "OK: " if ok == "True" else "Failed: " }}{{ msg }}</div>
+{% endif %}
+
+{% if kind == "prediction" %}
+<div class="cards">
+  <div class="card"><div class="label">Symbol</div><div class="value">{{ row.symbol }}</div></div>
+  <div class="card"><div class="label">Direction</div><div class="value"><span class="tag {{ row.direction.value }}">{{ row.direction.value }}</span></div></div>
+  <div class="card"><div class="label">Confidence</div><div class="value">{{ "%.2f"|format(row.confidence) }}</div></div>
+</div>
+<div class="note">{{ row.news_headline }}</div>
+<div class="note">{{ row.rationale }}</div>
+{% else %}
+<div class="cards">
+  <div class="card"><div class="label">Symbol</div><div class="value">{{ row.symbol }}</div></div>
+  <div class="card"><div class="label">If YES</div><div class="value"><span class="tag {{ row.direction_if_yes.value }}">{{ row.direction_if_yes.value }}</span></div></div>
+  {% if belief %}
+  <div class="card"><div class="label">Gap</div><div class="value">{{ "%+.2f"|format(belief.gap) }}</div></div>
+  <div class="card"><div class="label">Belief confidence</div><div class="value">{{ "%.2f"|format(belief.confidence) }}</div></div>
+  {% endif %}
+</div>
+<div class="note">{{ row.question }}</div>
+{% if belief %}<div class="note">P_model {{ "%.2f"|format(belief.p_model) }}, P_market {{ "%.2f"|format(belief.p_market) }}. {{ belief.rationale }}</div>{% endif %}
+{% endif %}
+
+{% if blocked_reason %}
+<div class="note">Cannot trade: {{ blocked_reason }}</div>
+{% elif suggested_qty is none %}
+<div class="note">Cannot trade: no price data available for {{ row.symbol }}.</div>
+{% else %}
+<div class="note">Current price {{ "%.2f"|format(price) }}. Suggested quantity (RiskGate-sized, same formula the automatic loop uses): {{ "%.4f"|format(suggested_qty) }}. Override below if you want a different size -- RiskGate still clips it to the position/exposure caps either way.</div>
+<form method="post" action="/manual-trade/convert/{{ kind }}/{{ row.id }}">
+  <label>Quantity
+    <input type="number" step="0.000001" name="override_quantity" value="{{ "%.6f"|format(suggested_qty) }}" min="0" required>
+  </label>
+  <button type="submit">Submit order</button>
+</form>
+{% endif %}
+{% endblock %}

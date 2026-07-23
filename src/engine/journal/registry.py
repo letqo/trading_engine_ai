@@ -21,6 +21,7 @@ from engine.journal.models import (
     HypothesisAction,
     HypothesisBelief,
     HypothesisStatus,
+    ManualTrade,
     NewsItemRecord,
     PredictLoopConfig,
     Prediction,
@@ -34,6 +35,9 @@ from engine.journal.models import (
     TradeRecord,
     TradeSide,
 )
+from engine.logging_setup import get_logger
+
+logger = get_logger(__name__)
 
 
 def current_git_hash() -> str:
@@ -897,3 +901,103 @@ def close_hypothesis(
     session.commit()
     session.refresh(hypothesis)
     return hypothesis
+
+
+def create_manual_trade(
+    session: Session, *, symbol: str, side: str, requested_quantity: float, submitted_by: str, note: str | None = None,
+) -> ManualTrade:
+    """Written once RiskGate has approved the order and the broker call is
+    about to be attempted -- see ManualTrade's docstring for why a
+    RiskGate-rejected raw trade is never journaled at all."""
+    trade = ManualTrade(
+        symbol=symbol, side=side, requested_quantity=requested_quantity, submitted_by=submitted_by, note=note,
+    )
+    session.add(trade)
+    session.commit()
+    session.refresh(trade)
+    return trade
+
+
+def mark_manual_trade_traded(session: Session, trade: ManualTrade, *, order_id: str, quantity: float) -> ManualTrade:
+    trade.traded_order_id = order_id
+    trade.traded_quantity = quantity
+    session.add(trade)
+    session.commit()
+    session.refresh(trade)
+    return trade
+
+
+def mark_manual_trade_trade_rejected(session: Session, trade: ManualTrade, *, reason: str) -> ManualTrade:
+    """The broker itself refused this order -- see Prediction.trade_rejected's
+    docstring for the same distinction (broker-level, not RiskGate)."""
+    trade.trade_rejected = True
+    trade.trade_rejection_reason = reason
+    session.add(trade)
+    session.commit()
+    session.refresh(trade)
+    return trade
+
+
+def mark_manual_trade_exited(session: Session, trade: ManualTrade, *, order_id: str) -> ManualTrade:
+    trade.exit_order_id = order_id
+    session.add(trade)
+    session.commit()
+    session.refresh(trade)
+    return trade
+
+
+def load_open_manual_trades(session: Session) -> list[ManualTrade]:
+    rows = session.exec(
+        select(ManualTrade).where(
+            ManualTrade.traded_order_id.is_not(None),
+            ManualTrade.exit_order_id.is_(None),
+        )
+    ).all()
+    return list(rows)
+
+
+def load_recent_manual_trades(session: Session, limit: int = 100) -> list[ManualTrade]:
+    rows = session.exec(select(ManualTrade).order_by(ManualTrade.created_at.desc()).limit(limit)).all()
+    return list(rows)
+
+
+def find_open_trade_by_symbol(session: Session, symbol: str) -> tuple[str, Prediction | Hypothesis | ManualTrade] | None:
+    """Which journal row (if any) currently claims the open broker position
+    in `symbol` -- the attribution lookup behind the dashboard's "close any
+    position" flow. Checked in order prediction, hypothesis, manual_trade;
+    a symbol can only have one open broker position at a time, so more than
+    one match would be a real data inconsistency (logged, not raised) --
+    not expected in normal operation. Returns None if nothing matches, i.e.
+    an orphaned/unattributed position (see the untracked-SPY-position
+    investigation in JOURNAL.md)."""
+    prediction = session.exec(
+        select(Prediction).where(
+            Prediction.symbol == symbol,
+            Prediction.traded_order_id.is_not(None),
+            Prediction.exit_order_id.is_(None),
+        )
+    ).first()
+    hypothesis = session.exec(
+        select(Hypothesis).where(
+            Hypothesis.symbol == symbol,
+            Hypothesis.position_side.is_not(None),
+        )
+    ).first()
+    manual_trade = session.exec(
+        select(ManualTrade).where(
+            ManualTrade.symbol == symbol,
+            ManualTrade.traded_order_id.is_not(None),
+            ManualTrade.exit_order_id.is_(None),
+        )
+    ).first()
+
+    matches = [("prediction", prediction), ("hypothesis", hypothesis), ("manual_trade", manual_trade)]
+    matches = [(kind, row) for kind, row in matches if row is not None]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        logger.warning(
+            "symbol has more than one open journal row claiming it -- data inconsistency",
+            extra={"extra_fields": {"symbol": symbol, "kinds": [kind for kind, _ in matches]}},
+        )
+    return matches[0]

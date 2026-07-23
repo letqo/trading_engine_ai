@@ -26,6 +26,8 @@
         <span class="tag incorrect" title="{{ h.trade_rejection_reason }}">rejected</span>
       {% elif h.traded_order_id %}
         <span class="tag correct">traded</span>
+      {% elif h.status.value == "open" %}
+        <a href="/manual-trade/convert/hypothesis/{{ h.id }}">trade</a>
       {% else %}
         -
       {% endif %}

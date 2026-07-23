@@ -102,7 +102,7 @@ def test_act_on_pending_predictions_opens_long_for_up_direction(db_session):
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
 
     assert len(acted) == 1
@@ -117,7 +117,7 @@ def test_act_on_pending_predictions_opens_short_for_down_direction(db_session):
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
 
     assert len(acted) == 1
@@ -131,7 +131,7 @@ def test_act_on_pending_predictions_skips_below_confidence_threshold(db_session)
     risk_gate = RiskGate(RiskLimits())
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
 
     assert acted == []
@@ -147,7 +147,7 @@ def test_act_on_pending_predictions_respects_risk_gate_rejection(db_session):
     # Already at the position cap for EWJ -> RiskGate must reject the new entry.
     account.positions["EWJ"] = Position(symbol="EWJ", quantity=50.0, avg_entry_price=100.0)
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
 
     assert acted == []
@@ -160,7 +160,7 @@ def test_act_on_pending_predictions_marks_broker_rejection_without_retrying(db_s
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
 
     assert acted == []
@@ -171,7 +171,7 @@ def test_act_on_pending_predictions_marks_broker_rejection_without_retrying(db_s
 
     # Re-running must not retry it -- load_actionable_predictions excludes
     # trade_rejected rows.
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         acted_again = act_on_pending_predictions(db_session, broker, risk_gate, account, make_universe(), min_confidence=0.6)
     assert acted_again == []
     assert broker.submitted == []
@@ -184,7 +184,7 @@ def test_act_on_pending_predictions_broker_rejection_does_not_block_other_predic
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         acted = act_on_pending_predictions(db_session, broker, risk_gate, account, make_two_symbol_universe(), min_confidence=0.6)
 
     # The rejected EWJ prediction must not abort the batch -- XLE still trades.
@@ -205,7 +205,7 @@ def test_close_expired_prediction_trades_closes_long_with_profit(db_session):
     db_session.add(pred)
     db_session.commit()
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(110.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(110.0)):
         closed = close_expired_prediction_trades(db_session, broker, risk_gate, account, make_universe(), as_of=NOW)
 
     assert len(closed) == 1
@@ -229,7 +229,7 @@ def test_close_expired_prediction_trades_closes_short_with_loss(db_session):
     db_session.commit()
 
     # Price rose -> a short here loses.
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(110.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(110.0)):
         closed = close_expired_prediction_trades(db_session, broker, risk_gate, account, make_universe(), as_of=NOW)
 
     assert len(closed) == 1
@@ -267,7 +267,7 @@ def test_close_expired_prediction_trades_broker_rejection_leaves_position_open_f
     db_session.add(pred)
     db_session.commit()
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(110.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(110.0)):
         closed = close_expired_prediction_trades(db_session, broker, risk_gate, account, make_universe(), as_of=NOW)
 
     # Unlike an open rejection, a close must NOT be given up on -- the
@@ -291,7 +291,7 @@ def test_close_stopped_prediction_trades_closes_long_when_stop_triggered(db_sess
     db_session.commit()
 
     # 2% stop on a 100.0 long entry triggers at/below 98.0.
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(97.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(97.0)):
         stopped = close_stopped_prediction_trades(db_session, broker, risk_gate, account, make_universe())
 
     assert len(stopped) == 1
@@ -314,7 +314,7 @@ def test_close_stopped_prediction_trades_leaves_position_open_within_stop(db_ses
 
     # 99.0 is above the 98.0 stop -- must not close, even though this
     # cycle runs regardless of predict-loop's pause state.
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(99.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(99.0)):
         stopped = close_stopped_prediction_trades(db_session, broker, risk_gate, account, make_universe())
 
     assert stopped == []
@@ -328,7 +328,7 @@ def test_close_stopped_prediction_trades_ignores_predictions_never_traded(db_ses
     risk_gate = RiskGate(RiskLimits(stop_loss_pct=0.02))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.prediction.trading.fetch_bars", return_value=_price_bars(1.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(1.0)):
         stopped = close_stopped_prediction_trades(db_session, broker, risk_gate, account, make_universe())
 
     assert stopped == []

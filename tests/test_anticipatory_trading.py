@@ -77,7 +77,7 @@ def test_opens_long_when_direction_up_and_gap_positive(db_session):
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         opened, closed = act_on_hypothesis_beliefs(
             db_session, broker, risk_gate, account, make_universe(), {hyp.id: hyp}, [belief], min_gap_threshold=0.05,
         )
@@ -95,7 +95,7 @@ def test_opens_short_when_direction_down_and_gap_positive(db_session):
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         act_on_hypothesis_beliefs(db_session, broker, risk_gate, account, make_universe(), {hyp.id: hyp}, [belief], min_gap_threshold=0.05)
 
     assert broker.submitted[0].side == Side.SELL
@@ -108,7 +108,7 @@ def test_opens_short_when_direction_up_and_gap_negative(db_session):
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         act_on_hypothesis_beliefs(db_session, broker, risk_gate, account, make_universe(), {hyp.id: hyp}, [belief], min_gap_threshold=0.05)
 
     assert broker.submitted[0].side == Side.SELL
@@ -138,7 +138,7 @@ def test_respects_risk_gate_rejection(db_session):
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
     account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)  # already at cap
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         opened, closed = act_on_hypothesis_beliefs(
             db_session, broker, risk_gate, account, make_universe(), {hyp.id: hyp}, [belief], min_gap_threshold=0.05,
         )
@@ -152,7 +152,7 @@ def test_open_broker_rejection_marks_untradeable_and_does_not_retry(db_session):
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         opened, closed = act_on_hypothesis_beliefs(
             db_session, broker, risk_gate, account, make_universe(), {hyp.id: hyp}, [belief], min_gap_threshold=0.05,
         )
@@ -186,7 +186,7 @@ def test_open_broker_rejection_does_not_block_other_hypotheses(db_session):
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(100.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
         opened, closed = act_on_hypothesis_beliefs(
             db_session, broker, risk_gate, account, make_two_symbol_universe(),
             {failing.id: failing, healthy.id: healthy}, [failing_belief, healthy_belief], min_gap_threshold=0.05,
@@ -208,7 +208,7 @@ def test_exits_close_the_open_position(db_session):
     account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
     account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(110.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(110.0)):
         opened, closed = act_on_hypothesis_beliefs(
             db_session, broker, risk_gate, account, make_universe(), {hyp.id: hyp}, [exit_belief], min_gap_threshold=0.05,
         )
@@ -228,7 +228,7 @@ def test_exit_broker_rejection_leaves_position_open_for_retry(db_session):
     account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
     account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(110.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(110.0)):
         opened, closed = act_on_hypothesis_beliefs(
             db_session, broker, risk_gate, account, make_universe(), {hyp.id: hyp}, [exit_belief], min_gap_threshold=0.05,
         )
@@ -284,7 +284,7 @@ def test_flatten_resolved_hypotheses_closes_lingering_positions(db_session):
     account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
     account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(105.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(105.0)):
         flattened = flatten_resolved_hypotheses(db_session, broker, risk_gate, account, make_universe(), [hyp])
 
     assert flattened == 1
@@ -312,7 +312,7 @@ def test_flatten_stopped_hypotheses_closes_when_stop_triggered(db_session):
     account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)
 
     # 2% stop on a 100.0 long entry triggers at/below 98.0.
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(97.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(97.0)):
         flattened = flatten_stopped_hypotheses(db_session, broker, risk_gate, account, make_universe())
 
     assert flattened == 1
@@ -328,7 +328,7 @@ def test_flatten_stopped_hypotheses_leaves_position_open_within_stop(db_session)
     account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
     account.positions["XLE"] = Position(symbol="XLE", quantity=50.0, avg_entry_price=100.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(99.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(99.0)):
         flattened = flatten_stopped_hypotheses(db_session, broker, risk_gate, account, make_universe())
 
     assert flattened == 0
@@ -342,7 +342,7 @@ def test_flatten_stopped_hypotheses_ignores_untraded_hypotheses(db_session):
     risk_gate = RiskGate(RiskLimits(stop_loss_pct=0.02))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    with patch("engine.anticipatory.trading.fetch_bars", return_value=_price_bars(1.0)):
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(1.0)):
         flattened = flatten_stopped_hypotheses(db_session, broker, risk_gate, account, make_universe())
 
     assert flattened == 0

@@ -16,12 +16,13 @@ as every other order path in this codebase (SPEC.md hard constraint #2).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from engine.data.bars import fetch_bars
 from engine.data.universe import Universe
 from engine.execution.broker import Broker
 from engine.execution.position_bookkeeping import apply_closing_fill, apply_opening_fill
+from engine.execution.pricing import latest_price as _latest_price
+from engine.execution.trade_result import TradeAttemptResult
 from engine.journal.models import Prediction, PredictionDirection
 from engine.journal.registry import (
     load_actionable_predictions,
@@ -38,77 +39,89 @@ from engine.risk.models import AccountState, OrderRequest, Side
 logger = get_logger(__name__)
 
 
-def _latest_price(symbol: str) -> float | None:
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=7)
-    df = fetch_bars([symbol], start=str(start), end=str(end + timedelta(days=1)), interval="1d")
-    if df.empty:
-        return None
-    return float(df.sort_values("timestamp").iloc[-1]["close"])
+def open_prediction_trade(
+    session, broker: Broker, risk_gate: RiskGate, account: AccountState, tradable: set[str],
+    prediction: Prediction, *, override_quantity: float | None = None,
+) -> TradeAttemptResult:
+    """Open the real position behind one prediction -- "up" -> BUY (long),
+    "down" -> SELL (short), sized the same way RiskGate sizes every other
+    opening order. Shared by act_on_pending_predictions (automatic; only
+    ever called for rows that already cleared confidence/forward_safe/
+    universe filters in load_actionable_predictions) and the dashboard's
+    manual convert route (called directly on any untraded prediction --
+    deliberately bypasses that filter, that's the point of a human
+    override; forward_safe is still enforced by the caller, not here, same
+    as automatic).
+
+    override_quantity, if given, replaces the oversize-and-clip candidate
+    quantity before RiskGate.evaluate -- RiskGate still clips it exactly
+    like every other opening order, so an override can ask for more than
+    the cap allows and still only get the capped amount."""
+    if prediction.symbol not in tradable:
+        logger.warning(
+            "actionable prediction named a symbol outside the tradable universe -- skipped",
+            extra={"extra_fields": {"symbol": prediction.symbol}},
+        )
+        return TradeAttemptResult(ok=False, reason="symbol outside the tradable universe")
+
+    price = _latest_price(prediction.symbol)
+    if price is None:
+        logger.warning("no price data to size prediction trade -- skipped", extra={"extra_fields": {"symbol": prediction.symbol}})
+        return TradeAttemptResult(ok=False, reason="no price data available")
+
+    side = Side.BUY if prediction.direction == PredictionDirection.UP else Side.SELL
+    cap_value = account.equity * risk_gate.limits.max_capital_per_position_pct
+    candidate_qty = override_quantity if override_quantity is not None else (cap_value * 2) / price  # oversized on purpose; RiskGate clips to the real cap
+
+    order = OrderRequest(
+        symbol=prediction.symbol, side=side, quantity=candidate_qty, price=price,
+        timestamp=datetime.now(timezone.utc), strategy_id="consequence_prediction",
+    )
+    decision = risk_gate.evaluate(order, account, tradable)
+    if not decision.approved:
+        logger.info(
+            "prediction trade rejected by RiskGate",
+            extra={"extra_fields": {"symbol": prediction.symbol, "reason": decision.reason.value}},
+        )
+        return TradeAttemptResult(ok=False, reason=decision.detail or decision.reason.value)
+
+    try:
+        broker_order = broker.submit_order(
+            OrderRequest(
+                symbol=prediction.symbol, side=side, quantity=decision.approved_quantity, price=price,
+                timestamp=order.timestamp, strategy_id="consequence_prediction",
+            )
+        )
+    except Exception as exc:
+        # A broker-level rejection (e.g. Alpaca refusing to short an
+        # asset that isn't shortable) is a structural fact about this
+        # order, not a transient RiskGate-style cap -- retrying every
+        # cycle would silently waste API calls forever. Isolated here
+        # (rather than letting it propagate) so one bad symbol can't
+        # also abort every other actionable prediction in this batch.
+        logger.error(
+            "prediction order rejected by broker -- marking untradeable, will not retry",
+            extra={"extra_fields": {"symbol": prediction.symbol, "side": side.value, "error": str(exc)}},
+        )
+        mark_prediction_trade_rejected(session, prediction, reason=str(exc))
+        return TradeAttemptResult(ok=False, reason=str(exc))
+
+    apply_opening_fill(account, prediction.symbol, side, decision.approved_quantity, price, "consequence_prediction")
+    mark_prediction_traded(session, prediction, order_id=broker_order.broker_order_id, quantity=decision.approved_quantity)
+    return TradeAttemptResult(ok=True)
 
 
 def act_on_pending_predictions(
     session, broker: Broker, risk_gate: RiskGate, account: AccountState, universe: Universe, min_confidence: float,
 ) -> list[Prediction]:
     """Submit a real paper order for every actionable prediction (pending,
-    forward_safe, confidence >= threshold, not yet traded). "up" -> BUY
-    (long), "down" -> SELL (short) -- both directions, sized the same way
-    RiskGate sizes every other opening order."""
+    forward_safe, confidence >= threshold, not yet traded) via
+    open_prediction_trade."""
     tradable = universe.tradable_symbols()
     acted: list[Prediction] = []
     for prediction in load_actionable_predictions(session, min_confidence=min_confidence):
-        if prediction.symbol not in tradable:
-            logger.warning(
-                "actionable prediction named a symbol outside the tradable universe -- skipped",
-                extra={"extra_fields": {"symbol": prediction.symbol}},
-            )
-            continue
-
-        price = _latest_price(prediction.symbol)
-        if price is None:
-            logger.warning("no price data to size prediction trade -- skipped", extra={"extra_fields": {"symbol": prediction.symbol}})
-            continue
-
-        side = Side.BUY if prediction.direction == PredictionDirection.UP else Side.SELL
-        cap_value = account.equity * risk_gate.limits.max_capital_per_position_pct
-        candidate_qty = (cap_value * 2) / price  # oversized on purpose; RiskGate clips to the real cap
-
-        order = OrderRequest(
-            symbol=prediction.symbol, side=side, quantity=candidate_qty, price=price,
-            timestamp=datetime.now(timezone.utc), strategy_id="consequence_prediction",
-        )
-        decision = risk_gate.evaluate(order, account, tradable)
-        if not decision.approved:
-            logger.info(
-                "prediction trade rejected by RiskGate",
-                extra={"extra_fields": {"symbol": prediction.symbol, "reason": decision.reason.value}},
-            )
-            continue
-
-        try:
-            broker_order = broker.submit_order(
-                OrderRequest(
-                    symbol=prediction.symbol, side=side, quantity=decision.approved_quantity, price=price,
-                    timestamp=order.timestamp, strategy_id="consequence_prediction",
-                )
-            )
-        except Exception as exc:
-            # A broker-level rejection (e.g. Alpaca refusing to short an
-            # asset that isn't shortable) is a structural fact about this
-            # order, not a transient RiskGate-style cap -- retrying every
-            # cycle would silently waste API calls forever. Isolated here
-            # (rather than letting it propagate) so one bad symbol can't
-            # also abort every other actionable prediction in this batch.
-            logger.error(
-                "prediction order rejected by broker -- marking untradeable, will not retry",
-                extra={"extra_fields": {"symbol": prediction.symbol, "side": side.value, "error": str(exc)}},
-            )
-            mark_prediction_trade_rejected(session, prediction, reason=str(exc))
-            continue
-
-        apply_opening_fill(account, prediction.symbol, side, decision.approved_quantity, price, "consequence_prediction")
-        mark_prediction_traded(session, prediction, order_id=broker_order.broker_order_id, quantity=decision.approved_quantity)
-        acted.append(prediction)
+        if open_prediction_trade(session, broker, risk_gate, account, tradable, prediction).ok:
+            acted.append(prediction)
     return acted
 
 
