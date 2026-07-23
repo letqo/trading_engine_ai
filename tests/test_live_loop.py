@@ -17,6 +17,7 @@ from engine.execution.live_loop import (
     run_live_cycle,
     seed_bar_history,
 )
+from engine.journal.registry import load_open_strategy_trades, load_recent_strategy_trades
 from engine.risk.gate import RiskGate
 from engine.risk.models import AccountState, Position, Side
 
@@ -137,25 +138,33 @@ def test_fetch_new_news_filters_by_last_decision_timestamp():
     assert items[0].headline == "fresh news"
 
 
-def test_check_and_submit_stop_triggers_on_adverse_price():
+def test_check_and_submit_stop_triggers_on_adverse_price(db_session):
     from engine.domain import Bar
+    from engine.journal.registry import create_strategy_trade
 
     broker = FakeBroker()
     risk_gate = RiskGate(RiskLimits(stop_loss_pct=0.02))
     account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
     account.positions["TEST"] = Position(symbol="TEST", quantity=50.0, avg_entry_price=100.0, strategy_id="scripted")
+    trade = create_strategy_trade(
+        db_session, strategy_id="scripted", symbol="TEST", side="buy",
+        order_id="entry-order", quantity=50.0, price=100.0,
+    )
 
     bar = Bar(symbol="TEST", timestamp=T0, open=99, high=99.5, low=97.0, close=98.0, volume=1000, timeframe="1h")
-    triggered = _check_and_submit_stop(bar, risk_gate, broker, account)
+    triggered = _check_and_submit_stop(bar, risk_gate, broker, account, db_session)
 
     assert triggered is True
     assert len(broker.submitted) == 1
     assert broker.submitted[0].side == Side.SELL
     assert "TEST" not in account.positions
     assert account.trades_today == 1
+    db_session.refresh(trade)
+    assert trade.exit_order_id == "order-1"
+    assert trade.exit_reason == "stop_loss"
 
 
-def test_check_and_submit_stop_noop_when_not_triggered():
+def test_check_and_submit_stop_noop_when_not_triggered(db_session):
     from engine.domain import Bar
 
     broker = FakeBroker()
@@ -164,14 +173,14 @@ def test_check_and_submit_stop_noop_when_not_triggered():
     account.positions["TEST"] = Position(symbol="TEST", quantity=50.0, avg_entry_price=100.0, strategy_id="scripted")
 
     bar = Bar(symbol="TEST", timestamp=T0, open=100, high=100.5, low=99.5, close=100.2, volume=1000, timeframe="1h")
-    triggered = _check_and_submit_stop(bar, risk_gate, broker, account)
+    triggered = _check_and_submit_stop(bar, risk_gate, broker, account, db_session)
 
     assert triggered is False
     assert broker.submitted == []
     assert "TEST" in account.positions
 
 
-def test_submit_signals_opens_long_sized_to_cap():
+def test_submit_signals_opens_long_sized_to_cap(db_session):
     state = LiveLoopState()
     from engine.domain import Bar
     state.latest_bars["TEST"] = Bar(symbol="TEST", timestamp=T0, open=100, high=100, low=100, close=100, volume=1000, timeframe="1h")
@@ -180,15 +189,24 @@ def test_submit_signals_opens_long_sized_to_cap():
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
-    signal = Signal(symbol="TEST", action=SignalAction.BUY, strategy_id="scripted", timestamp=T0)
-    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"})
+    signal = Signal(symbol="TEST", action=SignalAction.BUY, strategy_id="scripted", timestamp=T0, reason="breakout")
+    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"}, db_session)
 
     assert result == {"orders": 1, "rejected": 0}
     assert broker.submitted[0].side == Side.BUY
     assert account.positions["TEST"].quantity == pytest.approx(50.0)  # 5,000 cap / 100 price
 
+    rows = load_open_strategy_trades(db_session)
+    assert len(rows) == 1
+    assert rows[0].strategy_id == "scripted"
+    assert rows[0].symbol == "TEST"
+    assert rows[0].side == "buy"
+    assert rows[0].entry_order_id == "order-1"
+    assert rows[0].entry_quantity == pytest.approx(50.0)
+    assert rows[0].reason == "breakout"
 
-def test_submit_signals_opens_short_for_sell_signal():
+
+def test_submit_signals_opens_short_for_sell_signal(db_session):
     state = LiveLoopState()
     from engine.domain import Bar
     state.latest_bars["TEST"] = Bar(symbol="TEST", timestamp=T0, open=100, high=100, low=100, close=100, volume=1000, timeframe="1h")
@@ -198,14 +216,17 @@ def test_submit_signals_opens_short_for_sell_signal():
     account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
 
     signal = Signal(symbol="TEST", action=SignalAction.SELL, strategy_id="scripted", timestamp=T0)
-    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"})
+    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"}, db_session)
 
     assert result == {"orders": 1, "rejected": 0}
     assert broker.submitted[0].side == Side.SELL
     assert account.positions["TEST"].quantity == pytest.approx(-50.0)
+    assert load_open_strategy_trades(db_session)[0].side == "sell"
 
 
-def test_submit_signals_closes_existing_long_on_close_signal():
+def test_submit_signals_closes_existing_long_on_close_signal(db_session):
+    from engine.journal.registry import create_strategy_trade
+
     state = LiveLoopState()
     from engine.domain import Bar
     state.latest_bars["TEST"] = Bar(symbol="TEST", timestamp=T0, open=110, high=110, low=110, close=110, volume=1000, timeframe="1h")
@@ -214,18 +235,26 @@ def test_submit_signals_closes_existing_long_on_close_signal():
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0))
     account = AccountState(equity=10_000.0, cash=5_000.0, equity_at_session_start=10_000.0)
     account.positions["TEST"] = Position(symbol="TEST", quantity=50.0, avg_entry_price=100.0, strategy_id="scripted")
+    trade = create_strategy_trade(
+        db_session, strategy_id="scripted", symbol="TEST", side="buy",
+        order_id="entry-order", quantity=50.0, price=100.0,
+    )
 
     signal = Signal(symbol="TEST", action=SignalAction.CLOSE, strategy_id="scripted", timestamp=T0)
-    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"})
+    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"}, db_session)
 
     assert result == {"orders": 1, "rejected": 0}
     assert broker.submitted[0].side == Side.SELL
     assert broker.submitted[0].quantity == pytest.approx(50.0)
     assert "TEST" not in account.positions
     assert account.trades_today == 1
+    db_session.refresh(trade)
+    assert trade.exit_order_id == "order-1"
+    assert trade.exit_reason == "signal"
+    assert load_open_strategy_trades(db_session) == []
 
 
-def test_submit_signals_respects_risk_gate_rejection():
+def test_submit_signals_respects_risk_gate_rejection(db_session):
     state = LiveLoopState()
     from engine.domain import Bar
     state.latest_bars["TEST"] = Bar(symbol="TEST", timestamp=T0, open=100, high=100, low=100, close=100, volume=1000, timeframe="1h")
@@ -236,13 +265,13 @@ def test_submit_signals_respects_risk_gate_rejection():
     account.positions["TEST"] = Position(symbol="TEST", quantity=50.0, avg_entry_price=100.0)  # already at cap
 
     signal = Signal(symbol="TEST", action=SignalAction.BUY, strategy_id="scripted", timestamp=T0)
-    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"})
+    result = _submit_signals([signal], risk_gate, broker, account, state, {"TEST"}, db_session)
 
     assert result == {"orders": 0, "rejected": 1}
     assert broker.submitted == []
 
 
-def test_run_live_cycle_dispatches_new_bars_then_news_and_submits_orders():
+def test_run_live_cycle_dispatches_new_bars_then_news_and_submits_orders(db_session):
     universe = make_universe()
     state = LiveLoopState()
     risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=0.5, max_total_exposure_pct=1.0))
@@ -255,9 +284,13 @@ def test_run_live_cycle_dispatches_new_bars_then_news_and_submits_orders():
     bars = _bars_df("TEST", [(T0, 100, 100, 100, 100)])
     with patch("engine.execution.live_loop.fetch_bars", return_value=bars), \
          patch("engine.execution.live_loop.fetch_all_rss", return_value=[]):
-        summary = run_live_cycle(strategy, universe, risk_gate, broker, account, state, "1h")
+        summary = run_live_cycle(strategy, universe, risk_gate, broker, account, state, "1h", db_session)
 
     assert summary["bars"] == 1
     assert summary["orders"] == 1
     assert len(strategy.bar_calls) == 1
     assert account.positions["TEST"].quantity == pytest.approx(50.0)
+    rows = load_recent_strategy_trades(db_session)
+    assert len(rows) == 1
+    assert rows[0].symbol == "TEST"
+    assert rows[0].entry_order_id == "order-1"

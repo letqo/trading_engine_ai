@@ -721,7 +721,8 @@ def papertrade(
                 break
 
             if strategy_obj is not None:
-                summary = run_live_cycle(strategy_obj, universe, risk_gate, client, account, live_state, interval)
+                with get_session(settings) as session:
+                    summary = run_live_cycle(strategy_obj, universe, risk_gate, client, account, live_state, interval, session)
                 if summary["bars"] or summary["news"]:
                     logger.info("papertrade live cycle", extra={"extra_fields": summary})
         except Exception:

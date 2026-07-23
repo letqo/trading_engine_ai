@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Strategy trades{% endblock %}
+{% block content %}
+<h1>Strategy trades</h1>
+<div class="subtitle">Real positions opened by the `worker` service's live technical strategies (momentum, mean_reversion, multi_factor, dumb_news, overnight_gap) -- see engine.execution.live_loop.</div>
+
+{% if trades %}
+<table>
+  <tr><th>Opened</th><th>Strategy</th><th>Symbol</th><th>Side</th><th>Entry qty</th><th>Entry price</th><th>Status</th><th>Exit price</th><th>Exit reason</th><th>Reason</th></tr>
+  {% for t in trades %}
+  <tr>
+    <td>{{ t.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td>{{ t.strategy_id }}</td>
+    <td>{{ t.symbol }}</td>
+    <td><span class="tag {{ 'up' if t.side == 'buy' else 'down' }}">{{ t.side }}</span></td>
+    <td>{{ "%.4f"|format(t.entry_quantity) }}</td>
+    <td>{{ "%.2f"|format(t.entry_price) }}</td>
+    <td>
+      {% if t.exit_order_id %}
+        <span class="tag correct">closed</span>
+      {% else %}
+        <span class="tag pending">open</span>
+      {% endif %}
+    </td>
+    <td>{{ "%.2f"|format(t.exit_price) if t.exit_price else "-" }}</td>
+    <td>{{ t.exit_reason or "-" }}</td>
+    <td class="rationale">{{ t.reason or "" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No strategy trades yet.</div>
+{% endif %}
+{% endblock %}

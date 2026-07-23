@@ -14,10 +14,12 @@ from engine.execution.broker import BrokerOrder
 from engine.journal.models import HypothesisAction, ManualTrade, PredictionDirection, PredictionStatus
 from engine.journal.registry import (
     create_hypothesis,
+    create_strategy_trade,
     get_anticipatory_loop_config,
     get_predict_loop_config,
     mark_hypothesis_trade_rejected,
     mark_prediction_trade_rejected,
+    mark_strategy_trade_exited,
     record_halt,
     record_hypothesis_belief,
     record_prediction,
@@ -306,6 +308,52 @@ def test_hypotheses_page_renders_symbol_and_latest_belief(tmp_path):
         assert "XLE" in resp.text
         assert "fed cut would boost energy demand" in resp.text
         assert "opened" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_strategy_trades_page_requires_auth(tmp_path):
+    db_path = tmp_path / "dashboard_strategy_trade_auth.db"
+    engine_ = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+    test_settings = Settings(database_url=f"sqlite:///{db_path}", dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        resp = TestClient(app).get("/strategy-trades")
+        assert resp.status_code == 401
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_strategy_trades_page_renders_open_and_closed_trades(tmp_path):
+    db_path = tmp_path / "dashboard_strategy_trade_test.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    with Session(engine_) as session:
+        open_trade = create_strategy_trade(
+            session, strategy_id="momentum", symbol="SPY", side="buy",
+            order_id="order-1", quantity=6.68, price=748.39, reason="breakout above 20d high",
+        )
+        closed_trade = create_strategy_trade(
+            session, strategy_id="mean_reversion", symbol="TLT", side="sell",
+            order_id="order-2", quantity=12.0, price=90.0,
+        )
+        mark_strategy_trade_exited(session, closed_trade, order_id="order-3", quantity=12.0, price=88.5, reason="signal")
+
+    test_settings = Settings(database_url=db_url, dashboard_password="testpass")
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    try:
+        resp = TestClient(app).get("/strategy-trades", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "momentum" in resp.text
+        assert "SPY" in resp.text
+        assert "breakout above 20d high" in resp.text
+        assert "mean_reversion" in resp.text
+        assert "TLT" in resp.text
+        assert "open" in resp.text
+        assert "closed" in resp.text
     finally:
         app.dependency_overrides.clear()
 

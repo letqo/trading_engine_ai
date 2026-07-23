@@ -37,6 +37,7 @@ from engine.execution.broker import Broker
 from engine.execution.position_bookkeeping import apply_closing_fill, apply_opening_fill
 from engine.execution.signal_translation import signal_to_side
 from engine.features.sentiment import score_news_item
+from engine.journal.registry import create_strategy_trade, load_open_strategy_trade_for_symbol, mark_strategy_trade_exited
 from engine.logging_setup import get_logger
 from engine.risk.gate import RiskGate
 from engine.risk.models import AccountState, OrderRequest, Side
@@ -122,7 +123,7 @@ def _build_context(timestamp: datetime, state: LiveLoopState, tradable_symbols: 
     )
 
 
-def _check_and_submit_stop(bar: Bar, risk_gate: RiskGate, broker: Broker, account: AccountState) -> bool:
+def _check_and_submit_stop(bar: Bar, risk_gate: RiskGate, broker: Broker, account: AccountState, session) -> bool:
     """Mirrors the backtester's _check_stop: a triggered stop bypasses
     RiskGate.evaluate() entirely and writes straight to the account, same
     as every other risk-reducing forced exit in this codebase (flatten,
@@ -141,6 +142,11 @@ def _check_and_submit_stop(bar: Bar, risk_gate: RiskGate, broker: Broker, accoun
                      timestamp=bar.timestamp, strategy_id=position.strategy_id)
     )
     apply_closing_fill(account, risk_gate, bar.symbol, position, qty, bar.close)
+    trade = load_open_strategy_trade_for_symbol(session, bar.symbol)
+    if trade is not None:
+        mark_strategy_trade_exited(
+            session, trade, order_id=broker_order.broker_order_id, quantity=qty, price=bar.close, reason="stop_loss",
+        )
     logger.warning(
         "live stop-loss triggered",
         extra={"extra_fields": {"symbol": bar.symbol, "order_id": broker_order.broker_order_id}},
@@ -148,7 +154,10 @@ def _check_and_submit_stop(bar: Bar, risk_gate: RiskGate, broker: Broker, accoun
     return True
 
 
-def _submit_signals(signals, risk_gate: RiskGate, broker: Broker, account: AccountState, state: LiveLoopState, tradable: set[str]) -> dict:
+def _submit_signals(
+    signals, risk_gate: RiskGate, broker: Broker, account: AccountState, state: LiveLoopState,
+    tradable: set[str], session,
+) -> dict:
     """Translate strategy signals into real orders. Opening orders are
     oversized on purpose and let RiskGate.evaluate() clip them to the real
     cap, same pattern used everywhere else in this codebase
@@ -198,8 +207,19 @@ def _submit_signals(signals, risk_gate: RiskGate, broker: Broker, account: Accou
         )
         if is_closing:
             apply_closing_fill(account, risk_gate, signal.symbol, existing, decision.approved_quantity, price)
+            trade = load_open_strategy_trade_for_symbol(session, signal.symbol)
+            if trade is not None:
+                mark_strategy_trade_exited(
+                    session, trade, order_id=broker_order.broker_order_id,
+                    quantity=decision.approved_quantity, price=price, reason="signal",
+                )
         else:
             apply_opening_fill(account, signal.symbol, side, decision.approved_quantity, price, signal.strategy_id)
+            create_strategy_trade(
+                session, strategy_id=signal.strategy_id, symbol=signal.symbol, side=side.value,
+                order_id=broker_order.broker_order_id, quantity=decision.approved_quantity, price=price,
+                reason=signal.reason,
+            )
         orders += 1
         logger.info(
             "live order submitted",
@@ -213,12 +233,18 @@ def _submit_signals(signals, risk_gate: RiskGate, broker: Broker, account: Accou
 
 def run_live_cycle(
     strategy, universe: Universe, risk_gate: RiskGate, broker: Broker, account: AccountState,
-    state: LiveLoopState, interval: str,
+    state: LiveLoopState, interval: str, session,
 ) -> dict:
     """One polling cycle: fetch new bars+news, dispatch to the strategy in
     chronological order (bars first, then news -- see module docstring),
     checking stops on every new bar and translating resulting signals into
-    real orders through RiskGate. Returns a summary dict for logging."""
+    real orders through RiskGate. Returns a summary dict for logging.
+
+    `session` is a single DB session covering the whole cycle (opened by
+    the papertrade command, same "one session per cycle" pattern predict-
+    loop/anticipatory-loop use) -- every open/close this cycle is journaled
+    to StrategyTrade through it, so a live position is never again
+    invisible to the dashboard the way the orphaned SPY position was."""
     tradable = universe.tradable_symbols()
     summary = {"bars": 0, "news": 0, "signals": 0, "orders": 0, "rejected": 0, "stops": 0}
 
@@ -227,14 +253,14 @@ def run_live_cycle(
         state.bar_history[bar.symbol].append(bar)
         summary["bars"] += 1
 
-        if _check_and_submit_stop(bar, risk_gate, broker, account):
+        if _check_and_submit_stop(bar, risk_gate, broker, account, session):
             summary["stops"] += 1
 
         if account.halted:
             continue
         ctx = _build_context(bar.timestamp, state, tradable)
         signals = strategy.on_bar(ctx)
-        result = _submit_signals(signals, risk_gate, broker, account, state, tradable)
+        result = _submit_signals(signals, risk_gate, broker, account, state, tradable, session)
         summary["signals"] += len(signals)
         summary["orders"] += result["orders"]
         summary["rejected"] += result["rejected"]
@@ -246,7 +272,7 @@ def run_live_cycle(
             continue
         ctx = _build_context(item.decision_timestamp, state, tradable)
         signals = strategy.on_news(ctx, item)
-        result = _submit_signals(signals, risk_gate, broker, account, state, tradable)
+        result = _submit_signals(signals, risk_gate, broker, account, state, tradable, session)
         summary["signals"] += len(signals)
         summary["orders"] += result["orders"]
         summary["rejected"] += result["rejected"]

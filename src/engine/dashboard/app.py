@@ -70,6 +70,7 @@ from engine.journal.registry import (
     load_recent_hypothesis_trade_rejections,
     load_recent_manual_trades,
     load_recent_risk_halts,
+    load_recent_strategy_trades,
     load_recent_trade_rejections,
     update_anticipatory_loop_config,
     update_predict_loop_config,
@@ -421,6 +422,13 @@ def hypotheses(request: Request, _user: str = Depends(require_auth), settings: S
     return _templates.TemplateResponse(
         request, "hypotheses.html", {"hypotheses": rows, "latest_beliefs": latest_beliefs}
     )
+
+
+@app.get("/strategy-trades", response_class=HTMLResponse)
+def strategy_trades(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    with get_session(settings) as session:
+        rows = load_recent_strategy_trades(session, limit=200)
+    return _templates.TemplateResponse(request, "strategy_trades.html", {"trades": rows})
 
 
 @app.get("/anticipatory-loop-config", response_class=HTMLResponse)

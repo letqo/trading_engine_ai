@@ -424,6 +424,42 @@ class AnticipatoryLoopConfig(SQLModel, table=True):
     max_open_hypotheses_per_symbol: int = Field(default=2)
 
 
+class StrategyTrade(SQLModel, table=True):
+    """One row per real position opened live by engine.execution.live_loop
+    -- the `worker` service's --strategy path (momentum, mean_reversion,
+    multi_factor, dumb_news, overnight_gap). Before this table existed,
+    that path submitted real broker orders with zero journal footprint,
+    which is exactly how the orphaned-SPY-position mystery happened: a
+    live position nothing else could see, attribute, or protect with a
+    stop-loss sweep. Written the moment the broker order is submitted --
+    a RiskGate rejection here is never journaled, since the strategy just
+    re-decides from a fresh signal next cycle rather than needing a
+    trade_rejected suppression flag like Prediction/Hypothesis do.
+
+    exit_reason distinguishes a normal opposite-signal close ("signal"),
+    live_loop's own stop-loss sweep ("stop_loss", bypasses RiskGate by
+    design -- see live_loop's module docstring), and a close initiated
+    through the dashboard's generic close-any-position flow
+    ("manual_close")."""
+
+    __tablename__ = "strategy_trade"
+
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    created_at: datetime = Field(default_factory=_now, index=True)
+    strategy_id: str = Field(index=True)
+    symbol: str = Field(index=True)
+    side: str  # "buy" / "sell", the opening side (engine.risk.models.Side.value)
+    entry_order_id: str = Field(index=True)
+    entry_quantity: float
+    entry_price: float
+    reason: str | None = None  # the strategy signal's own reason string, if any
+
+    exit_order_id: str | None = Field(default=None, index=True)
+    exit_quantity: float | None = None
+    exit_price: float | None = None
+    exit_reason: str | None = None
+
+
 class ManualTrade(SQLModel, table=True):
     """One row per raw manual order submitted from the dashboard with no
     Prediction/Hypothesis behind it (engine.execution.manual_trading

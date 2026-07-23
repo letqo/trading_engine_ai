@@ -26,6 +26,7 @@ from engine.journal.registry import (
     mark_manual_trade_trade_rejected,
     mark_manual_trade_traded,
     mark_prediction_exited,
+    mark_strategy_trade_exited,
 )
 from engine.logging_setup import get_logger
 from engine.risk.gate import RiskGate
@@ -138,6 +139,11 @@ def close_any_position(
         mark_prediction_exited(session, row, order_id=broker_order.broker_order_id)
     elif kind == "hypothesis":
         mark_hypothesis_flat(session, row, exit_order_id=broker_order.broker_order_id)
+    elif kind == "strategy_trade":
+        mark_strategy_trade_exited(
+            session, row, order_id=broker_order.broker_order_id,
+            quantity=decision.approved_quantity, price=price, reason="manual_close",
+        )
     else:
         mark_manual_trade_exited(session, row, order_id=broker_order.broker_order_id)
     return CloseResult(ok=True, attribution=kind, broker_order_id=broker_order.broker_order_id)

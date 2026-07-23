@@ -32,6 +32,7 @@ from engine.journal.models import (
     RiskGateConfig,
     RiskHaltEvent,
     RunMode,
+    StrategyTrade,
     TradeRecord,
     TradeSide,
 )
@@ -903,6 +904,56 @@ def close_hypothesis(
     return hypothesis
 
 
+def create_strategy_trade(
+    session: Session, *, strategy_id: str, symbol: str, side: str, order_id: str, quantity: float,
+    price: float, reason: str | None = None,
+) -> StrategyTrade:
+    """Written the moment engine.execution.live_loop submits a real opening
+    order -- see StrategyTrade's docstring for why this table exists at
+    all (it's the fix for the untracked-SPY-position gap)."""
+    trade = StrategyTrade(
+        strategy_id=strategy_id, symbol=symbol, side=side, entry_order_id=order_id,
+        entry_quantity=quantity, entry_price=price, reason=reason,
+    )
+    session.add(trade)
+    session.commit()
+    session.refresh(trade)
+    return trade
+
+
+def mark_strategy_trade_exited(
+    session: Session, trade: StrategyTrade, *, order_id: str, quantity: float, price: float, reason: str,
+) -> StrategyTrade:
+    trade.exit_order_id = order_id
+    trade.exit_quantity = quantity
+    trade.exit_price = price
+    trade.exit_reason = reason
+    session.add(trade)
+    session.commit()
+    session.refresh(trade)
+    return trade
+
+
+def load_open_strategy_trade_for_symbol(session: Session, symbol: str) -> StrategyTrade | None:
+    """The one open StrategyTrade row (if any) for `symbol` -- live_loop
+    uses this to find its own row to close on an opposite signal or a
+    triggered stop, the same way close_stopped_prediction_trades looks up
+    load_open_traded_predictions."""
+    return session.exec(
+        select(StrategyTrade).where(StrategyTrade.symbol == symbol, StrategyTrade.exit_order_id.is_(None))
+    ).first()
+
+
+def load_open_strategy_trades(session: Session) -> list[StrategyTrade]:
+    rows = session.exec(select(StrategyTrade).where(StrategyTrade.exit_order_id.is_(None))).all()
+    return list(rows)
+
+
+def load_recent_strategy_trades(session: Session, limit: int = 100) -> list[StrategyTrade]:
+    rows = session.exec(select(StrategyTrade).order_by(StrategyTrade.created_at.desc()).limit(limit)).all()
+    return list(rows)
+
+
 def create_manual_trade(
     session: Session, *, symbol: str, side: str, requested_quantity: float, submitted_by: str, note: str | None = None,
 ) -> ManualTrade:
@@ -961,15 +1012,17 @@ def load_recent_manual_trades(session: Session, limit: int = 100) -> list[Manual
     return list(rows)
 
 
-def find_open_trade_by_symbol(session: Session, symbol: str) -> tuple[str, Prediction | Hypothesis | ManualTrade] | None:
+def find_open_trade_by_symbol(
+    session: Session, symbol: str,
+) -> tuple[str, Prediction | Hypothesis | ManualTrade | StrategyTrade] | None:
     """Which journal row (if any) currently claims the open broker position
     in `symbol` -- the attribution lookup behind the dashboard's "close any
-    position" flow. Checked in order prediction, hypothesis, manual_trade;
-    a symbol can only have one open broker position at a time, so more than
-    one match would be a real data inconsistency (logged, not raised) --
-    not expected in normal operation. Returns None if nothing matches, i.e.
-    an orphaned/unattributed position (see the untracked-SPY-position
-    investigation in JOURNAL.md)."""
+    position" flow. Checked in order prediction, hypothesis, strategy_trade,
+    manual_trade; a symbol can only have one open broker position at a
+    time, so more than one match would be a real data inconsistency
+    (logged, not raised) -- not expected in normal operation. Returns None
+    if nothing matches, i.e. an orphaned/unattributed position (see the
+    untracked-SPY-position investigation in JOURNAL.md)."""
     prediction = session.exec(
         select(Prediction).where(
             Prediction.symbol == symbol,
@@ -983,6 +1036,7 @@ def find_open_trade_by_symbol(session: Session, symbol: str) -> tuple[str, Predi
             Hypothesis.position_side.is_not(None),
         )
     ).first()
+    strategy_trade = load_open_strategy_trade_for_symbol(session, symbol)
     manual_trade = session.exec(
         select(ManualTrade).where(
             ManualTrade.symbol == symbol,
@@ -991,7 +1045,10 @@ def find_open_trade_by_symbol(session: Session, symbol: str) -> tuple[str, Predi
         )
     ).first()
 
-    matches = [("prediction", prediction), ("hypothesis", hypothesis), ("manual_trade", manual_trade)]
+    matches = [
+        ("prediction", prediction), ("hypothesis", hypothesis),
+        ("strategy_trade", strategy_trade), ("manual_trade", manual_trade),
+    ]
     matches = [(kind, row) for kind, row in matches if row is not None]
     if not matches:
         return None

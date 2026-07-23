@@ -13,6 +13,7 @@ from engine.journal.models import ManualTrade, PredictionDirection
 from engine.journal.registry import (
     create_hypothesis,
     create_manual_trade,
+    create_strategy_trade,
     find_open_trade_by_symbol,
     mark_hypothesis_traded,
     mark_manual_trade_traded,
@@ -216,6 +217,26 @@ def test_close_any_position_attributes_to_manual_trade(db_session):
     assert result.attribution == "manual_trade"
     db_session.refresh(trade)
     assert trade.exit_order_id is not None
+
+
+def test_close_any_position_attributes_to_strategy_trade(db_session):
+    create_strategy_trade(
+        db_session, strategy_id="momentum", symbol="EWJ", side="buy",
+        order_id="order-1", quantity=10.0, price=100.0, reason="breakout",
+    )
+
+    broker = FakeBroker()
+    risk_gate = RiskGate(RiskLimits(max_capital_per_position_pct=1.0, max_total_exposure_pct=1.0))
+    account = AccountState(equity=10_000.0, cash=10_000.0, equity_at_session_start=10_000.0)
+    account.positions["EWJ"] = Position(symbol="EWJ", quantity=10.0, avg_entry_price=100.0)
+
+    with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(110.0)):
+        result = close_any_position(db_session, broker, risk_gate, account, make_universe(), "EWJ")
+
+    assert result.ok is True
+    assert result.attribution == "strategy_trade"
+    rows = db_session.exec(select(ManualTrade)).all()
+    assert rows == []  # closing a strategy trade must not create a ManualTrade row
 
 
 def test_close_any_position_rejected_when_symbol_not_in_universe(db_session):
