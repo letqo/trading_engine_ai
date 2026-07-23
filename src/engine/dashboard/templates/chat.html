@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Chat{% endblock %}
+{% block content %}
+<h1>Chat</h1>
+<div class="subtitle">Discuss a prediction/hypothesis (or anything else) with Claude. It can look things up but can never place a trade itself -- it can only propose one, which you confirm or reject below. Mention a Prediction/Hypothesis id if you want it looked up.</div>
+
+{% if error %}
+<div class="note">{{ error }}</div>
+{% endif %}
+
+<div class="chat-log">
+  {% for m in messages %}
+  <div class="chat-msg {{ 'user' if m.role == 'user' and not m.text.startswith('[system]') else ('system' if m.text.startswith('[system]') else 'assistant') }}">{{ m.text }}</div>
+  {% endfor %}
+  {% if not messages %}
+  <div class="empty">No messages yet -- ask about a symbol, a prediction id, or a hypothesis id.</div>
+  {% endif %}
+</div>
+
+{% if proposal %}
+<div class="proposal">
+  <div><strong>Proposed trade:</strong> {{ proposal.side }} {{ proposal.quantity }} {{ proposal.symbol }}</div>
+  <div class="rationale">{{ proposal.rationale }}</div>
+  {% if proposal.kind in ("prediction", "hypothesis") %}
+  <div class="note">Converts {{ proposal.kind }} {{ proposal.item_id }}</div>
+  {% endif %}
+  <div class="proposal-actions">
+    <form method="post" action="/chat/confirm">
+      <input type="hidden" name="history" value="{{ history_json }}">
+      <input type="hidden" name="symbol" value="{{ proposal.symbol }}">
+      <input type="hidden" name="side" value="{{ proposal.side }}">
+      <input type="hidden" name="quantity" value="{{ proposal.quantity }}">
+      <input type="hidden" name="rationale" value="{{ proposal.rationale }}">
+      <input type="hidden" name="kind" value="{{ proposal.kind }}">
+      <input type="hidden" name="item_id" value="{{ proposal.item_id or '' }}">
+      <button type="submit">Confirm &amp; submit order</button>
+    </form>
+    <form method="post" action="/chat/dismiss">
+      <input type="hidden" name="history" value="{{ history_json }}">
+      <button type="submit" class="reject">Dismiss</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+<form method="post" action="/chat" class="chat-form">
+  <input type="hidden" name="history" value="{{ history_json }}">
+  <textarea name="message" rows="3" placeholder="Ask about a prediction, hypothesis, symbol, or trade idea..." required></textarea>
+  <button type="submit" style="margin-top: 0.75rem;">Send</button>
+</form>
+{% endblock %}

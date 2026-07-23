@@ -41,6 +41,17 @@
     .filter-bar select, .filter-bar input[type="date"] { display: block; margin-top: 0.3rem; background: #0f1115; border: 1px solid #2a2e37; color: #e6e6e6; border-radius: 4px; padding: 0.35rem 0.5rem; font-size: 0.85rem; }
     .filter-bar button { background: #2a5bd7; color: #fff; border: none; border-radius: 4px; padding: 0.4rem 0.9rem; font-size: 0.85rem; cursor: pointer; align-self: flex-end; }
     .filter-bar a { align-self: center; color: #9fb4ff; font-size: 0.85rem; text-decoration: none; }
+    .chat-log { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1.5rem; }
+    .chat-msg { max-width: 75%; padding: 0.6rem 0.9rem; border-radius: 8px; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.4; }
+    .chat-msg.user { align-self: flex-end; background: #2a5bd7; color: #fff; }
+    .chat-msg.assistant { align-self: flex-start; background: #171a21; border: 1px solid #2a2e37; color: #e6e6e6; }
+    .chat-msg.system { align-self: center; background: transparent; color: #9098a8; font-style: italic; font-size: 0.82rem; }
+    .chat-form textarea { display: block; width: 100%; background: #0f1115; border: 1px solid #2a2e37; color: #e6e6e6; border-radius: 4px; padding: 0.5rem 0.7rem; font-size: 0.9rem; font-family: inherit; resize: vertical; box-sizing: border-box; }
+    .proposal { background: #171a21; border: 1px solid #3768e0; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.5rem; }
+    .proposal-actions { display: flex; gap: 0.75rem; margin-top: 0.75rem; }
+    .proposal-actions button.reject { background: #3a3f4a; }
+    .proposal-actions button.reject:hover { background: #464c59; }
+    .advice-text { background: #171a21; border: 1px solid #2a2e37; border-radius: 8px; padding: 1.25rem; white-space: pre-wrap; font-size: 0.92rem; line-height: 1.5; margin-bottom: 1.5rem; }
   </style>
 </head>
 <body>
@@ -59,6 +70,8 @@
     <a href="/papertrade-config">papertrade config</a>
     <a href="/risk-gate-config">risk gate config</a>
     <a href="/manual-trade">manual trade</a>
+    <a href="/chat">chat</a>
+    <a href="/strategy-advisor">strategy advisor</a>
   </nav>
   <main>
     {% block content %}{% endblock %}

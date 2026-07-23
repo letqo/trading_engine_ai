@@ -34,6 +34,7 @@ exposure/drawdown caps) predate the /manual-trade* routes and are unaffected.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -45,7 +46,9 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import case, func
 from sqlmodel import select
 
+from engine.advisor.strategy_advisor import AdvisorConfigError, build_performance_summary, generate_advice
 from engine.anticipatory.trading import MAX_SEVERITY, open_hypothesis_trade
+from engine.chat.advisor import ChatConfigError, display_messages, execute_proposal, run_chat_turn
 from engine.cli.main import LIVE_ELIGIBLE_STRATEGIES
 from engine.config.guard import PaperOnlyViolation, enforce_paper_only
 from engine.config.settings import Settings, get_settings
@@ -703,6 +706,114 @@ def manual_trade_convert_submit(
                 override_quantity=override_quantity,
             )
     return _redirect(redirect_path, ok=result.ok, msg="submitted" if result.ok else result.reason)
+
+
+@app.get("/chat", response_class=HTMLResponse)
+def chat_view(request: Request, _user: str = Depends(require_auth)):
+    return _templates.TemplateResponse(
+        request, "chat.html",
+        {"messages": [], "history_json": "[]", "proposal": None, "error": None},
+    )
+
+
+@app.post("/chat", response_class=HTMLResponse)
+def chat_send(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    broker: Broker = Depends(get_broker),
+    message: str = Form(...),
+    history: str = Form("[]"),
+):
+    messages = json.loads(history) if history else []
+    _risk_gate, account, _universe = _trading_context(settings, broker)
+    proposal = None
+    error = None
+    with get_session(settings) as session:
+        try:
+            messages, _final_text, proposal = run_chat_turn(
+                settings=settings, session=session, account=account, messages=messages, user_message=message,
+            )
+        except ChatConfigError as exc:
+            error = str(exc)
+    return _templates.TemplateResponse(
+        request, "chat.html",
+        {
+            "messages": display_messages(messages),
+            "history_json": json.dumps(messages),
+            "proposal": proposal,
+            "error": error,
+        },
+    )
+
+
+@app.post("/chat/confirm", response_class=HTMLResponse)
+def chat_confirm(
+    request: Request,
+    _user: str = Depends(require_auth),
+    settings: Settings = Depends(get_settings),
+    broker: Broker = Depends(get_broker),
+    history: str = Form("[]"),
+    symbol: str = Form(...),
+    side: str = Form(...),
+    quantity: float = Form(...),
+    rationale: str = Form(""),
+    kind: str = Form("manual"),
+    item_id: str = Form(""),
+):
+    messages = json.loads(history) if history else []
+
+    if is_kill_switch_engaged(settings):
+        note = "[system] Kill switch is engaged -- manual opens are blocked, trade not submitted."
+        messages.append({"role": "user", "content": note})
+        return _templates.TemplateResponse(
+            request, "chat.html",
+            {"messages": display_messages(messages), "history_json": json.dumps(messages), "proposal": None, "error": None},
+        )
+
+    risk_gate, account, universe = _trading_context(settings, broker)
+    with get_session(settings) as session:
+        result = execute_proposal(
+            session, broker, risk_gate, account, universe,
+            symbol=symbol, side=side, quantity=quantity, rationale=rationale,
+            kind=kind, item_id=item_id or None, submitted_by=_user,
+        )
+    note = "[system] Trade submitted." if result.ok else f"[system] Trade not submitted: {result.reason}"
+    messages.append({"role": "user", "content": note})
+    return _templates.TemplateResponse(
+        request, "chat.html",
+        {"messages": display_messages(messages), "history_json": json.dumps(messages), "proposal": None, "error": None},
+    )
+
+
+@app.post("/chat/dismiss", response_class=HTMLResponse)
+def chat_dismiss(request: Request, _user: str = Depends(require_auth), history: str = Form("[]")):
+    messages = json.loads(history) if history else []
+    messages.append({"role": "user", "content": "[system] Proposal dismissed, not submitted."})
+    return _templates.TemplateResponse(
+        request, "chat.html",
+        {"messages": display_messages(messages), "history_json": json.dumps(messages), "proposal": None, "error": None},
+    )
+
+
+@app.get("/strategy-advisor", response_class=HTMLResponse)
+def strategy_advisor_view(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    with get_session(settings) as session:
+        summary = build_performance_summary(session)
+    return _templates.TemplateResponse(request, "strategy_advisor.html", {"summary": summary, "advice": None, "error": None})
+
+
+@app.post("/strategy-advisor", response_class=HTMLResponse)
+def strategy_advisor_generate(request: Request, _user: str = Depends(require_auth), settings: Settings = Depends(get_settings)):
+    with get_session(settings) as session:
+        summary = build_performance_summary(session)
+        advice = None
+        error = None
+        try:
+            advice = generate_advice(settings, summary)
+        except AdvisorConfigError as exc:
+            error = str(exc)
+    return _templates.TemplateResponse(request, "strategy_advisor.html", {"summary": summary, "advice": advice, "error": error})
 
 
 @app.get("/health")

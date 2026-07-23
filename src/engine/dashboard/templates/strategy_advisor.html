@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Strategy advisor{% endblock %}
+{% block content %}
+<h1>Strategy advisor</h1>
+<div class="subtitle">Read-only: aggregates real performance across every trading path and asks Claude for tuning suggestions. It never changes config itself -- act on suggestions manually through the *-config pages. Costs a Claude call only when you click Generate.</div>
+
+{% if error %}
+<div class="note">{{ error }}</div>
+{% endif %}
+
+<div class="cards">
+  <div class="card">
+    <div class="label">Predictions (predict-loop)</div>
+    <div class="value">{{ "%.1f%%"|format(summary.predictions.accuracy_pct) if summary.predictions.accuracy_pct is not none else "n/a" }}</div>
+    <div class="note" style="margin:0;">{{ summary.predictions.correct_count }}/{{ summary.predictions.resolved_count }} resolved correct, {{ summary.predictions.traded_count }} traded</div>
+  </div>
+  <div class="card">
+    <div class="label">Hypotheses (anticipatory-loop)</div>
+    <div class="value">{{ "%.1f%%"|format(summary.hypotheses.win_rate_pct) if summary.hypotheses.win_rate_pct is not none else "n/a" }}</div>
+    <div class="note" style="margin:0;">{{ summary.hypotheses.win_count }}/{{ summary.hypotheses.closed_traded }} closed+traded correct, {{ summary.hypotheses.open }} open</div>
+  </div>
+  <div class="card">
+    <div class="label">Manual trades</div>
+    <div class="value">{{ summary.manual_trades.total }}</div>
+    <div class="note" style="margin:0;">{{ summary.manual_trades.open }} open, {{ summary.manual_trades.rejected }} rejected</div>
+  </div>
+</div>
+
+<h1>Technical strategies (worker), by strategy</h1>
+{% if summary.strategy_trades_by_strategy %}
+<table>
+  <tr><th>Strategy</th><th>Opened</th><th>Closed</th><th>Win rate</th><th>Total P&amp;L</th></tr>
+  {% for g in summary.strategy_trades_by_strategy %}
+  <tr>
+    <td>{{ g.label }}</td>
+    <td>{{ g.count }}</td>
+    <td>{{ g.closed }}</td>
+    <td>{{ "%.1f%%"|format(g.win_rate_pct) if g.win_rate_pct is not none else "-" }}</td>
+    <td class="{{ 'value good' if g.total_pnl > 0 else ('value bad' if g.total_pnl < 0 else '') }}" style="font-size:0.88rem;">{{ "%+.2f"|format(g.total_pnl) if g.closed else "-" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No technical-strategy trades yet.</div>
+{% endif %}
+
+<h1>Technical strategies (worker), by symbol</h1>
+{% if summary.strategy_trades_by_symbol %}
+<table>
+  <tr><th>Symbol</th><th>Opened</th><th>Closed</th><th>Win rate</th><th>Total P&amp;L</th></tr>
+  {% for g in summary.strategy_trades_by_symbol %}
+  <tr>
+    <td>{{ g.label }}</td>
+    <td>{{ g.count }}</td>
+    <td>{{ g.closed }}</td>
+    <td>{{ "%.1f%%"|format(g.win_rate_pct) if g.win_rate_pct is not none else "-" }}</td>
+    <td style="font-size:0.88rem;">{{ "%+.2f"|format(g.total_pnl) if g.closed else "-" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">No technical-strategy trades yet.</div>
+{% endif %}
+
+<h1>Suggestions</h1>
+<form method="post" action="/strategy-advisor">
+  <button type="submit">Generate suggestions</button>
+</form>
+{% if advice %}
+<div class="advice-text" style="margin-top:1rem;">{{ advice }}</div>
+{% endif %}
+{% endblock %}

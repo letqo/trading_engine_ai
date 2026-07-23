@@ -998,6 +998,152 @@ def test_manual_trade_convert_unknown_id_is_404(tmp_path):
         app.dependency_overrides.clear()
 
 
+def test_chat_view_requires_auth(client):
+    assert client.get("/chat").status_code == 401
+
+
+def test_chat_view_renders_empty(client):
+    resp = client.get("/chat", headers=_auth_header("admin", "testpass"))
+    assert resp.status_code == 200
+    assert "No messages yet" in resp.text
+
+
+def test_chat_send_without_api_key_shows_error(tmp_path):
+    db_path = tmp_path / "chat_no_key.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, database_url=db_url, dashboard_password="testpass", anthropic_api_key=None,
+    )
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        resp = TestClient(app).post(
+            "/chat", headers=_auth_header("admin", "testpass"),
+            data={"message": "what about SPY?", "history": "[]"},
+        )
+        assert resp.status_code == 200
+        assert "ANTHROPIC_API_KEY is not set" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_chat_confirm_manual_trade_executes_and_notes_result(tmp_path):
+    # Simulates the human clicking Confirm on a proposal -- this route never
+    # calls the LLM, so no anthropic mocking is needed to test the one path
+    # that actually places an order.
+    db_path = tmp_path / "chat_confirm.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: _manual_trade_settings(tmp_path, db_url)
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        with patch("engine.execution.pricing.fetch_bars", return_value=_price_bars(100.0)):
+            resp = TestClient(app).post(
+                "/chat/confirm", headers=_auth_header("admin", "testpass"),
+                data={
+                    "history": "[]", "symbol": "SPY", "side": "buy", "quantity": "1",
+                    "rationale": "AI-suggested breakout", "kind": "manual", "item_id": "",
+                },
+            )
+        assert resp.status_code == 200
+        assert "Trade submitted" in resp.text
+        assert len(broker.submitted) == 1
+
+        with Session(engine_) as session:
+            rows = session.exec(select(ManualTrade)).all()
+        assert len(rows) == 1
+        assert "AI chat proposal" in rows[0].note
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_chat_confirm_blocked_by_kill_switch(tmp_path):
+    db_path = tmp_path / "chat_confirm_killed.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    halt_file = tmp_path / "HALT"
+    halt_file.write_text("halted for test\n")
+    broker = FakeBroker()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, database_url=db_url, dashboard_password="testpass", halt_file=halt_file,
+    )
+    app.dependency_overrides[get_broker] = lambda: broker
+    try:
+        resp = TestClient(app).post(
+            "/chat/confirm", headers=_auth_header("admin", "testpass"),
+            data={
+                "history": "[]", "symbol": "SPY", "side": "buy", "quantity": "1",
+                "rationale": "r", "kind": "manual", "item_id": "",
+            },
+        )
+        assert resp.status_code == 200
+        assert "Kill switch is engaged" in resp.text
+        assert broker.submitted == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_strategy_advisor_view_requires_auth(client):
+    assert client.get("/strategy-advisor").status_code == 401
+
+
+def test_strategy_advisor_view_renders_empty(client):
+    resp = client.get("/strategy-advisor", headers=_auth_header("admin", "testpass"))
+    assert resp.status_code == 200
+    assert "No technical-strategy trades yet" in resp.text
+
+
+def test_strategy_advisor_generate_without_api_key_shows_error(tmp_path):
+    db_path = tmp_path / "advisor_no_key.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, database_url=db_url, dashboard_password="testpass", anthropic_api_key=None,
+    )
+    try:
+        resp = TestClient(app).post("/strategy-advisor", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "ANTHROPIC_API_KEY is not set" in resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_strategy_advisor_view_shows_strategy_trade_stats(tmp_path):
+    db_path = tmp_path / "advisor_stats.db"
+    db_url = f"sqlite:///{db_path}"
+    engine_ = create_engine(db_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine_)
+
+    with Session(engine_) as session:
+        closed_trade = create_strategy_trade(
+            session, strategy_id="momentum", symbol="SPY", side="buy",
+            order_id="order-1", quantity=10.0, price=100.0,
+        )
+        mark_strategy_trade_exited(session, closed_trade, order_id="order-2", quantity=10.0, price=110.0, reason="signal")
+
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        _env_file=None, database_url=db_url, dashboard_password="testpass",
+    )
+    try:
+        resp = TestClient(app).get("/strategy-advisor", headers=_auth_header("admin", "testpass"))
+        assert resp.status_code == 200
+        assert "momentum" in resp.text
+        assert "100.0%" in resp.text  # one closed trade, one win
+        assert "+100.00" in resp.text  # (110-100)*10
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_manual_trade_convert_invalid_kind_is_422(tmp_path):
     db_path = tmp_path / "manual_trade_convert_kind.db"
     db_url = f"sqlite:///{db_path}"
